@@ -76,7 +76,11 @@ class PolymarketClient:
         self.clob_base_url = "https://clob.polymarket.com"
 
     def headers(self) -> dict[str, str]:
-        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 QLA/2.0",
+        }
         if self.settings.poly_api_key:
             headers.update(
                 {

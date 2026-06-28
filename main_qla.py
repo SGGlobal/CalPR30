@@ -99,6 +99,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="QLA Polymarket bot framework")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("test-connection", help="Validate configuration and Polymarket connectivity")
+    subparsers.add_parser("discover-market", help="Display the active BTC 5-minute market dashboard")
     args = parser.parse_args(argv)
 
     if args.command in (None, "test-connection"):
@@ -107,6 +108,12 @@ def main(argv: list[str] | None = None) -> int:
         except ConnectionCheckError as error:
             print(f"Connection test failed: {error}", file=sys.stderr)
             return 1
+        return 0
+
+    if args.command == "discover-market":
+        from strategies.qla_buzzer import run_qla_buzzer
+
+        run_qla_buzzer()
         return 0
 
     parser.error(f"Unknown command: {args.command}")
