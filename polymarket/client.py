@@ -21,13 +21,14 @@ class Settings:
     poly_passphrase: str
     dry_run: bool
     bet_size_usd: float
+    environment_loaded: bool
 
 
-def _load_dotenv(path: str = ".env") -> None:
+def _load_dotenv(path: str = ".env") -> bool:
     """Load simple KEY=VALUE pairs without requiring python-dotenv."""
     env_path = Path(path)
     if not env_path.exists():
-        return
+        return False
 
     for raw_line in env_path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
@@ -37,6 +38,7 @@ def _load_dotenv(path: str = ".env") -> None:
         key = key.strip()
         value = value.strip().strip('"').strip("'")
         os.environ.setdefault(key, value)
+    return True
 
 
 def _get_bool(name: str, default: bool) -> bool:
@@ -52,15 +54,16 @@ def _get_bool(name: str, default: bool) -> bool:
 
 
 def get_settings() -> Settings:
-    _load_dotenv()
+    environment_loaded = _load_dotenv()
     return Settings(
         private_key=os.getenv("PRIVATE_KEY", ""),
         public_key=os.getenv("PUBLIC_KEY", ""),
         poly_api_key=os.getenv("POLY_API_KEY", ""),
         poly_api_secret=os.getenv("POLY_API_SECRET", ""),
         poly_passphrase=os.getenv("POLY_PASSPHRASE", ""),
-        dry_run=_get_bool("DRY_RUN", True),
+        dry_run=True,
         bet_size_usd=float(os.getenv("BET_SIZE_USD", "5") or 5),
+        environment_loaded=environment_loaded,
     )
 
 
