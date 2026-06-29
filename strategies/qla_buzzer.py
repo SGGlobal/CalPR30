@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from polymarket.client import build_client
 from polymarket.intelligence import MarketIntelligence, get_market_intelligence
 from polymarket.markets import DiscoveredMarket, discover_current_btc_5m_market, format_utc
-from reasoning import Decision, reason_about_market
+from polymarket.reasoning import Decision, reason_about_market
 
 
 REFRESH_SECONDS = 2
