@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+from polymarket.archive import archive_statistics, save_decision
 from polymarket.client import build_client
 from polymarket.intelligence import MarketIntelligence, get_market_intelligence
 from polymarket.markets import DiscoveredMarket, discover_current_btc_5m_market, format_utc
@@ -27,6 +28,9 @@ class DashboardState:
     down: MarketIntelligence | None = None
     decision: Decision | None = None
     dry_run: bool = True
+    archive_status: str = "Not started"
+    decisions_saved: int = 0
+    session_count: int = 0
     last_action: str = "Starting"
 
 
@@ -67,9 +71,16 @@ def _print_decision(decision: Decision | None) -> None:
         print(f"    - {reason}")
 
 
+def _print_archive_status(state: DashboardState) -> None:
+    print("Archive Status")
+    print(f"  Status:                {state.archive_status}")
+    print(f"  Decisions Saved:       {state.decisions_saved}")
+    print(f"  Current Session Count: {state.session_count}")
+
+
 def render_dashboard(state: DashboardState) -> None:
     print("\033[2J\033[H", end="")
-    print("QLA Phase 5 - Reasoning Engine")
+    print("QLA Phase 6 - Decision Archive")
     print("=" * 60)
     print("Question:")
     print(state.question)
@@ -92,14 +103,44 @@ def render_dashboard(state: DashboardState) -> None:
     print()
     _print_decision(state.decision)
     print()
+    _print_archive_status(state)
+    print()
     print(f"DRY_RUN: {state.dry_run}")
     print(f"Status: {state.last_action}")
 
 
-def dashboard_state_from_market(market: DiscoveredMarket, dry_run: bool, now: int | None = None) -> DashboardState:
+def dashboard_state_from_market(
+    market: DiscoveredMarket,
+    dry_run: bool,
+    session_count: int,
+    now: int | None = None,
+) -> DashboardState:
     time_left = market.seconds_remaining(now)
     up = get_market_intelligence(market.up_token_id, time_left)
     down = get_market_intelligence(market.down_token_id, time_left)
+    decision = reason_about_market(up, down)
+    timestamp = now if now is not None else int(time.time())
+    stats_before = archive_statistics()
+    decisions_saved = int(stats_before["decision_count"])
+    archive_status = "Ready"
+
+    try:
+        save_decision(
+            timestamp=timestamp,
+            market_id=market.market_id,
+            market_slug=market.slug,
+            market_question=market.question,
+            seconds_remaining=time_left,
+            intelligence={"up": up, "down": down},
+            decision=decision,
+            dry_run=dry_run,
+        )
+        decisions_saved += 1
+        session_count += 1
+        archive_status = "Saved"
+    except OSError as exc:
+        archive_status = f"Archive error: {exc}"
+
     return DashboardState(
         question=market.question,
         market_slug=market.slug,
@@ -110,22 +151,27 @@ def dashboard_state_from_market(market: DiscoveredMarket, dry_run: bool, now: in
         time_left=time_left,
         up=up,
         down=down,
-        decision=reason_about_market(up, down),
+        decision=decision,
         dry_run=dry_run,
-        last_action="Reasoning refreshed; no orders, trade execution, or profitability evaluation enabled",
+        archive_status=archive_status,
+        decisions_saved=decisions_saved,
+        session_count=session_count,
+        last_action="Reasoning refreshed and archived; no orders, trade execution, or profitability evaluation enabled",
     )
 
 
 def run_qla_buzzer() -> None:
     """Run the autonomous reasoning dashboard without placing orders."""
     client = build_client()
+    session_count = 0
     state = DashboardState(dry_run=client.settings.dry_run)
 
     while True:
         try:
             now = int(time.time())
             market = discover_current_btc_5m_market(client, now)
-            state = dashboard_state_from_market(market, client.settings.dry_run, now)
+            state = dashboard_state_from_market(market, client.settings.dry_run, session_count, now)
+            session_count = state.session_count
             render_dashboard(state)
         except KeyboardInterrupt:
             print("\nQLA stopped by user.")

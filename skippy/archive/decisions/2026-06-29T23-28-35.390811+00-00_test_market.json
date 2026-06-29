@@ -1,0 +1,15 @@
+{
+  "project": "Skippy",
+  "phase": 6,
+  "market_id": "test_market",
+  "question": "Should Skippy act or watch?",
+  "confidence": 0.0,
+  "edge": 0.0,
+  "decision": "WATCH",
+  "dry_run": true,
+  "reasoning": {
+    "summary": "Phase 6 archive test.",
+    "risk": "No real action taken."
+  },
+  "timestamp": "2026-06-29T23:28:35.390811+00:00"
+}
