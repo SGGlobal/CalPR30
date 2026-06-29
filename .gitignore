@@ -1,18 +1,52 @@
+# =========================
+# Python
+# =========================
+.venv/
 __pycache__/
 *.pyc
-.env
-logs/
+
+# Test & Build Caches
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 
+# Environment Files
+.env
+
+# Logs
+logs/
+
+# =========================
 # OpenClaude
+# =========================
 .claude/worktrees/
 .claude/tmp/
 .openclaude/tmp/
 
-# IDE
+# =========================
+# IDEs
+# =========================
 .vscode/
 .idea/
 
-# Windows
+# =========================
+# Operating Systems
+# =========================
 Thumbs.db
+.DS_Store
+
+# Coverage
+.coverage
+htmlcov/
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# Local databases
+*.db
+*.sqlite3
+
+# Temporary files
+*.tmp
