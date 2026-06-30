@@ -5,6 +5,7 @@ from pathlib import Path
 ARCHIVE_DIR = Path("skippy/archive/decisions")
 ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 
+
 def save_decision(decision: dict) -> Path:
     decision["timestamp"] = datetime.now(timezone.utc).isoformat()
 
@@ -28,10 +29,7 @@ if __name__ == "__main__":
         "edge": 0.0,
         "decision": "WATCH",
         "dry_run": True,
-        "reasoning": {
-            "summary": "Phase 6 archive test.",
-            "risk": "No real action taken."
-        }
+        "reasoning": {"summary": "Phase 6 archive test.", "risk": "No real action taken."},
     }
 
     saved = save_decision(sample)

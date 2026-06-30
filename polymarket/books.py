@@ -68,7 +68,9 @@ def get_order_book(
         raise
 
     if not isinstance(book, dict):
-        log_event("order_book_api_failure", token_id=token_id, error="Unexpected order book response")
+        log_event(
+            "order_book_api_failure", token_id=token_id, error="Unexpected order book response"
+        )
         raise ValueError("Unexpected order book response")
 
     _ORDER_BOOK_CACHE[token_id] = (current_time, book)

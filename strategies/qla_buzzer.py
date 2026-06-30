@@ -49,12 +49,24 @@ def _print_intelligence(label: str, token_id: str, metrics: MarketIntelligence |
     print(f"  Best Ask:             {_format_metric(metrics.best_ask if metrics else None)}")
     print(f"  Mid Price:            {_format_metric(metrics.mid_price if metrics else None)}")
     print(f"  Spread:               {_format_metric(metrics.spread if metrics else None)}")
-    print(f"  Bid Liquidity:        {_format_metric(metrics.bid_liquidity if metrics else None, 2)}")
-    print(f"  Ask Liquidity:        {_format_metric(metrics.ask_liquidity if metrics else None, 2)}")
-    print(f"  Order Book Imbalance: {_format_metric(metrics.order_book_imbalance if metrics else None)}")
-    print(f"  Largest Bid Wall:     {_format_metric(metrics.largest_bid_wall if metrics else None, 2)}")
-    print(f"  Largest Ask Wall:     {_format_metric(metrics.largest_ask_wall if metrics else None, 2)}")
-    print(f"  Time Remaining:       {_format_metric(metrics.time_remaining if metrics else None)} sec")
+    print(
+        f"  Bid Liquidity:        {_format_metric(metrics.bid_liquidity if metrics else None, 2)}"
+    )
+    print(
+        f"  Ask Liquidity:        {_format_metric(metrics.ask_liquidity if metrics else None, 2)}"
+    )
+    print(
+        f"  Order Book Imbalance: {_format_metric(metrics.order_book_imbalance if metrics else None)}"
+    )
+    print(
+        f"  Largest Bid Wall:     {_format_metric(metrics.largest_bid_wall if metrics else None, 2)}"
+    )
+    print(
+        f"  Largest Ask Wall:     {_format_metric(metrics.largest_ask_wall if metrics else None, 2)}"
+    )
+    print(
+        f"  Time Remaining:       {_format_metric(metrics.time_remaining if metrics else None)} sec"
+    )
     print(f"  Bid/Ask Ratio:        {_format_metric(metrics.bid_ask_ratio if metrics else None)}")
 
 

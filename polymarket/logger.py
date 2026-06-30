@@ -7,7 +7,14 @@ from pathlib import Path
 from typing import Any
 
 
-_SECRET_WORDS = ("PRIVATE_KEY", "POLY_API_KEY", "POLY_API_SECRET", "POLY_PASSPHRASE", "SECRET", "KEY")
+_SECRET_WORDS = (
+    "PRIVATE_KEY",
+    "POLY_API_KEY",
+    "POLY_API_SECRET",
+    "POLY_PASSPHRASE",
+    "SECRET",
+    "KEY",
+)
 
 
 def _sanitize(value: Any) -> Any:

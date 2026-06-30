@@ -54,7 +54,9 @@ def _verify_api_reachable(client: PolymarketClient) -> None:
     try:
         client.get_json(f"{client.gamma_base_url}/markets", {"limit": 1})
     except urllib.error.HTTPError as error:
-        raise ConnectionCheckError(f"API reachability check failed: {_format_http_error(error)}") from error
+        raise ConnectionCheckError(
+            f"API reachability check failed: {_format_http_error(error)}"
+        ) from error
     except urllib.error.URLError as error:
         raise ConnectionCheckError(f"API reachability check failed: {error.reason}") from error
     except TimeoutError as error:
@@ -65,7 +67,9 @@ def _verify_authentication(client: PolymarketClient) -> None:
     try:
         client.get_json(f"{client.clob_base_url}/auth/api-key")
     except urllib.error.HTTPError as error:
-        raise ConnectionCheckError(f"Authentication check failed: {_format_http_error(error)}") from error
+        raise ConnectionCheckError(
+            f"Authentication check failed: {_format_http_error(error)}"
+        ) from error
     except urllib.error.URLError as error:
         raise ConnectionCheckError(f"Authentication check failed: {error.reason}") from error
     except TimeoutError as error:
@@ -98,8 +102,12 @@ def _run_connection_test() -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="QLA Polymarket bot framework")
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("test-connection", help="Validate configuration and Polymarket connectivity")
-    subparsers.add_parser("discover-market", help="Display the active BTC 5-minute market dashboard")
+    subparsers.add_parser(
+        "test-connection", help="Validate configuration and Polymarket connectivity"
+    )
+    subparsers.add_parser(
+        "discover-market", help="Display the active BTC 5-minute market dashboard"
+    )
     args = parser.parse_args(argv)
 
     if args.command in (None, "test-connection"):

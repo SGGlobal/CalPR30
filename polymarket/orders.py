@@ -9,7 +9,9 @@ from .client import build_client
 from .logger import log_event
 
 
-def place_limit_order(token_id: str, side: str, price: float, size: float, neg_risk: bool = False) -> dict[str, Any]:
+def place_limit_order(
+    token_id: str, side: str, price: float, size: float, neg_risk: bool = False
+) -> dict[str, Any]:
     """Place a limit order, or simulate it when DRY_RUN is enabled."""
     client = build_client()
     payload = {

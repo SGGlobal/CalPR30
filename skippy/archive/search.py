@@ -28,9 +28,4 @@ if __name__ == "__main__":
     print(f"Found {len(matches)} matching decisions\n")
 
     for m in matches:
-        print(
-            f"{m['timestamp']} | "
-            f"{m['market_id']} | "
-            f"{m['decision']} | "
-            f"{m['confidence']}"
-        )
+        print(f"{m['timestamp']} | {m['market_id']} | {m['decision']} | {m['confidence']}")

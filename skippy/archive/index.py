@@ -27,8 +27,5 @@ if __name__ == "__main__":
 
     for d in decisions:
         print(
-            f"{d['timestamp']} | "
-            f"{d.get('market_id')} | "
-            f"{d.get('decision')} | "
-            f"{d.get('confidence')}"
+            f"{d['timestamp']} | {d.get('market_id')} | {d.get('decision')} | {d.get('confidence')}"
         )

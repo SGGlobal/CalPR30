@@ -112,7 +112,9 @@ def save_decision(
     return safe_record
 
 
-def load_decisions(archive_path: Path = DEFAULT_ARCHIVE_PATH, limit: int | None = None) -> list[dict[str, Any]]:
+def load_decisions(
+    archive_path: Path = DEFAULT_ARCHIVE_PATH, limit: int | None = None
+) -> list[dict[str, Any]]:
     """Load archived decision records from JSON Lines."""
     ensure_archive_directories()
     if not archive_path.exists():
@@ -160,7 +162,9 @@ def search_archive(
 def archive_statistics(archive_path: Path = DEFAULT_ARCHIVE_PATH) -> dict[str, int | str | None]:
     """Summarize archived decision records."""
     records = load_decisions(archive_path)
-    timestamps = [record.get("timestamp") for record in records if isinstance(record.get("timestamp"), int)]
+    timestamps = [
+        record.get("timestamp") for record in records if isinstance(record.get("timestamp"), int)
+    ]
     market_ids = {record.get("market_id") for record in records if record.get("market_id")}
     dry_run_count = sum(1 for record in records if record.get("dry_run") is True)
 

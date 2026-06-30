@@ -24,8 +24,9 @@ class Decision:
 
 
 class ReasoningStrategy(Protocol):
-    def evaluate(self, up: MarketIntelligence, down: MarketIntelligence, timestamp: int | None = None) -> Decision:
-        ...
+    def evaluate(
+        self, up: MarketIntelligence, down: MarketIntelligence, timestamp: int | None = None
+    ) -> Decision: ...
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,9 @@ class OrderBookReasoningStrategy:
         )
     )
 
-    def evaluate(self, up: MarketIntelligence, down: MarketIntelligence, timestamp: int | None = None) -> Decision:
+    def evaluate(
+        self, up: MarketIntelligence, down: MarketIntelligence, timestamp: int | None = None
+    ) -> Decision:
         return reason_about_market(up, down, self, timestamp)
 
 
@@ -57,7 +60,9 @@ def clamp_confidence(value: float) -> int:
     return max(0, min(100, round(value)))
 
 
-def choose_direction(up: MarketIntelligence, down: MarketIntelligence, strategy: OrderBookReasoningStrategy) -> tuple[Direction, list[str]]:
+def choose_direction(
+    up: MarketIntelligence, down: MarketIntelligence, strategy: OrderBookReasoningStrategy
+) -> tuple[Direction, list[str]]:
     explanation: list[str] = []
     up_score = _score_side(up, strategy)
     down_score = _score_side(down, strategy)
@@ -75,7 +80,9 @@ def choose_direction(up: MarketIntelligence, down: MarketIntelligence, strategy:
     return "DOWN", explanation
 
 
-def assess_risk(up: MarketIntelligence, down: MarketIntelligence, strategy: OrderBookReasoningStrategy) -> tuple[RiskLevel, list[str]]:
+def assess_risk(
+    up: MarketIntelligence, down: MarketIntelligence, strategy: OrderBookReasoningStrategy
+) -> tuple[RiskLevel, list[str]]:
     explanation: list[str] = []
     widest_spread = max(_or_zero(up.spread), _or_zero(down.spread))
     time_remaining = min(up.time_remaining, down.time_remaining)
@@ -151,7 +158,9 @@ def reason_about_market(
     confidence = calculate_confidence(direction, risk, up, down, active_strategy)
 
     explanation = [*direction_reasons, *risk_reasons]
-    explanation.append("Decision is informational only; no orders or profitability evaluation are performed.")
+    explanation.append(
+        "Decision is informational only; no orders or profitability evaluation are performed."
+    )
 
     return Decision(
         confidence=confidence,

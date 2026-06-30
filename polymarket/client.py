@@ -82,13 +82,11 @@ class PolymarketClient:
             "User-Agent": "Mozilla/5.0 QLA/2.0",
         }
         if self.settings.poly_api_key:
-            headers.update(
-                {
-                    "POLY-API-KEY": self.settings.poly_api_key,
-                    "POLY-API-SECRET": self.settings.poly_api_secret,
-                    "POLY-API-PASSPHRASE": self.settings.poly_passphrase,
-                }
-            )
+            headers.update({
+                "POLY-API-KEY": self.settings.poly_api_key,
+                "POLY-API-SECRET": self.settings.poly_api_secret,
+                "POLY-API-PASSPHRASE": self.settings.poly_passphrase,
+            })
         return headers
 
     def get_json(self, url: str, params: dict[str, Any] | None = None) -> Any:

@@ -24,11 +24,7 @@ class Memory:
         if decision is None:
             return records
 
-        return [
-            r
-            for r in records
-            if r.get("decision") == decision
-        ]
+        return [r for r in records if r.get("decision") == decision]
 
 
 if __name__ == "__main__":

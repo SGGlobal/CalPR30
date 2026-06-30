@@ -65,7 +65,12 @@ def extract_tokens(market: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[
 
     if token_ids:
         candidates = [
-            {"token_id": token_id, "outcome": outcomes[index] if index < len(outcomes) else ("UP" if index == 0 else "DOWN")}
+            {
+                "token_id": token_id,
+                "outcome": outcomes[index]
+                if index < len(outcomes)
+                else ("UP" if index == 0 else "DOWN"),
+            }
             for index, token_id in enumerate(token_ids)
         ]
     else:
@@ -79,7 +84,9 @@ def extract_tokens(market: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[
             label = "UP" if index == 0 else "DOWN"
             token_data = {"token_id": token, "outcome": label}
         elif isinstance(token, dict):
-            outcome = str(token.get("outcome") or token.get("name") or token.get("label") or "").upper()
+            outcome = str(
+                token.get("outcome") or token.get("name") or token.get("label") or ""
+            ).upper()
             token_id = token.get("token_id") or token.get("tokenId") or token.get("id")
             token_data = {"token_id": token_id, "outcome": outcome, **token}
             label = outcome or ("UP" if index == 0 else "DOWN")
@@ -103,7 +110,11 @@ def discover_current_btc_5m_market(
     global _DISCOVERY_CACHE
 
     current_time = int(time.time()) if now is None else int(now)
-    if not force_refresh and _DISCOVERY_CACHE and _DISCOVERY_CACHE.seconds_remaining(current_time) > 0:
+    if (
+        not force_refresh
+        and _DISCOVERY_CACHE
+        and _DISCOVERY_CACHE.seconds_remaining(current_time) > 0
+    ):
         return _DISCOVERY_CACHE
 
     api_client = client or build_client()
@@ -126,13 +137,20 @@ def build_discovered_market(market: dict[str, Any], now: int | None = None) -> D
     """Build normalized discovered-market metadata from a Gamma market payload."""
     slug = str(market.get("slug") or "")
     question = str(market.get("question") or market.get("title") or slug)
-    market_id = str(market.get("id") or market.get("conditionId") or market.get("marketMakerAddress") or "")
+    market_id = str(
+        market.get("id") or market.get("conditionId") or market.get("marketMakerAddress") or ""
+    )
     end_timestamp = _market_end_timestamp(market)
     if end_timestamp is None:
         raise MarketDiscoveryError(f"Could not determine end timestamp for market {slug}")
 
     up_token, down_token = extract_tokens(market)
-    if not up_token or not down_token or not up_token.get("token_id") or not down_token.get("token_id"):
+    if (
+        not up_token
+        or not down_token
+        or not up_token.get("token_id")
+        or not down_token.get("token_id")
+    ):
         raise MarketDiscoveryError(f"Could not extract UP/DOWN tokens for market {slug}")
 
     return DiscoveredMarket(
@@ -152,7 +170,13 @@ def format_utc(ts: int) -> str:
 def _find_active_btc_5m_market(client: PolymarketClient, now: int) -> dict[str, Any] | None:
     data = client.get_json(
         f"{client.gamma_base_url}/markets",
-        {"active": "true", "closed": "false", "limit": 200, "order": "endDate", "ascending": "true"},
+        {
+            "active": "true",
+            "closed": "false",
+            "limit": 200,
+            "order": "endDate",
+            "ascending": "true",
+        },
     )
     candidates = [market for market in _market_list(data) if _is_active_btc_5m_market(market, now)]
     if not candidates:
