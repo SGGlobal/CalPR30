@@ -5,7 +5,6 @@ Temporary memory used while a mission is active.
 Cleared after mission completion.
 """
 
-from skippy.memory.working_memory import WorkingMemory
 from dataclasses import dataclass, field
 from typing import Any
 
