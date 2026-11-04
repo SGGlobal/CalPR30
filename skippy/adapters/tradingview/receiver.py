@@ -11,6 +11,7 @@ from dataclasses import asdict
 
 from skippy.adapters.tradingview.validator import validate_signal
 from skippy.adapters.tradingview.deduplicator import SignalDeduplicator
+from skippy.adapters.tradingview.freshness import SignalFreshnessValidator
 from skippy.kernel.event_bus import EventBus
 
 
@@ -21,14 +22,17 @@ class TradingViewReceiver:
     def __init__(self, event_bus: EventBus):
         self.event_bus = event_bus
         self.deduplicator = SignalDeduplicator()
+        self.freshness = SignalFreshnessValidator()
 
     def receive(self, payload: dict) -> dict:
         """
-        Validate, deduplicate, and publish
-        a simulated TradingView signal.
+        Validate freshness, reject duplicates,
+        and publish a simulated TradingView signal.
         """
 
         validated = validate_signal(payload)
+
+        self.freshness.check(validated)
 
         self.deduplicator.check(validated)
 

@@ -1,11 +1,12 @@
-"""
-SKIPPY AI TRADER — PHASE 8
+﻿"""
+SKIPPY AI TRADER â€” PHASE 8
 
 Hermes Observational Integration Tests.
 """
 
 from skippy.adapters.tradingview.observer import TradingViewObserver
 from skippy.adapters.tradingview.receiver import TradingViewReceiver
+from datetime import datetime, timezone
 from skippy.kernel.event_bus import EventBus
 
 
@@ -14,7 +15,7 @@ def valid_payload():
         "symbol": "BTCUSDT",
         "action": "BUY",
         "price": 65000,
-        "timestamp": "2026-11-04T18:00:00Z",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 

@@ -1,5 +1,5 @@
-"""
-SKIPPY AI TRADER — PHASE 8
+﻿"""
+SKIPPY AI TRADER â€” PHASE 8
 
 Duplicate Signal Protection Tests.
 """
@@ -8,6 +8,7 @@ import pytest
 
 from skippy.adapters.tradingview.receiver import TradingViewReceiver
 from skippy.adapters.tradingview.deduplicator import DuplicateSignalError
+from datetime import datetime, timezone
 from skippy.kernel.event_bus import EventBus
 
 
@@ -16,7 +17,7 @@ def valid_payload():
         "symbol": "BTCUSDT",
         "action": "BUY",
         "price": 65000,
-        "timestamp": "2026-11-04T18:00:00Z",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
