@@ -9,6 +9,9 @@ No external networking, automatic retries, or trade execution.
 
 from pathlib import Path
 
+from skippy.adapters.tradingview.receiver import (
+    TRADINGVIEW_SIGNAL_VALIDATED,
+)
 from skippy.adapters.tradingview.atomic_ingestion import (
     AtomicTradingViewIngestion,
 )
@@ -92,17 +95,45 @@ class LocalTradingViewStartup:
         self.ingestion = ingestion
         self.ready = True
 
-    def ingest(self, body: bytes, token: str):
+    def _verify_observer_readiness(self) -> None:
         """
-        Accept a local simulated signal only after startup.
+        Verify that exactly one designated durable observer
+        is subscribed to the TradingView event.
 
-        No HTTP listener, brokerage connection,
-        or trade execution is provided.
+        LOCAL SIMULATION ONLY.
         """
 
-        if not self.ready or self.ingestion is None:
+        if (
+            not self.ready
+            or self.event_bus is None
+            or self.observer is None
+            or self.ingestion is None
+        ):
             raise LocalStartupError(
                 "Local observational system is not ready"
             )
+
+        subscribers = self.event_bus._subscribers.get(
+            TRADINGVIEW_SIGNAL_VALIDATED,
+            [],
+        )
+
+        expected_callback = self.observer._observe
+
+        if (
+            len(subscribers) != 1
+            or subscribers[0] != expected_callback
+        ):
+            raise LocalStartupError(
+                "Durable observer readiness verification failed"
+            )
+
+    def ingest(self, body: bytes, token: str):
+        """
+        Accept local simulated signals only when the
+        designated durable observer is registered exactly once.
+        """
+
+        self._verify_observer_readiness()
 
         return self.ingestion.ingest(body, token)
