@@ -239,13 +239,18 @@ def test_ingestion_blocked_when_observer_verification_fails(tmp_path):
 
 def test_concurrent_subscription_change_serialized_by_lock(tmp_path):
     """
-    Demonstrates that the controlled bus serializes subscription changes
-    relative to the locked ingest path using deterministic Event coordination.
+    Demonstrates that the controlled bus serializes a concurrent subscribe
+    relative to a locked controlled_ingest section.
 
-    Limitation: This test proves that a concurrent subscribe is blocked
-    until the locked controlled_ingest section completes. It does not
-    exhaustively prove absence of all possible races under arbitrary
-    scheduling; it verifies the lock is held across the protected interval.
+    The test uses Event coordination and try/finally so that:
+    - allow_release is always signaled, even if assertions fail
+    - both threads are joined with bounded timeouts
+    - no claim is made that subscribe_started proves the thread has
+      already reached lock acquisition (it only proves the thread has begun)
+
+    Limitation: This verifies lock-based serialization of one concurrent
+    subscribe across the protected interval under the tested schedule.
+    It does not exhaustively prove absence of all possible races.
     """
     database = tmp_path / "startup.db"
 
@@ -266,7 +271,6 @@ def test_concurrent_subscription_change_serialized_by_lock(tmp_path):
         with results_lock:
             results.append("VERIFY_ENTER")
         lock_held.set()
-        # Hold the bus lock until the test permits release.
         allow_release.wait(timeout=5)
         with results_lock:
             results.append("VERIFY_EXIT")
@@ -294,28 +298,43 @@ def test_concurrent_subscription_change_serialized_by_lock(tmp_path):
     )
     t_sub = threading.Thread(target=concurrent_subscribe, daemon=True)
 
-    t_ingest.start()
-    assert lock_held.wait(timeout=5), "locked section did not start"
+    try:
+        t_ingest.start()
+        assert lock_held.wait(timeout=5), "locked section did not start"
 
-    t_sub.start()
-    assert subscribe_started.wait(timeout=5), "subscribe thread did not start"
+        t_sub.start()
+        # subscribe_started only proves the thread has begun execution;
+        # it does not prove the thread has reached the bus lock.
+        assert subscribe_started.wait(timeout=5), "subscribe thread did not start"
 
-    # At this point the subscribe thread has started and must be blocked
-    # on the bus lock. It cannot have finished yet.
-    assert not subscribe_finished.is_set()
+        # While the lock is still held, the subscribe cannot have finished.
+        assert not subscribe_finished.is_set()
 
-    # Permit the locked section to complete.
-    allow_release.set()
+        # Release the locked section.
+        allow_release.set()
 
-    t_ingest.join(timeout=5)
-    t_sub.join(timeout=5)
+        t_ingest.join(timeout=5)
+        t_sub.join(timeout=5)
 
-    assert not t_ingest.is_alive()
-    assert not t_sub.is_alive()
-    assert subscribe_finished.is_set()
+        assert not t_ingest.is_alive()
+        assert not t_sub.is_alive()
+        assert subscribe_finished.is_set()
 
-    with results_lock:
-        assert results == ["VERIFY_ENTER", "VERIFY_EXIT", "INGEST", "SUBSCRIBE"]
+        with results_lock:
+            assert results == [
+                "VERIFY_ENTER",
+                "VERIFY_EXIT",
+                "INGEST",
+                "SUBSCRIBE",
+            ]
+
+    finally:
+        # Ensure the locked section can always exit, even if an assertion fails.
+        allow_release.set()
+        if t_ingest.is_alive():
+            t_ingest.join(timeout=5)
+        if t_sub.is_alive():
+            t_sub.join(timeout=5)
 
 
 def test_existing_successful_ingestion_unchanged(tmp_path):
