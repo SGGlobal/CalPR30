@@ -204,24 +204,6 @@ def test_ingestion_stores_evidence(tmp_path):
     assert stored["price"] == result["price"]
 
 
-def test_interrupted_registration_leaves_evidence(tmp_path):
-    """
-    Simulate a crash after registration commit but before publish.
-    Evidence must still be durable.
-    """
-    database = tmp_path / "evidence.db"
-    registry = AtomicSignalRegistry(database)
-
-    payload = make_payload()
-    validated = validate_signal(payload)
-    fingerprint = SignalDeduplicator().fingerprint(validated)
-
-    # Register (commits) then raise before any publish.
-    assert registry.register(fingerprint, evidence=payload) is True
-
-    raise RuntimeError("simulated crash before publish")
-
-
 def test_interrupted_registration_leaves_evidence_verified(tmp_path):
     database = tmp_path / "evidence.db"
     registry = AtomicSignalRegistry(database)
@@ -232,7 +214,7 @@ def test_interrupted_registration_leaves_evidence_verified(tmp_path):
 
     registry.register(fingerprint, evidence=payload)
 
-    # Re-open as a new process would.
+    # Re-open as a new process would after a crash before publish.
     reopened = AtomicSignalRegistry(database)
 
     assert reopened.get_evidence(fingerprint) == payload
@@ -240,21 +222,5 @@ def test_interrupted_registration_leaves_evidence_verified(tmp_path):
 
 
 def test_schema_migration_failure_fails_closed(tmp_path):
-    database = tmp_path / "broken.db"
-
-    # Create a signals table that will cause ALTER to fail
-    # by making the connection path invalid after creation.
-    with sqlite3.connect(database) as connection:
-        connection.execute(
-            """
-            CREATE TABLE signals (
-                fingerprint TEXT PRIMARY KEY,
-                first_seen TEXT NOT NULL
-            )
-            """
-        )
-
-    # Force a failure by making the directory disappear after the file exists.
-    # (Simpler: pass a path whose parent is not a directory.)
     with pytest.raises(AtomicRegistryError):
         AtomicSignalRegistry(tmp_path / "missing_dir" / "broken.db")
