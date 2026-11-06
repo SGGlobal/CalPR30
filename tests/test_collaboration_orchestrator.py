@@ -46,31 +46,78 @@ def test_correction_loop(tmp_path):
     assert report["corrections"] == 1
 
 
-def test_handler_invoked_on_delivery(tmp_path):
+def test_jason_handler_processes_assignment(tmp_path):
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
-    router = LocalRouter(protocol)
-
-    called = []
-
-    def handler(message):
-        called.append(message.message_id)
-
-    router.register("jason", handler)
+    orchestrator = CollaborationOrchestrator(protocol)
+    now = datetime.now(timezone.utc)
 
     msg = Message(
-        message_id="h1", idempotency_key="h-k", correlation_id="c",
-        project_id="QLA", task_id="TH", sender="skyppy", recipient="jason",
-        message_type=MessageType.TASK_ASSIGNMENT,
-        timestamp=datetime.now(timezone.utc),
-        payload={"objective": "handle me"},
+        message_id="jh1", idempotency_key="jh-k", correlation_id="c",
+        project_id="QLA", task_id="TJ", sender="skyppy", recipient="jason",
+        message_type=MessageType.TASK_ASSIGNMENT, timestamp=now,
+        payload={"objective": "build plan"},
     )
 
-    protocol.accept(msg)
-    assert router.dispatch(msg) == "handled"
-    assert called == ["h1"]
+    orchestrator._send(msg, now)
+    result = orchestrator._handler_results["jh1"]
+
+    assert "steps" in result
+    assert isinstance(result["steps"], list)
+    assert protocol.is_acknowledged("jh1") is True
 
 
-def test_handler_failure_leaves_unacknowledged(tmp_path):
+def test_skyppy_handler_processes_review(tmp_path):
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
+    orchestrator = CollaborationOrchestrator(protocol)
+    now = datetime.now(timezone.utc)
+
+    msg = Message(
+        message_id="sh1", idempotency_key="sh-k", correlation_id="c",
+        project_id="QLA", task_id="TS", sender="jason", recipient="skyppy",
+        message_type=MessageType.RESULT, timestamp=now,
+        payload={
+            "objective": "x",
+            "steps": ["a", "b"],
+            "needs_correction": False,
+        },
+    )
+
+    # RESULT requires an existing task in IN_PROGRESS. Create the path.
+    assignment = Message(
+        message_id="sh-a", idempotency_key="sh-ak", correlation_id="c",
+        project_id="QLA", task_id="TS", sender="skyppy", recipient="jason",
+        message_type=MessageType.TASK_ASSIGNMENT, timestamp=now,
+        payload={"objective": "x"},
+    )
+    protocol.accept(assignment, now=now)
+    protocol.acknowledge(assignment.message_id)
+
+    ack = Message(
+        message_id="sh-ack", idempotency_key="sh-ackk", correlation_id="c",
+        project_id="QLA", task_id="TS", sender="jason", recipient="skyppy",
+        message_type=MessageType.ACK, timestamp=now,
+        payload={"received": True}, parent_message_id="sh-a",
+    )
+    protocol.accept(ack, now=now)
+    protocol.acknowledge(ack.message_id)
+
+    start = Message(
+        message_id="sh-s", idempotency_key="sh-sk", correlation_id="c",
+        project_id="QLA", task_id="TS", sender="jason", recipient="bridge",
+        message_type=MessageType.START, timestamp=now,
+        payload={"started": True}, parent_message_id="sh-ack",
+    )
+    protocol.accept(start, now=now)
+    protocol.acknowledge(start.message_id)
+
+    orchestrator._send(msg, now)
+    review = orchestrator._handler_results["sh1"]
+
+    assert review["decision"] == "approved"
+    assert protocol.is_acknowledged("sh1") is True
+
+
+def test_handler_failure_prevents_acknowledgment(tmp_path):
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
     orchestrator = CollaborationOrchestrator(protocol)
 
@@ -94,7 +141,7 @@ def test_handler_failure_leaves_unacknowledged(tmp_path):
     assert "f1" in protocol.unacknowledged()
 
 
-def test_duplicate_handling_does_not_repeat_effects(tmp_path):
+def test_duplicate_delivery_does_not_repeat_processing(tmp_path):
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
     router = LocalRouter(protocol)
 
@@ -119,6 +166,88 @@ def test_duplicate_handling_does_not_repeat_effects(tmp_path):
     assert calls == ["d1"]
 
 
+def test_complete_with_unacknowledged_completion(tmp_path):
+    database = tmp_path / "bridge.db"
+    protocol = CollaborationProtocol(database)
+    now = datetime.now(timezone.utc)
+
+    # Drive to UNDER_REVIEW then accept a COMPLETION without acknowledging it.
+    orchestrator = CollaborationOrchestrator(protocol)
+    orchestrator.run("TC", "complete me")
+
+    # Manually insert an unacknowledged extra message is not possible after
+    # COMPLETE (terminal). Instead, accept a completion-shaped message on a
+    # fresh path that ends COMPLETE but leave the final message unacked.
+    # We simulate by accepting messages up to COMPLETION and skipping ack.
+    protocol2 = CollaborationProtocol(tmp_path / "bridge2.db")
+    now = datetime.now(timezone.utc)
+
+    steps = [
+        ("c1", "k1", MessageType.TASK_ASSIGNMENT, "skyppy", "jason",
+         {"objective": "x"}, None),
+        ("c2", "k2", MessageType.ACK, "jason", "skyppy",
+         {"received": True}, "c1"),
+        ("c3", "k3", MessageType.START, "jason", "bridge",
+         {"started": True}, "c2"),
+        ("c4", "k4", MessageType.RESULT, "jason", "skyppy",
+         {"objective": "x", "steps": ["a"], "needs_correction": False}, "c3"),
+        ("c5", "k5", MessageType.REVIEW, "skyppy", "jason",
+         {"decision": "approved", "reason": "ok"}, "c4"),
+        ("c6", "k6", MessageType.COMPLETION, "skyppy", "bridge",
+         {"outcome": "approved"}, "c5"),
+    ]
+
+    for mid, key, mtype, sender, recipient, payload, parent in steps:
+        message = Message(
+            message_id=mid, idempotency_key=key, correlation_id="cc",
+            project_id="QLA", task_id="TC2", sender=sender, recipient=recipient,
+            message_type=mtype, timestamp=now, payload=payload,
+            parent_message_id=parent,
+        )
+        protocol2.accept(message, now=now)
+        if mid != "c6":
+            protocol2.acknowledge(mid)
+
+    status = CollaborationOrchestrator(protocol2).recover("TC2")
+
+    assert status["recovery"] == "uncertain"
+    assert status["status"] == "COMPLETE"
+    assert "c6" in status["outstanding"]
+
+
+def test_complete_all_acknowledged(tmp_path):
+    database = tmp_path / "bridge.db"
+    CollaborationOrchestrator(CollaborationProtocol(database)).run("T5", "done")
+
+    status = CollaborationOrchestrator(
+        CollaborationProtocol(database)
+    ).recover("T5")
+
+    assert status["recovery"] == "complete_not_replayed"
+
+
+def test_earlier_unacknowledged_blocks_later_ack(tmp_path):
+    database = tmp_path / "bridge.db"
+    protocol = CollaborationProtocol(database)
+    now = datetime.now(timezone.utc)
+
+    first = Message(
+        message_id="early", idempotency_key="k-early", correlation_id="c",
+        project_id="QLA", task_id="TE", sender="skyppy", recipient="jason",
+        message_type=MessageType.TASK_ASSIGNMENT, timestamp=now,
+        payload={"objective": "early"},
+    )
+    protocol.accept(first, now=now)
+    # Not acknowledged.
+
+    status = CollaborationOrchestrator(
+        CollaborationProtocol(database)
+    ).recover("TE")
+
+    assert status["recovery"] == "uncertain"
+    assert "early" in status["outstanding"]
+
+
 def test_recovery_after_assignment(tmp_path):
     database = tmp_path / "bridge.db"
     protocol = CollaborationProtocol(database)
@@ -139,8 +268,9 @@ def test_recovery_after_assignment(tmp_path):
     protocol.accept(msg, now=now)
     protocol.acknowledge(msg.message_id)
 
-    recovered = CollaborationOrchestrator(CollaborationProtocol(database))
-    status = recovered.recover("T3")
+    status = CollaborationOrchestrator(
+        CollaborationProtocol(database)
+    ).recover("T3")
 
     assert status["recovery"] == "resumable"
     assert status["status"] == "ASSIGNED"
@@ -176,40 +306,6 @@ def test_recovery_after_ack(tmp_path):
 
     assert status["recovery"] == "resumable"
     assert status["status"] == "ACKNOWLEDGED"
-
-
-def test_earlier_unacknowledged_blocks_recovery(tmp_path):
-    database = tmp_path / "bridge.db"
-    protocol = CollaborationProtocol(database)
-    now = datetime.now(timezone.utc)
-
-    first = Message(
-        message_id="early", idempotency_key="k-early", correlation_id="c",
-        project_id="QLA", task_id="TE", sender="skyppy", recipient="jason",
-        message_type=MessageType.TASK_ASSIGNMENT, timestamp=now,
-        payload={"objective": "early"},
-    )
-    protocol.accept(first, now=now)
-    # Intentionally not acknowledged.
-
-    status = CollaborationOrchestrator(
-        CollaborationProtocol(database)
-    ).recover("TE")
-
-    assert status["recovery"] == "uncertain"
-    assert "early" in status["outstanding"]
-
-
-def test_recovery_after_result(tmp_path):
-    database = tmp_path / "bridge.db"
-    first = CollaborationProtocol(database)
-    CollaborationOrchestrator(first).run("T5", "result stage")
-
-    status = CollaborationOrchestrator(
-        CollaborationProtocol(database)
-    ).recover("T5")
-
-    assert status["recovery"] == "complete_not_replayed"
 
 
 def test_completed_task_not_replayed(tmp_path):
@@ -254,11 +350,7 @@ def test_task_specific_filtering(tmp_path):
     assert second["unacknowledged"] == []
 
 
-def test_halt_during_active_workflow(tmp_path):
-    """
-    Issue HALT after the assignment is accepted and before the next stage.
-    Further agent handling and message acceptance must stop.
-    """
+def test_halt_before_next_agent_operation(tmp_path):
     database = tmp_path / "bridge.db"
     protocol = CollaborationProtocol(database)
     orchestrator = CollaborationOrchestrator(protocol)
@@ -287,7 +379,6 @@ def test_halt_during_active_workflow(tmp_path):
             now,
         )
 
-    # Previously accepted record remains inspectable.
     assert orchestrator.report("THALT")["status"] == "ASSIGNED"
     assert orchestrator.report("THALT")["message_count"] == 1
 
@@ -308,12 +399,6 @@ def test_halt_persists_across_reopen(tmp_path):
 
 
 def test_invalid_recipient_rejected():
-    """
-    Message construction rejects unknown recipients.
-    Router validation is tested with a valid Message that is then
-    checked by validate_recipient after a synthetic override is not
-    possible; instead we confirm the constructor itself rejects.
-    """
     with pytest.raises(ProtocolError, match="Unknown recipient"):
         Message(
             message_id="bad", idempotency_key="bad-k", correlation_id="c",

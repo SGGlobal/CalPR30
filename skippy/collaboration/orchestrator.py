@@ -13,6 +13,8 @@ Delivery sequence for every message:
 
 recover() classifies progress from persisted records. It does not
 automatically continue a partial workflow.
+
+Hermes is reserved for a later milestone and is not integrated here.
 """
 
 from __future__ import annotations
@@ -47,6 +49,8 @@ class CollaborationOrchestrator:
     Drives a complete synthetic collaboration workflow.
 
     All task transitions go through CollaborationProtocol.accept().
+    Agent work for assignment handling and review is performed by the
+    registered router handlers.
     """
 
     def __init__(self, protocol: CollaborationProtocol):
@@ -54,21 +58,45 @@ class CollaborationOrchestrator:
         self.router = LocalRouter(protocol)
         self.skyppy = SimulatedSkyppy()
         self.jason = SimulatedJason()
+        self._handler_results: dict[str, dict[str, Any]] = {}
         self._register_handlers()
 
     def _register_handlers(self) -> None:
         def _skyppy(message: Message) -> None:
-            # Deterministic no-op handler; agent work is explicit in run().
-            return None
+            # Skyppy reviews RESULT payloads.
+            if message.message_type is MessageType.RESULT:
+                plan = dict(message.payload)
+                self._handler_results[message.message_id] = self.skyppy.review(plan)
+            else:
+                self._handler_results[message.message_id] = {
+                    "handled": message.message_type.value,
+                }
 
         def _jason(message: Message) -> None:
-            return None
+            # Jason produces a plan from an assignment or correction.
+            if message.message_type is MessageType.TASK_ASSIGNMENT:
+                plan = self.jason.plan(dict(message.payload), correction=False)
+                self._handler_results[message.message_id] = plan
+            elif message.message_type is MessageType.CORRECTION:
+                plan = self.jason.plan(
+                    {"objective": message.payload.get("objective", "unspecified")},
+                    correction=True,
+                )
+                self._handler_results[message.message_id] = plan
+            else:
+                self._handler_results[message.message_id] = {
+                    "handled": message.message_type.value,
+                }
 
         def _bridge(message: Message) -> None:
-            return None
+            self._handler_results[message.message_id] = {
+                "handled": message.message_type.value,
+            }
 
         def _chief(message: Message) -> None:
-            return None
+            self._handler_results[message.message_id] = {
+                "handled": message.message_type.value,
+            }
 
         self.router.register("skyppy", _skyppy)
         self.router.register("jason", _jason)
@@ -117,14 +145,11 @@ class CollaborationOrchestrator:
 
         accepted = self.protocol.accept(message, now=now)
         if not accepted:
-            # Valid duplicate delivery. Do not re-acknowledge and do not
-            # reprocess. If it was never acknowledged, leave it that way.
             return message
 
         try:
             outcome = self.router.dispatch(message)
         except Exception:
-            # Accepted but not acknowledged.
             raise
 
         if outcome == "duplicate":
@@ -163,20 +188,14 @@ class CollaborationOrchestrator:
         Classify progress from persisted records.
 
         This is recovery classification, not automatic resumption.
-        If any message belonging to the task is unacknowledged, the
-        task is not classified as safely resumable.
+        Outstanding acknowledgments are checked before any COMPLETE
+        classification. A COMPLETE task with outstanding messages is
+        uncertain and is never silently acknowledged or replayed.
         """
 
         state = self.protocol.get_state(task_id)
         if state is None:
             return {"task_id": task_id, "recovery": "not_found"}
-
-        if state is TaskState.COMPLETE:
-            return {
-                "task_id": task_id,
-                "recovery": "complete_not_replayed",
-                "status": state.value,
-            }
 
         messages = self._task_messages(task_id)
         if not messages:
@@ -197,6 +216,14 @@ class CollaborationOrchestrator:
                 "outstanding": outstanding,
                 "correlation_id": messages[-1]["correlation_id"],
                 "reason": "One or more messages have unresolved handling",
+            }
+
+        if state is TaskState.COMPLETE:
+            return {
+                "task_id": task_id,
+                "recovery": "complete_not_replayed",
+                "status": state.value,
+                "correlation_id": messages[-1]["correlation_id"],
             }
 
         resumable = {
@@ -263,6 +290,11 @@ class CollaborationOrchestrator:
             now,
         )
 
+        # Jason's handler produced the plan from the assignment.
+        plan = self._handler_results.get(assignment.message_id)
+        if not isinstance(plan, dict) or "steps" not in plan:
+            raise OrchestratorError("Jason handler did not produce a plan")
+
         ack = self._send(
             self._message(
                 task_id, correlation, "jason", "skyppy",
@@ -281,7 +313,6 @@ class CollaborationOrchestrator:
             now,
         )
 
-        plan = self.jason.plan(assignment_payload, correction=False)
         result = self._send(
             self._message(
                 task_id, correlation, "jason", "skyppy",
@@ -291,7 +322,11 @@ class CollaborationOrchestrator:
             now,
         )
 
-        review_payload = self.skyppy.review(plan)
+        # Skyppy's handler reviewed the result.
+        review_payload = self._handler_results.get(result.message_id)
+        if not isinstance(review_payload, dict) or "decision" not in review_payload:
+            raise OrchestratorError("Skyppy handler did not produce a review")
+
         review = self._send(
             self._message(
                 task_id, correlation, "skyppy", "jason",
@@ -306,12 +341,21 @@ class CollaborationOrchestrator:
                 self._message(
                     task_id, correlation, "skyppy", "jason",
                     MessageType.CORRECTION,
-                    {"reason": review_payload["reason"]},
+                    {
+                        "reason": review_payload["reason"],
+                        "objective": assignment_payload.get("objective"),
+                    },
                     review.message_id,
                     "correction", now,
                 ),
                 now,
             )
+
+            corrected = self._handler_results.get(correction.message_id)
+            if not isinstance(corrected, dict) or "steps" not in corrected:
+                raise OrchestratorError(
+                    "Jason handler did not produce a corrected plan"
+                )
 
             restart = self._send(
                 self._message(
@@ -323,7 +367,6 @@ class CollaborationOrchestrator:
                 now,
             )
 
-            corrected = self.jason.plan(assignment_payload, correction=True)
             result = self._send(
                 self._message(
                     task_id, correlation, "jason", "skyppy",
@@ -333,7 +376,10 @@ class CollaborationOrchestrator:
                 now,
             )
 
-            review_payload = self.skyppy.review(corrected)
+            review_payload = self._handler_results.get(result.message_id)
+            if not isinstance(review_payload, dict) or "decision" not in review_payload:
+                raise OrchestratorError("Skyppy handler did not review correction")
+
             review = self._send(
                 self._message(
                     task_id, correlation, "skyppy", "jason",
