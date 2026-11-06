@@ -12,12 +12,12 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
+from skippy.adapters.tradingview.deduplicator import SignalDeduplicator
+from skippy.adapters.tradingview.validator import validate_signal
+
 
 class AtomicRegistryError(RuntimeError):
     """Raised when atomic registration cannot be guaranteed."""
-
-
-ALLOWED_EVIDENCE_KEYS = frozenset({"symbol", "action", "price", "timestamp"})
 
 
 class AtomicSignalRegistry:
@@ -79,10 +79,10 @@ class AtomicSignalRegistry:
     @staticmethod
     def _normalize_evidence(evidence: dict | None) -> str | None:
         """
-        Accept only the four validated signal fields.
+        Validate and canonicalize evidence when supplied.
 
         Returns a canonical JSON string or None.
-        Rejects anything else fail-closed.
+        Rejects invalid content fail-closed before any database access.
         """
 
         if evidence is None:
@@ -91,15 +91,22 @@ class AtomicSignalRegistry:
         if not isinstance(evidence, dict):
             raise ValueError("Evidence must be a dictionary")
 
-        if set(evidence.keys()) != ALLOWED_EVIDENCE_KEYS:
-            raise ValueError(
-                "Evidence must contain exactly symbol, action, price, and timestamp"
-            )
+        # Reuse the existing signal validator.
+        # This enforces allowed symbols/actions, numeric price,
+        # timezone-aware timestamp, and exact field set.
+        validated = validate_signal(evidence)
 
-        # Reject non-JSON-safe values early.
+        # Canonical representation used for fingerprinting and storage.
+        canonical = {
+            "symbol": validated.symbol,
+            "action": validated.action,
+            "price": validated.price,
+            "timestamp": validated.timestamp,
+        }
+
         try:
             serialized = json.dumps(
-                evidence,
+                canonical,
                 sort_keys=True,
                 separators=(",", ":"),
                 allow_nan=False,
@@ -120,8 +127,10 @@ class AtomicSignalRegistry:
         Returns True only for a new signal.
         Returns False for an existing signal.
 
-        When evidence is supplied it is stored in the same transaction.
+        When evidence is supplied it is validated, normalized, and
+        required to match the supplied fingerprint before any mutation.
         Duplicate registrations do not modify existing evidence.
+        Fingerprint-only registration remains supported for legacy paths.
         """
 
         if (
@@ -132,6 +141,17 @@ class AtomicSignalRegistry:
             raise ValueError("Invalid SHA-256 fingerprint")
 
         evidence_json = self._normalize_evidence(evidence)
+
+        # When evidence is present, recompute and enforce fingerprint match
+        # before opening a database transaction.
+        if evidence_json is not None:
+            validated = validate_signal(evidence)
+            recomputed = SignalDeduplicator().fingerprint(validated)
+
+            if recomputed != fingerprint:
+                raise ValueError(
+                    "Evidence fingerprint does not match supplied fingerprint"
+                )
 
         timestamp = self._timestamp()
 

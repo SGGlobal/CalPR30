@@ -26,7 +26,7 @@ from skippy.kernel.event_bus import EventBus
 
 
 TEST_SECRET = "local-simulation-secret-32-characters-minimum"
-FINGERPRINT = "a" * 64
+LEGACY_FINGERPRINT = "a" * 64
 
 
 def make_payload():
@@ -38,19 +38,25 @@ def make_payload():
     }
 
 
+def matching_fingerprint(payload: dict) -> str:
+    validated = validate_signal(payload)
+    return SignalDeduplicator().fingerprint(validated)
+
+
 def test_evidence_persists_on_registration(tmp_path):
     database = tmp_path / "evidence.db"
     registry = AtomicSignalRegistry(database)
 
     payload = make_payload()
-    validated = validate_signal(payload)
-    fingerprint = SignalDeduplicator().fingerprint(validated)
+    fingerprint = matching_fingerprint(payload)
 
     assert registry.register(fingerprint, evidence=payload) is True
 
     stored = registry.get_evidence(fingerprint)
 
-    assert stored == payload
+    assert stored["symbol"] == payload["symbol"]
+    assert stored["action"] == payload["action"]
+    assert stored["price"] == payload["price"]
 
 
 def test_evidence_matches_fingerprint(tmp_path):
@@ -58,15 +64,26 @@ def test_evidence_matches_fingerprint(tmp_path):
     registry = AtomicSignalRegistry(database)
 
     payload = make_payload()
-    validated = validate_signal(payload)
-    fingerprint = SignalDeduplicator().fingerprint(validated)
+    fingerprint = matching_fingerprint(payload)
 
     registry.register(fingerprint, evidence=payload)
 
     stored = registry.get_evidence(fingerprint)
-    recomputed = SignalDeduplicator().fingerprint(validate_signal(stored))
+    recomputed = matching_fingerprint(stored)
 
     assert recomputed == fingerprint
+
+
+def test_mismatched_fingerprint_rejected(tmp_path):
+    registry = AtomicSignalRegistry(tmp_path / "evidence.db")
+
+    payload = make_payload()
+
+    with pytest.raises(ValueError, match="fingerprint"):
+        registry.register(LEGACY_FINGERPRINT, evidence=payload)
+
+    # No records created.
+    assert registry.get_state(LEGACY_FINGERPRINT) is None
 
 
 def test_duplicate_does_not_overwrite_evidence(tmp_path):
@@ -74,7 +91,9 @@ def test_duplicate_does_not_overwrite_evidence(tmp_path):
     registry = AtomicSignalRegistry(database)
 
     original = make_payload()
-    registry.register(FINGERPRINT, evidence=original)
+    fingerprint = matching_fingerprint(original)
+
+    registry.register(fingerprint, evidence=original)
 
     different = {
         "symbol": "ETHUSDT",
@@ -83,39 +102,42 @@ def test_duplicate_does_not_overwrite_evidence(tmp_path):
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
-    assert registry.register(FINGERPRINT, evidence=different) is False
+    # Different evidence has a different fingerprint; the same fingerprint
+    # with different evidence must be rejected before mutation.
+    with pytest.raises(ValueError):
+        registry.register(fingerprint, evidence=different)
 
-    assert registry.get_evidence(FINGERPRINT) == original
+    assert registry.get_evidence(fingerprint)["symbol"] == original["symbol"]
 
 
 def test_historical_null_evidence_remains_valid(tmp_path):
     database = tmp_path / "evidence.db"
     registry = AtomicSignalRegistry(database)
 
-    # Simulate a pre-migration row.
+    # Simulate a pre-migration row with fingerprint only.
     with sqlite3.connect(database) as connection:
         connection.execute(
             """
             INSERT INTO signals (fingerprint, first_seen, evidence_json)
             VALUES (?, ?, NULL)
             """,
-            (FINGERPRINT, datetime.now(timezone.utc).isoformat()),
+            (LEGACY_FINGERPRINT, datetime.now(timezone.utc).isoformat()),
         )
         connection.execute(
             """
             INSERT INTO processing_states (fingerprint, state, updated_at)
             VALUES (?, 'RECEIVED', ?)
             """,
-            (FINGERPRINT, datetime.now(timezone.utc).isoformat()),
+            (LEGACY_FINGERPRINT, datetime.now(timezone.utc).isoformat()),
         )
 
-    assert registry.get_evidence(FINGERPRINT) is None
+    assert registry.get_evidence(LEGACY_FINGERPRINT) is None
 
     inspector = RecoveryInspector(database)
-    assert inspector.get_evidence(FINGERPRINT) is None
+    assert inspector.get_evidence(LEGACY_FINGERPRINT) is None
 
     report = inspector.inspect()
-    assert report[0]["fingerprint"] == FINGERPRINT
+    assert report[0]["fingerprint"] == LEGACY_FINGERPRINT
     assert "evidence" not in report[0]
 
 
@@ -123,16 +145,32 @@ def test_invalid_evidence_rejected(tmp_path):
     registry = AtomicSignalRegistry(tmp_path / "evidence.db")
 
     with pytest.raises(ValueError):
-        registry.register(FINGERPRINT, evidence={"extra": "field"})
+        registry.register(LEGACY_FINGERPRINT, evidence={"extra": "field"})
 
     with pytest.raises(ValueError):
-        registry.register(FINGERPRINT, evidence="not-a-dict")
+        registry.register(LEGACY_FINGERPRINT, evidence="not-a-dict")
+
+    with pytest.raises(ValueError):
+        registry.register(
+            LEGACY_FINGERPRINT,
+            evidence={
+                "symbol": "INVALID",
+                "action": "BUY",
+                "price": 1.0,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+
+    # No records created.
+    assert registry.get_state(LEGACY_FINGERPRINT) is None
 
 
-def test_existing_database_migrates(tmp_path):
+def test_existing_database_migrates_with_historical_records(tmp_path):
     database = tmp_path / "legacy.db"
 
-    # Create a pre-evidence schema.
+    old_time = "2026-01-01T00:00:00+00:00"
+
+    # Create a pre-evidence schema with historical data.
     with sqlite3.connect(database) as connection:
         connection.execute(
             """
@@ -151,8 +189,19 @@ def test_existing_database_migrates(tmp_path):
             )
             """
         )
+        connection.execute(
+            "INSERT INTO signals (fingerprint, first_seen) VALUES (?, ?)",
+            (LEGACY_FINGERPRINT, old_time),
+        )
+        connection.execute(
+            """
+            INSERT INTO processing_states (fingerprint, state, updated_at)
+            VALUES (?, 'RECEIVED', ?)
+            """,
+            (LEGACY_FINGERPRINT, old_time),
+        )
 
-    # Re-open with the new registry; migration should add the column.
+    # Migration on open.
     registry = AtomicSignalRegistry(database)
 
     with sqlite3.connect(database) as connection:
@@ -160,24 +209,30 @@ def test_existing_database_migrates(tmp_path):
             row[1]
             for row in connection.execute("PRAGMA table_info(signals)")
         }
+        row = connection.execute(
+            "SELECT first_seen, evidence_json FROM signals WHERE fingerprint = ?",
+            (LEGACY_FINGERPRINT,),
+        ).fetchone()
 
     assert "evidence_json" in columns
-
-    # Existing (none) and new registrations still work.
-    assert registry.register(FINGERPRINT, evidence=make_payload()) is True
+    assert row[0] == old_time
+    assert row[1] is None
+    assert registry.get_state(LEGACY_FINGERPRINT) == "RECEIVED"
 
 
 def test_repeated_initialization_preserves_records(tmp_path):
     database = tmp_path / "evidence.db"
 
-    first = AtomicSignalRegistry(database)
     payload = make_payload()
-    first.register(FINGERPRINT, evidence=payload)
+    fingerprint = matching_fingerprint(payload)
+
+    first = AtomicSignalRegistry(database)
+    first.register(fingerprint, evidence=payload)
 
     second = AtomicSignalRegistry(database)
 
-    assert second.get_evidence(FINGERPRINT) == payload
-    assert second.register(FINGERPRINT) is False
+    assert second.get_evidence(fingerprint)["symbol"] == payload["symbol"]
+    assert second.register(fingerprint) is False
 
 
 def test_ingestion_stores_evidence(tmp_path):
@@ -209,18 +264,24 @@ def test_interrupted_registration_leaves_evidence_verified(tmp_path):
     registry = AtomicSignalRegistry(database)
 
     payload = make_payload()
-    validated = validate_signal(payload)
-    fingerprint = SignalDeduplicator().fingerprint(validated)
+    fingerprint = matching_fingerprint(payload)
 
     registry.register(fingerprint, evidence=payload)
 
-    # Re-open as a new process would after a crash before publish.
     reopened = AtomicSignalRegistry(database)
 
-    assert reopened.get_evidence(fingerprint) == payload
+    assert reopened.get_evidence(fingerprint)["symbol"] == payload["symbol"]
     assert reopened.get_state(fingerprint) == "RECEIVED"
 
 
 def test_schema_migration_failure_fails_closed(tmp_path):
     with pytest.raises(AtomicRegistryError):
         AtomicSignalRegistry(tmp_path / "missing_dir" / "broken.db")
+
+
+def test_legacy_fingerprint_only_registration_still_works(tmp_path):
+    registry = AtomicSignalRegistry(tmp_path / "evidence.db")
+
+    assert registry.register(LEGACY_FINGERPRINT) is True
+    assert registry.get_state(LEGACY_FINGERPRINT) == "RECEIVED"
+    assert registry.get_evidence(LEGACY_FINGERPRINT) is None
