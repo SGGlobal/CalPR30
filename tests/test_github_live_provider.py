@@ -5,6 +5,7 @@ Mocked HTTP only. No real credentials. No network.
 """
 
 import json
+import traceback
 
 import pytest
 
@@ -177,6 +178,7 @@ def test_pending_workflow():
     snap = provider.workflow(ALLOWED_REPOSITORY, SHA)
 
     assert snap.status is CIStatus.PENDING
+    assert snap.name == "tests"
 
 
 def test_successful_workflow():
@@ -197,6 +199,29 @@ def test_successful_workflow():
     assert result.status is CIStatus.SUCCESS
     assert result.passed is None
     assert result.failed is None
+
+
+def test_unrelated_workflow_success_is_not_required():
+    """
+    A successful workflow that is not the required QLA test workflow
+    must not be reported as successful required tests.
+    """
+    transport = make_transport([
+        ("/actions/runs",
+         json_response({
+             "workflow_runs": [{
+                 "name": "deploy",
+                 "status": "completed",
+                 "conclusion": "success",
+                 "head_sha": SHA,
+             }],
+         })),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+    snap = provider.workflow(ALLOWED_REPOSITORY, SHA)
+
+    assert snap.name == "tests"
+    assert snap.status is CIStatus.UNAVAILABLE
 
 
 def test_failed_workflow():
@@ -292,6 +317,28 @@ def test_timeout():
         provider.repository(ALLOWED_REPOSITORY)
 
 
+def test_credential_not_in_traceback():
+    """
+    A transport exception that includes the token must not surface it
+    in the raised error or its traceback.
+    """
+
+    def leaky(method, url, headers, timeout):
+        raise RuntimeError(f"failed with token {TOKEN}")
+
+    transport = make_transport([("/repos/", leaky)])
+    provider = GitHubLiveProvider(TOKEN, transport)
+
+    try:
+        provider.repository(ALLOWED_REPOSITORY)
+    except TransportError as exc:
+        rendered = "".join(traceback.format_exception(exc))
+        assert TOKEN not in str(exc)
+        assert TOKEN not in rendered
+    else:
+        raise AssertionError("expected TransportError")
+
+
 def test_malformed_json():
     transport = make_transport([
         ("/repos/", HTTPResponse(200, b"not-json", {})),
@@ -327,6 +374,49 @@ def test_unexpected_redirect():
 
     with pytest.raises(TransportError, match="redirect"):
         provider.repository(ALLOWED_REPOSITORY)
+
+
+def test_malformed_repository_identity():
+    transport = make_transport([
+        ("/repos/SGGlobal/QLA",
+         json_response({
+             "full_name": "other/repo",
+             "default_branch": "main",
+             "private": True,
+         })),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+
+    with pytest.raises(AdapterError, match="identity mismatch"):
+        provider.repository(ALLOWED_REPOSITORY)
+
+
+def test_missing_repository_fields():
+    transport = make_transport([
+        ("/repos/SGGlobal/QLA",
+         json_response({"full_name": "SGGlobal/QLA"})),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+
+    with pytest.raises(AdapterError, match="default branch"):
+        provider.repository(ALLOWED_REPOSITORY)
+
+
+def test_missing_pull_request_source():
+    transport = make_transport([
+        ("/pulls/1",
+         json_response({
+             "title": "Open",
+             "state": "open",
+             "merged": False,
+             "head": {},
+             "base": {"ref": "phase-8-tradingview-integration"},
+         })),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+
+    with pytest.raises(AdapterError, match="source"):
+        provider.pull_request(ALLOWED_REPOSITORY, 1)
 
 
 def test_invalid_provenance_rejected():
