@@ -1,4 +1,4 @@
-﻿"""
+"""
 SKIPPY AI TRADER - PHASE 8
 
 Read-Only TradingView Recovery Inspector.
@@ -7,6 +7,7 @@ LOCAL SIMULATION ONLY.
 No database mutations, retries, or trade execution.
 """
 
+import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -67,6 +68,7 @@ class RecoveryInspector:
         Inspect replay, processing-state, and observation records.
 
         No database modifications or automatic retries.
+        Evidence is intentionally omitted from the default report.
         """
 
         if now is None:
@@ -187,3 +189,44 @@ class RecoveryInspector:
             })
 
         return report
+
+    def get_evidence(self, fingerprint: str) -> dict | None:
+        """
+        Retrieve validated signal evidence for a fingerprint.
+
+        Returns None when the record has no evidence (historical NULL).
+        Read-only; does not modify state.
+        """
+
+        try:
+            with self._connect() as connection:
+                connection.execute("PRAGMA query_only = ON")
+
+                row = connection.execute(
+                    """
+                    SELECT evidence_json
+                    FROM signals
+                    WHERE fingerprint = ?
+                    """,
+                    (fingerprint,),
+                ).fetchone()
+
+        except sqlite3.Error as exc:
+            raise RecoveryInspectionError(
+                "Unable to retrieve signal evidence"
+            ) from exc
+
+        if row is None or row[0] is None:
+            return None
+
+        try:
+            parsed = json.loads(row[0])
+        except (TypeError, ValueError) as exc:
+            raise RecoveryInspectionError(
+                "Stored evidence contains invalid JSON"
+            ) from exc
+
+        if not isinstance(parsed, dict):
+            raise RecoveryInspectionError("Stored evidence is not an object")
+
+        return parsed
