@@ -42,17 +42,23 @@ def _request(**overrides):
     return AuthorizationRequest(**values)
 
 
+def _decide(policy, authorization_id="auth-1", **overrides):
+    values = {
+        "action": "merge_pull_request",
+        "repository": "SGGlobal/QLA",
+        "project_id": "qla",
+        "task_id": "task-1",
+        "action_digest": "digest-a",
+        "expected_sha": "abc1234",
+        "environment": "local",
+    }
+    values.update(overrides)
+    return policy.decide(authorization_id, **values)
+
+
 def test_default_denial(tmp_path):
     policy = AuthorizationPolicy(tmp_path / "auth.db")
-    decision = policy.decide(
-        "missing",
-        action="merge_pull_request",
-        repository="SGGlobal/QLA",
-        project_id="qla",
-        task_id="task-1",
-        action_digest="digest-a",
-        expected_sha="abc1234",
-    )
+    decision = _decide(policy, "missing")
     assert decision.allowed is False
     assert decision.execution_enabled is False
 
@@ -73,47 +79,47 @@ def test_unauthorized_participant_rejected(tmp_path):
         _request(requesting_participant="hermes")
 
 
-def test_forged_chief_identity(tmp_path):
-    policy = AuthorizationPolicy(tmp_path / "auth.db")
-    policy.submit(_request(requesting_participant="jason", chief_identity="jason"))
-
-    decision = policy.decide(
-        "auth-1",
-        action="merge_pull_request",
-        repository="SGGlobal/QLA",
-        project_id="qla",
-        task_id="task-1",
-        action_digest="digest-a",
-        expected_sha="abc1234",
-    )
-    assert decision.reason == "AI impersonation of Chief"
-
-
-def test_ai_cannot_submit_approved(tmp_path):
+def test_ai_approved_rejected_on_submit(tmp_path):
     policy = AuthorizationPolicy(tmp_path / "auth.db")
     with pytest.raises(AuthorizationError, match="manufacture"):
         policy.submit(
             _request(
-                requesting_participant="skyppy",
+                requesting_participant="jason",
                 state=AuthorizationState.APPROVED,
             )
         )
+
+
+def test_pending_impersonation_rejected_on_decide(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    policy.submit(
+        _request(
+            requesting_participant="jason",
+            chief_identity="jason",
+            state=AuthorizationState.PENDING,
+        )
+    )
+
+    decision = _decide(policy)
+    assert decision.reason == "AI impersonation of Chief"
+    assert decision.execution_enabled is False
 
 
 def test_expiration(tmp_path):
     policy = AuthorizationPolicy(tmp_path / "auth.db")
     policy.submit(_request(expires_at=_now() - timedelta(seconds=1)))
 
-    decision = policy.decide(
-        "auth-1",
-        action="merge_pull_request",
-        repository="SGGlobal/QLA",
-        project_id="qla",
-        task_id="task-1",
-        action_digest="digest-a",
-        expected_sha="abc1234",
-    )
+    decision = _decide(policy)
     assert decision.state is AuthorizationState.EXPIRED
+
+
+def test_expiration_blocks_consumption(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    policy.submit(_request(expires_at=_now() - timedelta(seconds=1)))
+
+    decision = policy.consume("auth-1")
+    assert decision.state is AuthorizationState.EXPIRED
+    assert decision.execution_enabled is False
 
 
 def test_revocation(tmp_path):
@@ -121,16 +127,25 @@ def test_revocation(tmp_path):
     policy.submit(_request())
     policy.revoke("auth-1")
 
-    decision = policy.decide(
-        "auth-1",
-        action="merge_pull_request",
-        repository="SGGlobal/QLA",
-        project_id="qla",
-        task_id="task-1",
-        action_digest="digest-a",
-        expected_sha="abc1234",
-    )
+    decision = _decide(policy)
     assert decision.state is AuthorizationState.REVOKED
+
+
+def test_revocation_blocks_consumption(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    policy.submit(_request())
+    policy.revoke("auth-1")
+
+    decision = policy.consume("auth-1")
+    assert decision.state is AuthorizationState.REVOKED
+
+
+def test_denied_blocks_consumption(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    policy.submit(_request(state=AuthorizationState.DENIED))
+
+    decision = policy.consume("auth-1")
+    assert decision.state is AuthorizationState.DENIED
 
 
 def test_one_time_consumption(tmp_path):
@@ -142,6 +157,7 @@ def test_one_time_consumption(tmp_path):
 
     assert first.state is AuthorizationState.CONSUMED
     assert first.execution_enabled is False
+    assert second.state is AuthorizationState.CONSUMED
     assert second.allowed is False
 
 
@@ -149,15 +165,7 @@ def test_action_mismatch(tmp_path):
     policy = AuthorizationPolicy(tmp_path / "auth.db")
     policy.submit(_request())
 
-    decision = policy.decide(
-        "auth-1",
-        action="deploy",
-        repository="SGGlobal/QLA",
-        project_id="qla",
-        task_id="task-1",
-        action_digest="digest-a",
-        expected_sha="abc1234",
-    )
+    decision = _decide(policy, action="deploy")
     assert decision.reason == "Incorrect action"
 
 
@@ -165,15 +173,7 @@ def test_sha_mismatch(tmp_path):
     policy = AuthorizationPolicy(tmp_path / "auth.db")
     policy.submit(_request())
 
-    decision = policy.decide(
-        "auth-1",
-        action="merge_pull_request",
-        repository="SGGlobal/QLA",
-        project_id="qla",
-        task_id="task-1",
-        action_digest="digest-a",
-        expected_sha="different",
-    )
+    decision = _decide(policy, expected_sha="different")
     assert decision.reason == "Commit SHA does not match"
 
 
@@ -181,16 +181,17 @@ def test_repository_mismatch(tmp_path):
     policy = AuthorizationPolicy(tmp_path / "auth.db")
     policy.submit(_request())
 
-    decision = policy.decide(
-        "auth-1",
-        action="merge_pull_request",
-        repository="other/repo",
-        project_id="qla",
-        task_id="task-1",
-        action_digest="digest-a",
-        expected_sha="abc1234",
-    )
+    decision = _decide(policy, repository="other/repo")
     assert decision.reason == "Incorrect repository"
+
+
+def test_environment_mismatch(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    policy.submit(_request(environment="local"))
+
+    decision = _decide(policy, environment="production")
+    assert decision.reason == "Incorrect environment"
+    assert decision.execution_enabled is False
 
 
 def test_halt_precedence(tmp_path):
@@ -198,19 +199,26 @@ def test_halt_precedence(tmp_path):
     policy.submit(_request())
     policy.halt()
 
-    decision = policy.decide(
-        "auth-1",
-        action="merge_pull_request",
-        repository="SGGlobal/QLA",
-        project_id="qla",
-        task_id="task-1",
-        action_digest="digest-a",
-        expected_sha="abc1234",
-    )
+    decision = _decide(policy)
     assert decision.reason == "System is halted"
 
     consumed = policy.consume("auth-1")
     assert consumed.allowed is False
+    assert consumed.reason == "System is halted"
+
+
+def test_halt_persists(tmp_path):
+    path = tmp_path / "auth.db"
+    policy = AuthorizationPolicy(path)
+    policy.halt()
+
+    reopened = AuthorizationPolicy(path)
+    assert reopened.is_halted() is True
+
+
+def test_expires_after_creation_required(tmp_path):
+    with pytest.raises(AuthorizationError, match="after created_at"):
+        _request(expires_at=_now() - timedelta(hours=1))
 
 
 def test_sqlite_persistence(tmp_path):
@@ -219,15 +227,7 @@ def test_sqlite_persistence(tmp_path):
     policy.submit(_request())
 
     reopened = AuthorizationPolicy(path)
-    decision = reopened.decide(
-        "auth-1",
-        action="merge_pull_request",
-        repository="SGGlobal/QLA",
-        project_id="qla",
-        task_id="task-1",
-        action_digest="digest-a",
-        expected_sha="abc1234",
-    )
+    decision = _decide(reopened)
     assert decision.state is AuthorizationState.APPROVED
     assert decision.execution_enabled is False
 
@@ -236,15 +236,7 @@ def test_no_execution_capability(tmp_path):
     policy = AuthorizationPolicy(tmp_path / "auth.db")
     policy.submit(_request())
 
-    decision = policy.decide(
-        "auth-1",
-        action="merge_pull_request",
-        repository="SGGlobal/QLA",
-        project_id="qla",
-        task_id="task-1",
-        action_digest="digest-a",
-        expected_sha="abc1234",
-    )
+    decision = _decide(policy)
     assert isinstance(decision, AuthorizationDecision)
     assert decision.execution_enabled is False
 

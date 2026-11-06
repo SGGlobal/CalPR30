@@ -10,11 +10,17 @@ or execute protected operations.
 A message claiming authorization is not proof of authorization.
 An identity string is not authentication.
 Execution permission remains disabled in this milestone.
+
+HALT limitation:
+This policy maintains its own persistent HALT flag. Fully atomic
+coordination with CollaborationProtocol.halt() is not possible in this
+milestone because the two components use separate databases. When either
+flag is set, this policy fails closed. There is no automatic resume and
+no recovery procedure in this step.
 """
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import uuid
 from dataclasses import dataclass
@@ -93,16 +99,30 @@ class AuthorizationRequest:
     evidence_ref: str | None = None
 
     def __post_init__(self):
-        if not self.authorization_id:
+        if not isinstance(self.authorization_id, str) or not self.authorization_id:
             raise AuthorizationError("authorization_id is required")
+        if not isinstance(self.chief_identity, str) or not self.chief_identity:
+            raise AuthorizationError("chief_identity is required")
         if self.requesting_participant not in KNOWN_PARTICIPANTS:
             raise AuthorizationError("Unknown requesting participant")
         if self.action not in READ_ONLY_ACTIONS | PROTECTED_ACTIONS:
             raise AuthorizationError("Unknown action")
+        if not isinstance(self.action_digest, str) or not self.action_digest:
+            raise AuthorizationError("action_digest is required")
+        if not isinstance(self.repository, str) or not self.repository:
+            raise AuthorizationError("repository is required")
+        if not isinstance(self.project_id, str) or not self.project_id:
+            raise AuthorizationError("project_id is required")
+        if not isinstance(self.task_id, str) or not self.task_id:
+            raise AuthorizationError("task_id is required")
+        if not isinstance(self.environment, str) or not self.environment:
+            raise AuthorizationError("environment is required")
         if not isinstance(self.created_at, datetime) or self.created_at.tzinfo is None:
             raise AuthorizationError("created_at must be timezone-aware")
         if not isinstance(self.expires_at, datetime) or self.expires_at.tzinfo is None:
             raise AuthorizationError("expires_at must be timezone-aware")
+        if self.expires_at <= self.created_at:
+            raise AuthorizationError("expires_at must be after created_at")
 
 
 @dataclass(frozen=True)
@@ -233,8 +253,13 @@ class AuthorizationPolicy:
             )
 
     def submit(self, request: AuthorizationRequest) -> None:
-        if request.requesting_participant in AI_PARTICIPANTS and request.state is AuthorizationState.APPROVED:
-            raise AuthorizationError("AI cannot manufacture an approved authorization")
+        if (
+            request.requesting_participant in AI_PARTICIPANTS
+            and request.state is AuthorizationState.APPROVED
+        ):
+            raise AuthorizationError(
+                "AI cannot manufacture an approved authorization"
+            )
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -292,6 +317,7 @@ class AuthorizationPolicy:
         task_id: str,
         action_digest: str,
         expected_sha: str | None,
+        environment: str,
         now: datetime | None = None,
     ) -> AuthorizationDecision:
         """
@@ -303,18 +329,27 @@ class AuthorizationPolicy:
 
         now = now or datetime.now(timezone.utc)
 
-        if self.is_halted():
-            return AuthorizationDecision(
-                False, AuthorizationState.DENIED, "System is halted"
-            )
-
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+
+            halt_row = connection.execute(
+                "SELECT value FROM authorization_control WHERE key = 'halted'"
+            ).fetchone()
+            if halt_row and halt_row[0] == "1":
+                self._record(
+                    connection, authorization_id, action, repository,
+                    None, "DENIED", "System is halted",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "System is halted"
+                )
+
             row = connection.execute(
                 """
                 SELECT chief_identity, requesting_participant, action,
                        action_digest, repository, project_id, task_id,
-                       expected_sha, expires_at, state, consumption_id
+                       expected_sha, environment, expires_at, state,
+                       consumption_id
                 FROM authorization_requests
                 WHERE authorization_id = ?
                 """,
@@ -339,6 +374,7 @@ class AuthorizationPolicy:
                 stored_project,
                 stored_task,
                 stored_sha,
+                stored_environment,
                 expires_at,
                 state,
                 consumption_id,
@@ -354,13 +390,30 @@ class AuthorizationPolicy:
                 )
 
             if state == AuthorizationState.REVOKED.value:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "REVOKED", "Authorization revoked",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.REVOKED, "Authorization revoked"
                 )
 
             if state == AuthorizationState.CONSUMED.value or consumption_id:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "CONSUMED", "Authorization already consumed",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.CONSUMED, "Authorization already consumed"
+                )
+
+            if state == AuthorizationState.DENIED.value:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Authorization denied",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Authorization denied"
                 )
 
             expires = datetime.fromisoformat(expires_at)
@@ -378,32 +431,67 @@ class AuthorizationPolicy:
                 )
 
             if stored_action != action:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Incorrect action",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.DENIED, "Incorrect action"
                 )
             if stored_repo != repository:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Incorrect repository",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.DENIED, "Incorrect repository"
                 )
             if stored_project != project_id or stored_task != task_id:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Incorrect task or project",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.DENIED, "Incorrect task or project"
                 )
             if stored_digest != action_digest:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Action parameters do not match",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.DENIED, "Action parameters do not match"
                 )
             if stored_sha != expected_sha:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Commit SHA does not match",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.DENIED, "Commit SHA does not match"
                 )
+            if stored_environment != environment:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Incorrect environment",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Incorrect environment"
+                )
 
             if state != AuthorizationState.APPROVED.value:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Authorization is not approved",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.DENIED, "Authorization is not approved"
                 )
 
-            # Even a matching approved request does not enable execution.
+            self._record(
+                connection, authorization_id, action, repository,
+                state, "APPROVED", "Validated; execution disabled",
+            )
             return AuthorizationDecision(
                 False,
                 AuthorizationState.APPROVED,
@@ -429,23 +517,93 @@ class AuthorizationPolicy:
                 row[0], "REVOKED", "Revoked",
             )
 
-    def consume(self, authorization_id: str) -> AuthorizationDecision:
+    def consume(
+        self,
+        authorization_id: str,
+        now: datetime | None = None,
+    ) -> AuthorizationDecision:
         """
         One-time consumption.
 
-        Does not enable execution. Concurrent attempts fail closed because
-        the update is conditional on the current state.
+        HALT, expiration, revocation, denial, and prior consumption are
+        checked inside the same transaction. Does not enable execution.
+        Concurrent attempts fail closed because the update is conditional.
         """
 
-        if self.is_halted():
-            return AuthorizationDecision(
-                False, AuthorizationState.DENIED, "System is halted"
-            )
-
+        now = now or datetime.now(timezone.utc)
         consumption_id = str(uuid.uuid4())
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+
+            halt_row = connection.execute(
+                "SELECT value FROM authorization_control WHERE key = 'halted'"
+            ).fetchone()
+            if halt_row and halt_row[0] == "1":
+                self._record(
+                    connection, authorization_id, "consume", "authorization",
+                    None, "DENIED", "System is halted",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "System is halted"
+                )
+
+            row = connection.execute(
+                """
+                SELECT state, expires_at, consumption_id
+                FROM authorization_requests
+                WHERE authorization_id = ?
+                """,
+                (authorization_id,),
+            ).fetchone()
+
+            if row is None:
+                self._record(
+                    connection, authorization_id, "consume", "authorization",
+                    None, "DENIED", "Missing authorization",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Missing authorization"
+                )
+
+            state, expires_at, existing_consumption = row
+
+            if state == AuthorizationState.REVOKED.value:
+                return AuthorizationDecision(
+                    False, AuthorizationState.REVOKED, "Authorization revoked"
+                )
+            if state == AuthorizationState.DENIED.value:
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Authorization denied"
+                )
+            if state == AuthorizationState.CONSUMED.value or existing_consumption:
+                return AuthorizationDecision(
+                    False, AuthorizationState.CONSUMED, "Authorization already consumed"
+                )
+            if state == AuthorizationState.EXPIRED.value:
+                return AuthorizationDecision(
+                    False, AuthorizationState.EXPIRED, "Authorization expired"
+                )
+
+            expires = datetime.fromisoformat(expires_at)
+            if now >= expires:
+                connection.execute(
+                    "UPDATE authorization_requests SET state = ? WHERE authorization_id = ?",
+                    (AuthorizationState.EXPIRED.value, authorization_id),
+                )
+                self._record(
+                    connection, authorization_id, "consume", "authorization",
+                    state, "EXPIRED", "Expired during consumption",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.EXPIRED, "Authorization expired"
+                )
+
+            if state != AuthorizationState.APPROVED.value:
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Invalid state for consumption"
+                )
+
             cursor = connection.execute(
                 """
                 UPDATE authorization_requests
@@ -462,7 +620,7 @@ class AuthorizationPolicy:
             if cursor.rowcount != 1:
                 self._record(
                     connection, authorization_id, "consume", "authorization",
-                    None, "DENIED", "Consumption rejected",
+                    state, "DENIED", "Consumption rejected",
                 )
                 return AuthorizationDecision(
                     False, AuthorizationState.DENIED, "Consumption rejected"
