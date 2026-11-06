@@ -49,16 +49,21 @@ def _read_token(reader: Callable[[str], str]) -> str:
 def run_probe(
     *,
     live: bool = False,
-    confirmed: bool = False,
-    token_reader: Callable[[str], str] | None = None,
     confirmer: Callable[[str], str] | None = None,
+    token_reader: Callable[[str], str] | None = None,
+    transport_factory: Callable[[], object] | None = None,
     pull_request: int | None = None,
 ) -> dict:
     """
     Manually gated, read-only verification.
 
-    live and confirmed must both be True. The token is read interactively
-    and never stored. Returns a report labeled source=github_live.
+    live=False (default) performs no request.
+    When live=True, an interactive confirmation that returns exactly LIVE
+    is required before token entry or network access. There is no
+    confirmed=True bypass.
+
+    confirmer, token_reader, and transport_factory are injectable for
+    offline tests. Production callers omit them.
     """
 
     if not live:
@@ -68,14 +73,16 @@ def run_probe(
             "note": "Default offline. No network request performed.",
         }
 
-    if not confirmed:
-        confirmer = confirmer or input
-        _require_confirmation(confirmer)
+    # Confirmation always happens first, before token or network.
+    confirmer = confirmer or input
+    _require_confirmation(confirmer)
 
     reader = token_reader or getpass.getpass
     token = _read_token(reader)
 
-    transport = production_transport()
+    factory = transport_factory or production_transport
+    transport = factory()
+
     provider = GitHubLiveProvider(token, transport)
     adapter = GitHubAdapter(provider, expected_source="github_live")
 
@@ -107,6 +114,5 @@ def run_probe(
 
 
 if __name__ == "__main__":
-    # Explicit invocation only. Not imported by tests or startup.
     print("This command requires Chief's separate authorization.")
     print("Use run_probe(live=True) from an authorized session.")

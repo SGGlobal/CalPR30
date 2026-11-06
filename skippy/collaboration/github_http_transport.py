@@ -10,8 +10,9 @@ Compatible with GitHubLiveProvider's HTTPTransport interface:
 from __future__ import annotations
 
 import ssl
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener, HTTPSHandler
 
 from skippy.collaboration.github_live_provider import (
     GITHUB_API_HOST,
@@ -25,13 +26,46 @@ from skippy.collaboration.github_live_provider import (
 ALLOWED_HOST = "api.github.com"
 
 
+class RedirectRejectingHandler(HTTPSHandler):
+    """
+    HTTPS handler that refuses every redirect before a second request.
+
+    Authorization headers are never forwarded because the redirect is
+    rejected rather than followed.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise CredentialSafeError("Unexpected redirect")
+
+
+def _validate_url(method: str, url: str) -> None:
+    if not isinstance(method, str) or method.upper() != "GET":
+        raise CredentialSafeError("Unsupported HTTP method")
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise CredentialSafeError("HTTPS required")
+    if parsed.username or parsed.password:
+        raise CredentialSafeError("URL userinfo is not permitted")
+    if parsed.port not in {None, 443}:
+        raise CredentialSafeError("Unexpected port")
+    if parsed.hostname != ALLOWED_HOST:
+        raise CredentialSafeError("Unexpected API host")
+    if not url.startswith(GITHUB_API_HOST):
+        raise CredentialSafeError("Unexpected API host")
+
+
 class ProductionHTTPTransport:
     """
     HTTPS-only transport for GitHub's documented API host.
 
-    GET only. TLS validation enabled. Redirects rejected. No retries.
-    Response body is streamed with an enforced size limit.
+    GET only. TLS validation enabled. Redirects rejected before following.
+    No retries. Response body is streamed with an enforced size limit.
     """
+
+    def __init__(self, opener=None):
+        # opener is injectable so tests never touch the network.
+        self._opener = opener
 
     def __call__(
         self,
@@ -40,41 +74,20 @@ class ProductionHTTPTransport:
         headers: dict[str, str],
         timeout: int,
     ) -> HTTPResponse:
-        if not isinstance(method, str) or method.upper() != "GET":
-            raise CredentialSafeError("Unsupported HTTP method")
-
-        parsed = urlparse(url)
-        if parsed.scheme != "https":
-            raise CredentialSafeError("HTTPS required")
-        if parsed.hostname != ALLOWED_HOST:
-            raise CredentialSafeError("Unexpected API host")
-        if not url.startswith(GITHUB_API_HOST):
-            raise CredentialSafeError("Unexpected API host")
+        _validate_url(method, url)
 
         effective_timeout = min(timeout, REQUEST_TIMEOUT_SECONDS)
 
-        # Strip any authorization header from the request object we log.
-        # We never log headers at all.
         request = Request(url, method="GET")
         for key, value in headers.items():
-            if key.lower() == "authorization":
-                # Passed to the request, never logged.
-                request.add_header(key, value)
-            else:
-                request.add_header(key, value)
+            request.add_header(key, value)
 
-        context = ssl.create_default_context()
+        opener = self._opener or build_opener(
+            RedirectRejectingHandler(context=ssl.create_default_context())
+        )
 
         try:
-            with urlopen(
-                request,
-                timeout=effective_timeout,
-                context=context,
-            ) as response:
-                # Reject redirects by not following them.
-                # urllib follows redirects by default; we disable that
-                # by checking the final URL and by using a custom handler
-                # expectation. If the response URL differs, treat as redirect.
+            with opener.open(request, timeout=effective_timeout) as response:
                 final = getattr(response, "url", url)
                 if final != url:
                     raise CredentialSafeError("Unexpected redirect")
@@ -97,8 +110,14 @@ class ProductionHTTPTransport:
 
         except CredentialSafeError:
             raise
+        except HTTPError as exc:
+            # Preserve the status so the provider can classify it.
+            # Do not include the body or any header in the message.
+            return HTTPResponse(status=exc.code, body=b"", headers={})
         except TimeoutError:
             raise CredentialSafeError("GitHub request timed out") from None
+        except URLError:
+            raise CredentialSafeError("GitHub request failed") from None
         except Exception:
             raise CredentialSafeError("GitHub request failed") from None
 

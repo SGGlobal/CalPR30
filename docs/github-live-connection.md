@@ -1,4 +1,4 @@
-# SKIPPY AI Collaboration Bridge — Live Connection (Step 69D.2B.1)
+# SKIPPY AI Collaboration Bridge — Live Connection (Step 69D.2B.1A)
 
 Foundation for controlled, real, read-only GitHub API requests.
 No live request is executed by this milestone.
@@ -9,10 +9,14 @@ No live request is executed by this milestone.
 
 - HTTPS only, host fixed to `api.github.com`.
 - GET only.
-- TLS certificate validation via `ssl.create_default_context()`.
+- TLS validation via `ssl.create_default_context()`.
 - Timeout capped at 10 seconds.
 - Response body streamed with a 1 MB limit.
-- Redirects rejected.
+- Redirects rejected by `RedirectRejectingHandler` before a second request.
+- Authorization headers are never forwarded because redirects are not followed.
+- Unexpected ports and URL userinfo are rejected.
+- HTTPError is converted to an `HTTPResponse` with the status and an empty
+  body so the provider can classify 401, 403, 404, 429, and 5xx.
 - No retries, no pagination, no arbitrary endpoints.
 - No network access on import.
 - Errors are credential-safe and do not include authorization headers.
@@ -32,14 +36,19 @@ unavailable. Credentials are not requested from Skyppy or Jason.
 ```python
 from skippy.collaboration.github_live_probe import run_probe
 
-report = run_probe(live=True, confirmed=True)
+report = run_probe(live=True)
 ```
 
-- `live=False` (default) returns an offline report and performs no request.
-- `confirmed=False` prompts for the literal text `LIVE`.
-- Any other confirmation cancels.
-- The command is not run by tests, import, startup, or schedules.
-- No autonomous agent may invoke it.
+1. `live=False` (default) returns an offline report and performs no request.
+2. `live=True` always prompts for the literal text `LIVE`.
+3. Any other answer cancels before token entry or network access.
+4. There is no `confirmed=True` bypass.
+5. After confirmation, the token is read through a hidden prompt.
+6. The command is not run by tests, import, startup, or schedules.
+7. No autonomous agent may invoke it.
+
+Tests inject `confirmer`, `token_reader`, and `transport_factory`. Production
+callers omit them.
 
 ## Expected read-only output
 
