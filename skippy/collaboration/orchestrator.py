@@ -8,11 +8,11 @@ No external APIs, no repository writes, no trading execution.
 Delivery sequence for every message:
 1. Validate recipient.
 2. Durably accept.
-3. Dispatch to the simulated handler.
+3. Dispatch to the designated simulated handler.
 4. Acknowledge only after successful handling.
 
-Recovery reconstructs progress from persisted protocol records and
-resumes only when the next stage is proven safe.
+recover() classifies progress from persisted records. It does not
+automatically continue a partial workflow.
 """
 
 from __future__ import annotations
@@ -54,6 +54,26 @@ class CollaborationOrchestrator:
         self.router = LocalRouter(protocol)
         self.skyppy = SimulatedSkyppy()
         self.jason = SimulatedJason()
+        self._register_handlers()
+
+    def _register_handlers(self) -> None:
+        def _skyppy(message: Message) -> None:
+            # Deterministic no-op handler; agent work is explicit in run().
+            return None
+
+        def _jason(message: Message) -> None:
+            return None
+
+        def _bridge(message: Message) -> None:
+            return None
+
+        def _chief(message: Message) -> None:
+            return None
+
+        self.router.register("skyppy", _skyppy)
+        self.router.register("jason", _jason)
+        self.router.register("bridge", _bridge)
+        self.router.register("chief", _chief)
 
     def _message(
         self,
@@ -86,7 +106,8 @@ class CollaborationOrchestrator:
         Accept, then dispatch, then acknowledge.
 
         If acceptance fails, the message is not acknowledged.
-        If dispatch fails, the message remains accepted but unacknowledged.
+        If dispatch or handling fails, the message remains accepted
+        but unacknowledged.
         """
 
         if self.protocol.is_halted and message.message_type is not MessageType.HALT:
@@ -96,10 +117,16 @@ class CollaborationOrchestrator:
 
         accepted = self.protocol.accept(message, now=now)
         if not accepted:
-            # Valid duplicate; do not reprocess.
+            # Valid duplicate delivery. Do not re-acknowledge and do not
+            # reprocess. If it was never acknowledged, leave it that way.
             return message
 
-        outcome = self.router.dispatch(message)
+        try:
+            outcome = self.router.dispatch(message)
+        except Exception:
+            # Accepted but not acknowledged.
+            raise
+
         if outcome == "duplicate":
             return message
 
@@ -133,11 +160,11 @@ class CollaborationOrchestrator:
 
     def recover(self, task_id: str) -> dict[str, Any]:
         """
-        Reconstruct progress from persisted records.
+        Classify progress from persisted records.
 
-        Returns a status describing whether the task is complete,
-        resumable, or blocked. Does not replay completed tasks and
-        does not create a second assignment.
+        This is recovery classification, not automatic resumption.
+        If any message belonging to the task is unacknowledged, the
+        task is not classified as safely resumable.
         """
 
         state = self.protocol.get_state(task_id)
@@ -155,19 +182,23 @@ class CollaborationOrchestrator:
         if not messages:
             raise RecoveryBlocked("No messages for existing task")
 
-        last = messages[-1]
-        acknowledged = self.protocol.is_acknowledged(last["message_id"])
+        task_ids = {msg["message_id"] for msg in messages}
+        outstanding = [
+            mid
+            for mid in self.protocol.unacknowledged()
+            if mid in task_ids
+        ]
 
-        if not acknowledged:
+        if outstanding:
             return {
                 "task_id": task_id,
                 "recovery": "uncertain",
                 "status": state.value,
-                "last_message_id": last["message_id"],
-                "reason": "Last accepted message is unacknowledged",
+                "outstanding": outstanding,
+                "correlation_id": messages[-1]["correlation_id"],
+                "reason": "One or more messages have unresolved handling",
             }
 
-        # Safe resume points: the next stage is determined by state.
         resumable = {
             TaskState.ASSIGNED,
             TaskState.ACKNOWLEDGED,
@@ -182,8 +213,8 @@ class CollaborationOrchestrator:
                 "task_id": task_id,
                 "recovery": "resumable",
                 "status": state.value,
-                "last_message_id": last["message_id"],
-                "correlation_id": last["correlation_id"],
+                "last_message_id": messages[-1]["message_id"],
+                "correlation_id": messages[-1]["correlation_id"],
             }
 
         return {
