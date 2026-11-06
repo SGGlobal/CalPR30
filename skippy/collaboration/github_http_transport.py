@@ -14,6 +14,8 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import (
     HTTPSHandler,
+    HTTPDefaultErrorHandler,
+    HTTPErrorProcessor,
     HTTPRedirectHandler,
     OpenerDirector,
     Request,
@@ -61,19 +63,22 @@ class RedirectRejectingHandler(HTTPRedirectHandler):
 
 def build_secure_opener() -> OpenerDirector:
     """
-    Build an opener with exactly two handlers:
+    Build an opener with the complete processing chain:
 
     * HTTPSHandler with certificate validation enabled.
-    * RedirectRejectingHandler, which replaces the default redirect handler.
+    * RedirectRejectingHandler, the only redirect handler.
+    * HTTPDefaultErrorHandler.
+    * HTTPErrorProcessor, which dispatches non-2xx responses.
 
-    No HTTPRedirectHandler is added by default because we construct the
-    opener ourselves rather than calling build_opener().
+    No default HTTPRedirectHandler is installed.
     """
 
     context = ssl.create_default_context()
     opener = OpenerDirector()
     opener.add_handler(HTTPSHandler(context=context))
     opener.add_handler(RedirectRejectingHandler())
+    opener.add_handler(HTTPDefaultErrorHandler())
+    opener.add_handler(HTTPErrorProcessor())
     return opener
 
 
