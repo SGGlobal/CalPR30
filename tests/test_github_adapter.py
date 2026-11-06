@@ -8,10 +8,16 @@ import pytest
 
 from skippy.collaboration.github_adapter import (
     ALLOWED_REPOSITORY,
+    CIResultSnapshot,
     CIStatus,
     AdapterError,
+    BranchSnapshot,
+    CommitSnapshot,
     GitHubAdapter,
+    PullRequestSnapshot,
+    RepositorySnapshot,
     SyntheticGitHubProvider,
+    WorkflowSnapshot,
 )
 
 
@@ -140,7 +146,7 @@ def test_malformed_provider_response(adapter):
 
     broken = GitHubAdapter(Broken())
     with pytest.raises(AdapterError):
-        broken.branch(ALLOWED_REPOSITORY, "phase-8-tradingview-integration")
+        broken.repository(ALLOWED_REPOSITORY)
 
 
 def test_bounded_output(adapter):
@@ -180,10 +186,189 @@ def test_no_network_or_writes(adapter):
 
 
 def test_collaboration_workflow_unaffected(tmp_path):
-    """
-    The GitHub adapter does not alter the existing collaboration protocol.
-    """
     from skippy.collaboration.protocol import CollaborationProtocol
 
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
     assert protocol.is_halted is False
+
+
+def test_invalid_branch_in_report(adapter):
+    with pytest.raises(AdapterError, match="Invalid branch"):
+        adapter.development_report(ALLOWED_REPOSITORY, branch="bad branch!")
+
+
+def test_invalid_pr_in_report(adapter):
+    with pytest.raises(AdapterError, match="Invalid pull request"):
+        adapter.development_report(ALLOWED_REPOSITORY, pull_request=0)
+
+
+def test_nonexistent_branch_in_report(adapter):
+    with pytest.raises(AdapterError, match="not found"):
+        adapter.development_report(ALLOWED_REPOSITORY, branch="missing-branch")
+
+
+def test_branch_head_mismatch(adapter):
+    with pytest.raises(AdapterError, match="Branch HEAD does not match"):
+        adapter.development_report(
+            ALLOWED_REPOSITORY,
+            branch="phase-8-tradingview-integration",
+            sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        )
+
+
+def test_pr_head_mismatch(adapter):
+    with pytest.raises(AdapterError, match="Pull request HEAD does not match"):
+        adapter.development_report(
+            ALLOWED_REPOSITORY,
+            pull_request=1,
+            sha="79925e4aa80bef170778fc02a022f5c338739c91",
+        )
+
+
+def test_commit_only_historical_report(adapter):
+    sha = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    report = adapter.development_report(ALLOWED_REPOSITORY, sha=sha)
+    assert report.sha == sha
+    assert report.branch is None
+    assert report.ci_status is CIStatus.SUCCESS
+
+
+def test_malformed_repository_snapshot():
+    class Bad:
+        def repository(self, repository):
+            return "nope"
+
+    with pytest.raises(AdapterError, match="Malformed repository"):
+        GitHubAdapter(Bad()).repository(ALLOWED_REPOSITORY)
+
+
+def test_malformed_branch_snapshot():
+    class Bad:
+        def branch(self, repository, name):
+            return "nope"
+
+    with pytest.raises(AdapterError, match="Malformed branch"):
+        GitHubAdapter(Bad()).branch(
+            ALLOWED_REPOSITORY, "phase-8-tradingview-integration"
+        )
+
+
+def test_malformed_commit_snapshot():
+    class Bad:
+        def commit(self, repository, sha):
+            return "nope"
+
+    with pytest.raises(AdapterError, match="Malformed commit"):
+        GitHubAdapter(Bad()).commit(
+            ALLOWED_REPOSITORY, "79925e4aa80bef170778fc02a022f5c338739c91"
+        )
+
+
+def test_malformed_pull_snapshot():
+    class Bad:
+        def pull_request(self, repository, number):
+            return "nope"
+
+    with pytest.raises(AdapterError, match="Malformed pull request"):
+        GitHubAdapter(Bad()).pull_request(ALLOWED_REPOSITORY, 1)
+
+
+def test_malformed_workflow_snapshot():
+    class Bad:
+        def workflow(self, repository, sha):
+            return "nope"
+
+    with pytest.raises(AdapterError, match="Malformed workflow"):
+        GitHubAdapter(Bad()).workflow(
+            ALLOWED_REPOSITORY, "79925e4aa80bef170778fc02a022f5c338739c91"
+        )
+
+
+def test_malformed_ci_snapshot():
+    class Bad:
+        def ci_result(self, repository, sha):
+            return "nope"
+
+    with pytest.raises(AdapterError, match="Malformed CI"):
+        GitHubAdapter(Bad()).ci_result(
+            ALLOWED_REPOSITORY, "79925e4aa80bef170778fc02a022f5c338739c91"
+        )
+
+
+def test_invalid_ci_status():
+    class Bad:
+        def ci_result(self, repository, sha):
+            return CIResultSnapshot(
+                sha=sha,
+                status="SUCCESS",  # type: ignore[arg-type]
+                passed=1,
+                failed=0,
+            )
+
+    with pytest.raises(AdapterError, match="Invalid CI status"):
+        GitHubAdapter(Bad()).ci_result(
+            ALLOWED_REPOSITORY, "79925e4aa80bef170778fc02a022f5c338739c91"
+        )
+
+
+def test_invalid_test_counts():
+    class Bad:
+        def ci_result(self, repository, sha):
+            return CIResultSnapshot(
+                sha=sha,
+                status=CIStatus.SUCCESS,
+                passed=-1,
+                failed=0,
+            )
+
+    with pytest.raises(AdapterError, match="Invalid passed"):
+        GitHubAdapter(Bad()).ci_result(
+            ALLOWED_REPOSITORY, "79925e4aa80bef170778fc02a022f5c338739c91"
+        )
+
+
+def test_success_with_failed_count_rejected():
+    class Bad:
+        def ci_result(self, repository, sha):
+            return CIResultSnapshot(
+                sha=sha,
+                status=CIStatus.SUCCESS,
+                passed=10,
+                failed=1,
+            )
+
+    with pytest.raises(AdapterError, match="conceal"):
+        GitHubAdapter(Bad()).ci_result(
+            ALLOWED_REPOSITORY, "79925e4aa80bef170778fc02a022f5c338739c91"
+        )
+
+
+def test_wrong_commit_sha_rejected():
+    class Bad:
+        def ci_result(self, repository, sha):
+            return CIResultSnapshot(
+                sha="ffffffffffffffffffffffffffffffffffffffff",
+                status=CIStatus.SUCCESS,
+                passed=1,
+                failed=0,
+            )
+
+    with pytest.raises(AdapterError, match="does not match"):
+        GitHubAdapter(Bad()).ci_result(
+            ALLOWED_REPOSITORY, "79925e4aa80bef170778fc02a022f5c338739c91"
+        )
+
+
+def test_non_synthetic_source_rejected():
+    class Bad:
+        def repository(self, repository):
+            return RepositorySnapshot(
+                owner="SGGlobal",
+                name="QLA",
+                default_branch="phase-8-tradingview-integration",
+                private=True,
+                source="live",
+            )
+
+    with pytest.raises(AdapterError, match="non-synthetic"):
+        GitHubAdapter(Bad()).repository(ALLOWED_REPOSITORY)

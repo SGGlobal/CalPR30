@@ -65,7 +65,7 @@ class CommitSnapshot:
 class PullRequestSnapshot:
     number: int
     title: str
-    state: str  # open, closed, merged
+    state: str
     head_sha: str
     base_branch: str
     source: str = "synthetic"
@@ -86,13 +86,6 @@ class CIResultSnapshot:
     passed: int | None
     failed: int | None
     source: str = "synthetic"
-
-    def __post_init__(self):
-        if self.status is CIStatus.SUCCESS and (
-            self.passed is None or self.failed is None
-        ):
-            # Success with unknown counts is allowed; counts stay None.
-            return
 
 
 @dataclass(frozen=True)
@@ -119,12 +112,32 @@ class GitHubProvider(Protocol):
     def ci_result(self, repository: str, sha: str) -> CIResultSnapshot: ...
 
 
+def _require_synthetic(source: str) -> None:
+    if source != "synthetic":
+        raise AdapterError(
+            "Provider claimed non-synthetic provenance; rejected"
+        )
+
+
+def _require_counts(passed: int | None, failed: int | None, status: CIStatus) -> None:
+    for label, value in (("passed", passed), ("failed", failed)):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise AdapterError(f"Invalid {label} test count")
+
+    if status is CIStatus.SUCCESS and failed is not None and failed > 0:
+        raise AdapterError(
+            "Successful status cannot conceal a positive failed-test count"
+        )
+
+
 class GitHubAdapter:
     """
     Read-only adapter over a provider.
 
-    Enforces the repository allowlist, input validation, and fail-closed
-    behavior. Does not perform network calls or Git operations.
+    Enforces the repository allowlist, input validation, snapshot
+    validation, and fail-closed evidence consistency.
     """
 
     def __init__(self, provider: GitHubProvider):
@@ -146,37 +159,95 @@ class GitHubAdapter:
         if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
             raise AdapterError("Invalid pull request number")
 
+    def _validate_repository(self, snap, repository: str) -> RepositorySnapshot:
+        if not isinstance(snap, RepositorySnapshot):
+            raise AdapterError("Malformed repository snapshot")
+        if f"{snap.owner}/{snap.name}" != repository:
+            raise AdapterError("Repository identity mismatch")
+        _require_synthetic(snap.source)
+        return snap
+
+    def _validate_branch(self, snap, name: str) -> BranchSnapshot:
+        if not isinstance(snap, BranchSnapshot):
+            raise AdapterError("Malformed branch snapshot")
+        if snap.name != name:
+            raise AdapterError("Branch identity mismatch")
+        _require_synthetic(snap.source)
+        return snap
+
+    def _validate_commit(self, snap, sha: str) -> CommitSnapshot:
+        if not isinstance(snap, CommitSnapshot):
+            raise AdapterError("Malformed commit snapshot")
+        if snap.sha != sha:
+            raise AdapterError("Commit identity mismatch")
+        _require_synthetic(snap.source)
+        return snap
+
+    def _validate_pull(self, snap, number: int) -> PullRequestSnapshot:
+        if not isinstance(snap, PullRequestSnapshot):
+            raise AdapterError("Malformed pull request snapshot")
+        if snap.number != number:
+            raise AdapterError("Pull request identity mismatch")
+        if snap.state not in {"open", "closed", "merged"}:
+            raise AdapterError("Invalid pull request state")
+        _require_synthetic(snap.source)
+        return snap
+
+    def _validate_workflow(self, snap, sha: str) -> WorkflowSnapshot:
+        if not isinstance(snap, WorkflowSnapshot):
+            raise AdapterError("Malformed workflow snapshot")
+        if snap.head_sha != sha:
+            raise AdapterError("Workflow SHA mismatch")
+        if not isinstance(snap.status, CIStatus):
+            raise AdapterError("Invalid CI status")
+        _require_synthetic(snap.source)
+        return snap
+
+    def _validate_ci(self, snap, sha: str) -> CIResultSnapshot:
+        if not isinstance(snap, CIResultSnapshot):
+            raise AdapterError("Malformed CI snapshot")
+        if snap.sha != sha:
+            raise AdapterError("CI result SHA does not match requested SHA")
+        if not isinstance(snap.status, CIStatus):
+            raise AdapterError("Invalid CI status")
+        _require_counts(snap.passed, snap.failed, snap.status)
+        _require_synthetic(snap.source)
+        return snap
+
     def repository(self, repository: str) -> RepositorySnapshot:
         self._check_repository(repository)
-        return self._provider.repository(repository)
+        return self._validate_repository(
+            self._provider.repository(repository), repository
+        )
 
     def branch(self, repository: str, name: str) -> BranchSnapshot:
         self._check_repository(repository)
         self._check_branch(name)
-        return self._provider.branch(repository, name)
+        return self._validate_branch(self._provider.branch(repository, name), name)
 
     def commit(self, repository: str, sha: str) -> CommitSnapshot:
         self._check_repository(repository)
         self._check_sha(sha)
-        return self._provider.commit(repository, sha)
+        return self._validate_commit(self._provider.commit(repository, sha), sha)
 
     def pull_request(self, repository: str, number: int) -> PullRequestSnapshot:
         self._check_repository(repository)
         self._check_pr(number)
-        return self._provider.pull_request(repository, number)
+        return self._validate_pull(
+            self._provider.pull_request(repository, number), number
+        )
 
     def workflow(self, repository: str, sha: str) -> WorkflowSnapshot:
         self._check_repository(repository)
         self._check_sha(sha)
-        return self._provider.workflow(repository, sha)
+        return self._validate_workflow(
+            self._provider.workflow(repository, sha), sha
+        )
 
     def ci_result(self, repository: str, sha: str) -> CIResultSnapshot:
         self._check_repository(repository)
         self._check_sha(sha)
-        result = self._provider.ci_result(repository, sha)
-        if result.sha != sha:
-            raise AdapterError("CI result SHA does not match requested SHA")
-        return result
+        return self._validate_ci(self._provider.ci_result(repository, sha), sha)
 
     def development_report(
         self,
@@ -188,10 +259,34 @@ class GitHubAdapter:
         """
         Build a synthetic development report.
 
+        Validates every supplied identifier. When a branch or PR is given
+        together with a SHA, the provider HEAD must match that SHA.
+        Commit-only reports are allowed for historical commits.
         CI success is evidence of testing, not permission to merge.
         """
 
         self._check_repository(repository)
+
+        if branch is not None:
+            self._check_branch(branch)
+            branch_snap = self.branch(repository, branch)
+            if sha is not None and branch_snap.sha != sha:
+                raise AdapterError(
+                    "Branch HEAD does not match requested commit"
+                )
+
+        if pull_request is not None:
+            self._check_pr(pull_request)
+            pr_snap = self.pull_request(repository, pull_request)
+            if sha is not None and pr_snap.head_sha != sha:
+                raise AdapterError(
+                    "Pull request HEAD does not match requested commit"
+                )
+
+        if sha is not None:
+            self._check_sha(sha)
+            # Confirm the commit exists; do not invent results.
+            self.commit(repository, sha)
 
         ci_status = CIStatus.UNAVAILABLE
         passed = None
@@ -265,6 +360,10 @@ class SyntheticGitHubProvider:
                 sha="cccccccccccccccccccccccccccccccccccccccc",
                 message="Synthetic pending commit",
             ),
+            (ALLOWED_REPOSITORY, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"): CommitSnapshot(
+                sha="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                message="Historical commit not current HEAD",
+            ),
         }
         self._pulls = {
             (ALLOWED_REPOSITORY, 1): PullRequestSnapshot(
@@ -307,6 +406,12 @@ class SyntheticGitHubProvider:
                 status=CIStatus.PENDING,
                 passed=None,
                 failed=None,
+            ),
+            (ALLOWED_REPOSITORY, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"): CIResultSnapshot(
+                sha="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                status=CIStatus.SUCCESS,
+                passed=260,
+                failed=0,
             ),
         }
 
