@@ -12,9 +12,15 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from skippy.adapters.tradingview.deduplicator import SignalDeduplicator
+from skippy.adapters.tradingview.validator import validate_signal
+
 
 class RecoveryInspectionError(RuntimeError):
     """Raised when recovery inspection cannot be completed safely."""
+
+
+ALLOWED_EVIDENCE_KEYS = frozenset({"symbol", "action", "price", "timestamp"})
 
 
 class RecoveryInspector:
@@ -192,10 +198,13 @@ class RecoveryInspector:
 
     def get_evidence(self, fingerprint: str) -> dict | None:
         """
-        Retrieve validated signal evidence for a fingerprint.
+        Retrieve stored signal evidence for a fingerprint.
 
         Returns None when the record has no evidence (historical NULL).
         Read-only; does not modify state.
+
+        This method does not re-validate content or recompute the fingerprint.
+        Use get_verified_evidence for integrity checking.
         """
 
         try:
@@ -230,3 +239,86 @@ class RecoveryInspector:
             raise RecoveryInspectionError("Stored evidence is not an object")
 
         return parsed
+
+    def get_verified_evidence(self, fingerprint: str) -> dict | None:
+        """
+        Retrieve and integrity-check stored signal evidence.
+
+        Returns None for historical records with NULL evidence.
+        When evidence is present it is validated and its fingerprint is
+        recomputed. Mismatches and invalid content raise
+        RecoveryInspectionError.
+
+        Read-only. Does not modify processing state, re-publish, or
+        trigger recovery.
+
+        Note: fingerprint consistency detects mismatches between stored
+        evidence and its fingerprint. It does not prove authenticity
+        against an attacker capable of modifying both the evidence and
+        the fingerprint together.
+        """
+
+        try:
+            with self._connect() as connection:
+                connection.execute("PRAGMA query_only = ON")
+
+                row = connection.execute(
+                    """
+                    SELECT evidence_json
+                    FROM signals
+                    WHERE fingerprint = ?
+                    """,
+                    (fingerprint,),
+                ).fetchone()
+
+        except sqlite3.Error as exc:
+            raise RecoveryInspectionError(
+                "Unable to retrieve signal evidence"
+            ) from exc
+
+        if row is None:
+            raise RecoveryInspectionError("Signal fingerprint not found")
+
+        raw = row[0]
+
+        # Historical NULL evidence is supported.
+        if raw is None:
+            return None
+
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError) as exc:
+            raise RecoveryInspectionError(
+                "Stored evidence contains invalid JSON"
+            ) from exc
+
+        if not isinstance(parsed, dict):
+            raise RecoveryInspectionError("Stored evidence is not an object")
+
+        # Strict field set before validation.
+        if set(parsed.keys()) != ALLOWED_EVIDENCE_KEYS:
+            raise RecoveryInspectionError(
+                "Stored evidence does not contain exactly the approved fields"
+            )
+
+        try:
+            validated = validate_signal(parsed)
+        except Exception as exc:
+            raise RecoveryInspectionError(
+                "Stored evidence failed signal validation"
+            ) from exc
+
+        recomputed = SignalDeduplicator().fingerprint(validated)
+
+        if recomputed != fingerprint:
+            raise RecoveryInspectionError(
+                "Stored evidence fingerprint does not match record fingerprint"
+            )
+
+        # Return the canonical validated form.
+        return {
+            "symbol": validated.symbol,
+            "action": validated.action,
+            "price": validated.price,
+            "timestamp": validated.timestamp,
+        }
