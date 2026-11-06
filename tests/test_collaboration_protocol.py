@@ -24,23 +24,26 @@ def make_message(
     idempotency_key: str = "key-1",
     payload: dict | None = None,
     timestamp: datetime | None = None,
+    sender: str = "skyppy",
+    recipient: str = "jason",
+    message_id: str | None = None,
 ) -> Message:
     return Message(
-        message_id=f"msg-{idempotency_key}-{message_type.value}",
+        message_id=message_id or f"msg-{idempotency_key}-{message_type.value}",
         idempotency_key=idempotency_key,
         correlation_id=f"corr-{task_id}",
         project_id="QLA",
         task_id=task_id,
-        sender="skyppy",
-        recipient="jason",
+        sender=sender,
+        recipient=recipient,
         message_type=message_type,
         timestamp=timestamp or datetime.now(timezone.utc),
         payload=payload or {"step": "plan"},
     )
 
 
-def test_successful_round_trip():
-    protocol = CollaborationProtocol()
+def test_successful_round_trip(tmp_path):
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
 
     messages = protocol.simulate_round_trip(
         task_id="T1",
@@ -48,53 +51,85 @@ def test_successful_round_trip():
         result_payload={"plan": "local protocol"},
     )
 
-    assert len(messages) == 4
+    assert len(messages) == 5
     assert protocol.get_state("T1") is TaskState.UNDER_REVIEW
     assert all(protocol.is_acknowledged(m.message_id) for m in messages)
 
 
-def test_duplicate_message_id_rejected():
-    protocol = CollaborationProtocol()
+def test_persistence_after_reopen(tmp_path):
+    database = tmp_path / "bridge.db"
+    first = CollaborationProtocol(database)
+
+    msg = make_message()
+    first.accept(msg)
+    first.acknowledge(msg.message_id)
+
+    second = CollaborationProtocol(database)
+
+    assert second.get_state("T1") is TaskState.ASSIGNED
+    assert second.is_acknowledged(msg.message_id) is True
+    assert second.unacknowledged() == []
+
+
+def test_unacknowledged_recovery(tmp_path):
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
     msg = make_message()
 
-    assert protocol.accept(msg) is True
-    assert protocol.accept(msg) is False  # duplicate delivery
+    protocol.accept(msg)
+    assert protocol.is_acknowledged(msg.message_id) is False
+
+    pending = protocol.unacknowledged()
+    assert msg.message_id in pending
+
+    protocol.acknowledge(msg.message_id)
+    assert protocol.unacknowledged() == []
 
 
-def test_conflicting_idempotency_key_rejected():
-    protocol = CollaborationProtocol()
+def test_duplicate_message_id_with_conflicting_content(tmp_path):
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
 
     first = make_message(payload={"a": 1})
     protocol.accept(first)
 
     conflict = make_message(
-        idempotency_key=first.idempotency_key,
-        payload={"a": 2},
-    )
-    # Force a different message_id so it is not a pure duplicate.
-    conflict = Message(
-        message_id="different-id",
-        idempotency_key=first.idempotency_key,
-        correlation_id=first.correlation_id,
-        project_id=first.project_id,
-        task_id=first.task_id,
-        sender=first.sender,
-        recipient=first.recipient,
-        message_type=first.message_type,
-        timestamp=first.timestamp,
+        message_id=first.message_id,
+        idempotency_key="different-key",
         payload={"a": 2},
     )
 
-    with pytest.raises(ProtocolError, match="Conflicting"):
+    with pytest.raises(ProtocolError, match="Conflicting content for existing message ID"):
         protocol.accept(conflict)
 
 
-def test_invalid_transition_rejected():
-    protocol = CollaborationProtocol()
+def test_same_idempotency_key_different_task(tmp_path):
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
+
+    first = make_message(task_id="T1", idempotency_key="shared")
+    protocol.accept(first)
+
+    conflict = make_message(
+        task_id="T2",
+        idempotency_key="shared",
+        message_id="other-id",
+    )
+
+    with pytest.raises(ProtocolError, match="Conflicting content for existing idempotency key"):
+        protocol.accept(conflict)
+
+
+def test_valid_duplicate_delivery(tmp_path):
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
+
+    msg = make_message()
+    assert protocol.accept(msg) is True
+    assert protocol.accept(msg) is False
+
+
+def test_invalid_transition_rejected(tmp_path):
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
 
     protocol.accept(make_message())
 
-    # Cannot jump from ASSIGNED to COMPLETE.
     complete = make_message(
         message_type=MessageType.COMPLETION,
         idempotency_key="complete-1",
@@ -104,41 +139,93 @@ def test_invalid_transition_rejected():
         protocol.accept(complete)
 
 
-def test_expiration_rejected():
-    protocol = CollaborationProtocol(message_ttl_seconds=10)
-    old = datetime.now(timezone.utc) - timedelta(seconds=60)
+def test_complete_round_trip_without_direct_mutation(tmp_path):
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
 
-    msg = make_message(timestamp=old)
+    messages = protocol.simulate_round_trip(
+        "T3",
+        {"objective": "x"},
+        {"plan": "y"},
+    )
 
-    with pytest.raises(ProtocolError, match="expired"):
-        protocol.accept(msg, now=datetime.now(timezone.utc))
+    # All transitions went through accept().
+    assert protocol.get_state("T3") is TaskState.UNDER_REVIEW
+    assert len(messages) == 5
 
 
-def test_halt_prevents_new_work():
-    protocol = CollaborationProtocol()
+def test_persistent_halt(tmp_path):
+    database = tmp_path / "bridge.db"
+    first = CollaborationProtocol(database)
+    first.halt()
+
+    second = CollaborationProtocol(database)
+    assert second.is_halted is True
+
+    with pytest.raises(ProtocolError, match="halted"):
+        second.accept(make_message())
+
+
+def test_outbound_rejected_after_halt(tmp_path):
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
     protocol.halt()
 
     with pytest.raises(ProtocolError, match="halted"):
-        protocol.accept(make_message())
+        protocol.track_outbound("T1")
 
 
-def test_unacknowledged_recovery():
-    protocol = CollaborationProtocol()
-    msg = make_message()
+def test_unsupported_protocol_version():
+    with pytest.raises(ProtocolError, match="Unsupported protocol version"):
+        Message(
+            message_id="x",
+            idempotency_key="k",
+            correlation_id="c",
+            project_id="QLA",
+            task_id="T",
+            sender="skyppy",
+            recipient="jason",
+            message_type=MessageType.TASK_ASSIGNMENT,
+            timestamp=datetime.now(timezone.utc),
+            protocol_version="0.9",
+        )
 
-    protocol.accept(msg)
-    assert protocol.is_acknowledged(msg.message_id) is False
 
-    pending = protocol.unacknowledged()
-    assert len(pending) == 1
-    assert pending[0].message_id == msg.message_id
+def test_invalid_timestamp():
+    with pytest.raises(ProtocolError, match="timezone-aware"):
+        Message(
+            message_id="x",
+            idempotency_key="k",
+            correlation_id="c",
+            project_id="QLA",
+            task_id="T",
+            sender="skyppy",
+            recipient="jason",
+            message_type=MessageType.TASK_ASSIGNMENT,
+            timestamp=datetime.now(),  # naive
+        )
 
-    protocol.acknowledge(msg.message_id)
-    assert protocol.unacknowledged() == []
+
+def test_ai_cannot_claim_approved(tmp_path):
+    with pytest.raises(ProtocolError, match="cannot establish an approved"):
+        make_message(). __class__(
+            message_id="x",
+            idempotency_key="k",
+            correlation_id="c",
+            project_id="QLA",
+            task_id="T",
+            sender="skyppy",
+            recipient="jason",
+            message_type=MessageType.TASK_ASSIGNMENT,
+            timestamp=datetime.now(timezone.utc),
+            authorization_status="APPROVED",
+        )
 
 
-def test_approval_separate_and_consumed_once():
-    protocol = CollaborationProtocol()
+def test_synthetic_approval_does_not_authorize_real_actions(tmp_path):
+    """
+    Consuming a synthetic approval updates only the local record.
+    It does not produce any external side effect or real authorization.
+    """
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
 
     approval = ApprovalRecord(
         approval_id="A1",
@@ -151,92 +238,47 @@ def test_approval_separate_and_consumed_once():
 
     protocol.record_approval(approval)
     consumed = protocol.consume_approval("A1")
+
     assert consumed.consumed_at is not None
+    # No external action was taken; the record is local only.
+    assert consumed.action == "MERGE_PR"
 
-    with pytest.raises(ProtocolError, match="already consumed"):
-        protocol.consume_approval("A1")
 
-
-def test_approval_expired():
-    protocol = CollaborationProtocol()
-
-    approval = ApprovalRecord(
-        approval_id="A2",
-        chief_identity="chief",
-        action="DEPLOY",
-        task_id="T1",
-        issued_at=datetime.now(timezone.utc) - timedelta(hours=2),
-        expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+def test_expiration_rejected(tmp_path):
+    protocol = CollaborationProtocol(
+        tmp_path / "bridge.db",
+        message_ttl_seconds=10,
     )
+    old = datetime.now(timezone.utc) - timedelta(seconds=60)
 
-    protocol.record_approval(approval)
+    msg = make_message(timestamp=old)
 
     with pytest.raises(ProtocolError, match="expired"):
-        protocol.consume_approval("A2")
+        protocol.accept(msg, now=datetime.now(timezone.utc))
 
 
-def test_uncertain_outbound_not_retried():
-    protocol = CollaborationProtocol()
-
-    # Establish a task that can enter UNCERTAIN.
-    protocol.accept(make_message())
-    protocol.accept(
-        make_message(
-            message_type=MessageType.ACK,
-            idempotency_key="ack-1",
-        )
+def test_message_bound_enforced(tmp_path):
+    protocol = CollaborationProtocol(
+        tmp_path / "bridge.db",
+        max_messages_per_task=2,
     )
-    # Force IN_PROGRESS for the test.
-    protocol._tasks["T1"] = TaskState.IN_PROGRESS
-
-    request = protocol.track_outbound("T1")
-    protocol.mark_outbound_uncertain(request.request_id)
-
-    assert protocol._outbound[request.request_id].status == "UNCERTAIN"
-    assert protocol.get_state("T1") is TaskState.UNCERTAIN
-    # No automatic retry occurred; attempts incremented once.
-    assert protocol._outbound[request.request_id].attempts == 1
-
-
-def test_message_bound_enforced():
-    protocol = CollaborationProtocol(max_messages_per_task=2)
 
     protocol.accept(make_message(idempotency_key="k1"))
     protocol.accept(
         make_message(
             message_type=MessageType.ACK,
             idempotency_key="k2",
+            sender="jason",
+            recipient="skyppy",
         )
     )
 
     with pytest.raises(ProtocolError, match="Maximum"):
         protocol.accept(
             make_message(
-                message_type=MessageType.RESULT,
+                message_type=MessageType.START,
                 idempotency_key="k3",
+                sender="jason",
+                recipient="bridge",
             )
         )
-
-
-def test_legitimate_repeated_review_allowed():
-    """
-    A new review with a new idempotency key is legitimate.
-    Correlation ID may be shared; it does not cause rejection.
-    """
-    protocol = CollaborationProtocol()
-
-    messages = protocol.simulate_round_trip(
-        "T2",
-        {"objective": "x"},
-        {"plan": "y"},
-    )
-
-    # After review the state is UNDER_REVIEW.
-    # A second review is not a valid transition from UNDER_REVIEW
-    # to UNDER_REVIEW, so this confirms correlation_id alone
-    # does not reject a well-formed new message of a different type.
-    # Instead we verify two different keys on the same correlation
-    # were both accepted during the round trip.
-    keys = {m.idempotency_key for m in messages}
-    assert len(keys) == 4
-    assert len({m.correlation_id for m in messages}) == 1

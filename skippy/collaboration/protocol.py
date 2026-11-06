@@ -3,18 +3,27 @@ SKIPPY AI Collaboration Bridge — Communication Protocol & State Machine.
 
 LOCAL SYNTHETIC ONLY.
 No external AI APIs, no repository writes, no trading execution.
+
+Approval records in this step are synthetic only.
+They do not constitute real human authorization.
+Actual authorization execution remains disabled until Step 69E.
 """
 
 from __future__ import annotations
 
+import json
+import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 
 PROTOCOL_VERSION = "1.0"
+
+KNOWN_AGENTS = frozenset({"skyppy", "jason", "chief", "bridge"})
 
 
 class ProtocolError(ValueError):
@@ -36,6 +45,7 @@ class TaskState(str, Enum):
 class MessageType(str, Enum):
     TASK_ASSIGNMENT = "TASK_ASSIGNMENT"
     ACK = "ACK"
+    START = "START"
     RESULT = "RESULT"
     REVIEW = "REVIEW"
     CORRECTION = "CORRECTION"
@@ -44,7 +54,6 @@ class MessageType(str, Enum):
     ERROR = "ERROR"
 
 
-# Allowed transitions: current -> set of next states
 ALLOWED_TRANSITIONS: dict[TaskState, set[TaskState]] = {
     TaskState.ASSIGNED: {
         TaskState.ACKNOWLEDGED,
@@ -75,7 +84,7 @@ ALLOWED_TRANSITIONS: dict[TaskState, set[TaskState]] = {
     TaskState.COMPLETE: set(),
     TaskState.HALTED: set(),
     TaskState.UNCERTAIN: {
-        TaskState.IN_PROGRESS,  # manual reconciliation only
+        TaskState.IN_PROGRESS,
         TaskState.HALTED,
     },
 }
@@ -84,6 +93,7 @@ ALLOWED_TRANSITIONS: dict[TaskState, set[TaskState]] = {
 MESSAGE_TO_STATE = {
     MessageType.TASK_ASSIGNMENT: TaskState.ASSIGNED,
     MessageType.ACK: TaskState.ACKNOWLEDGED,
+    MessageType.START: TaskState.IN_PROGRESS,
     MessageType.RESULT: TaskState.RESULT_SUBMITTED,
     MessageType.REVIEW: TaskState.UNDER_REVIEW,
     MessageType.CORRECTION: TaskState.CORRECTION_REQUESTED,
@@ -94,7 +104,7 @@ MESSAGE_TO_STATE = {
 
 @dataclass(frozen=True)
 class Message:
-    """Versioned collaboration message."""
+    """Versioned collaboration message. Immutable after creation."""
 
     message_id: str
     idempotency_key: str
@@ -111,14 +121,34 @@ class Message:
     protocol_version: str = PROTOCOL_VERSION
 
     def __post_init__(self):
-        if not self.message_id:
+        if self.protocol_version != PROTOCOL_VERSION:
+            raise ProtocolError("Unsupported protocol version")
+
+        if not isinstance(self.message_id, str) or not self.message_id:
             raise ProtocolError("message_id is required")
-        if not self.idempotency_key:
+        if not isinstance(self.idempotency_key, str) or not self.idempotency_key:
             raise ProtocolError("idempotency_key is required")
-        if not self.correlation_id:
+        if not isinstance(self.correlation_id, str) or not self.correlation_id:
             raise ProtocolError("correlation_id is required")
+        if not isinstance(self.project_id, str) or not self.project_id:
+            raise ProtocolError("project_id is required")
+        if not isinstance(self.task_id, str) or not self.task_id:
+            raise ProtocolError("task_id is required")
+
+        if self.sender not in KNOWN_AGENTS:
+            raise ProtocolError("Unknown sender")
+        if self.recipient not in KNOWN_AGENTS:
+            raise ProtocolError("Unknown recipient")
+
         if not isinstance(self.message_type, MessageType):
             raise ProtocolError("invalid message_type")
+
+        if not isinstance(self.timestamp, datetime) or self.timestamp.tzinfo is None:
+            raise ProtocolError("timestamp must be timezone-aware")
+
+        if not isinstance(self.payload, dict):
+            raise ProtocolError("payload must be a dictionary")
+
         if self.authorization_status not in {
             "NONE",
             "PENDING",
@@ -128,10 +158,37 @@ class Message:
         }:
             raise ProtocolError("invalid authorization_status")
 
+        # AI-generated messages must never independently claim approval.
+        if (
+            self.sender in {"skyppy", "jason"}
+            and self.authorization_status == "APPROVED"
+        ):
+            raise ProtocolError(
+                "AI message cannot establish an approved authorization state"
+            )
+
+    def logical_identity(self) -> tuple:
+        """Fields that must match for a duplicate to be valid."""
+        return (
+            self.project_id,
+            self.task_id,
+            self.sender,
+            self.recipient,
+            self.message_type.value,
+            json.dumps(self.payload, sort_keys=True, separators=(",", ":")),
+            self.protocol_version,
+        )
+
 
 @dataclass
 class ApprovalRecord:
-    """Separate from AI messages. Never derived from message text."""
+    """
+    Synthetic approval record.
+
+    Separate from AI messages.
+    An identity string is not real human authentication.
+    Actual authorization execution remains disabled until Step 69E.
+    """
 
     approval_id: str
     chief_identity: str
@@ -144,60 +201,155 @@ class ApprovalRecord:
 
 @dataclass
 class OutboundRequest:
-    """Tracked separately from internal message delivery."""
-
     request_id: str
     task_id: str
-    status: str  # PENDING, CONFIRMED, UNCERTAIN, FAILED
+    status: str
     created_at: datetime
     attempts: int = 0
 
 
 class CollaborationProtocol:
     """
-    Local, in-memory collaboration protocol.
+    Local collaboration protocol with minimal SQLite persistence.
 
     No external network calls. Synthetic agents only.
     """
 
     def __init__(
         self,
+        database_path: str | Path,
         max_messages_per_task: int = 10,
         max_retries: int = 3,
         message_ttl_seconds: int = 86400,
     ):
+        if str(database_path) == ":memory:":
+            raise ValueError("Protocol requires a disk database")
+
+        self.database_path = Path(database_path)
         self.max_messages_per_task = max_messages_per_task
         self.max_retries = max_retries
         self.message_ttl = timedelta(seconds=message_ttl_seconds)
 
-        self._messages: dict[str, Message] = {}
-        self._idempotency: dict[str, str] = {}  # key -> message_id
-        self._tasks: dict[str, TaskState] = {}
-        self._task_message_count: dict[str, int] = {}
-        self._acks: set[str] = set()
-        self._approvals: dict[str, ApprovalRecord] = {}
-        self._outbound: dict[str, OutboundRequest] = {}
-        self._halted: bool = False
+        if not self.database_path.parent.is_dir():
+            raise ProtocolError("Database directory does not exist")
+
+        self._init_schema()
+        self._load_halt()
+
+    def _connect(self):
+        return sqlite3.connect(self.database_path, timeout=5.0)
+
+    def _init_schema(self):
+        with self._connect() as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS messages (
+                    message_id TEXT PRIMARY KEY,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    correlation_id TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    sender TEXT NOT NULL,
+                    recipient TEXT NOT NULL,
+                    message_type TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    authorization_status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    parent_message_id TEXT,
+                    protocol_version TEXT NOT NULL,
+                    logical_identity TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS acknowledgments (
+                    message_id TEXT PRIMARY KEY
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_states (
+                    task_id TEXT PRIMARY KEY,
+                    state TEXT NOT NULL,
+                    message_count INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS outbound_requests (
+                    request_id TEXT PRIMARY KEY,
+                    task_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    attempts INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS control (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS approvals (
+                    approval_id TEXT PRIMARY KEY,
+                    chief_identity TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    issued_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    consumed_at TEXT
+                )
+                """
+            )
+
+    def _load_halt(self) -> None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM control WHERE key = 'halted'"
+            ).fetchone()
+            self._halted = bool(row and row[0] == "1")
 
     @property
     def is_halted(self) -> bool:
         return self._halted
 
     def halt(self) -> None:
-        """Global HALT. Prevents new work."""
+        """Global HALT. Survives reopen. No automatic resumption."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO control (key, value)
+                VALUES ('halted', '1')
+                ON CONFLICT(key) DO UPDATE SET value = '1'
+                """
+            )
         self._halted = True
 
     def get_state(self, task_id: str) -> TaskState | None:
-        return self._tasks.get(task_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT state FROM task_states WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+        return TaskState(row[0]) if row else None
 
     def accept(self, message: Message, now: datetime | None = None) -> bool:
         """
         Accept a message if valid.
 
         Returns True if newly accepted.
-        Returns False if it is a duplicate of an already-accepted message.
-        Raises ProtocolError on invalid content, conflicting idempotency,
-        invalid transition, expiration, bound exceeded, or HALT.
+        Returns False if it is a valid duplicate.
+        Raises ProtocolError on conflict, invalid transition, expiration,
+        bound exceeded, or HALT.
         """
 
         now = now or datetime.now(timezone.utc)
@@ -205,80 +357,191 @@ class CollaborationProtocol:
         if self._halted and message.message_type is not MessageType.HALT:
             raise ProtocolError("Protocol is halted; new work rejected")
 
-        # Expiration
         if now - message.timestamp > self.message_ttl:
             raise ProtocolError("Message expired")
 
-        # Duplicate message_id
-        if message.message_id in self._messages:
-            return False
+        identity = message.logical_identity()
 
-        # Idempotency
-        if message.idempotency_key in self._idempotency:
-            existing_id = self._idempotency[message.idempotency_key]
-            existing = self._messages[existing_id]
-            if existing.payload != message.payload:
-                raise ProtocolError(
-                    "Conflicting payload for existing idempotency key"
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+
+                existing_by_id = connection.execute(
+                    "SELECT logical_identity FROM messages WHERE message_id = ?",
+                    (message.message_id,),
+                ).fetchone()
+
+                if existing_by_id is not None:
+                    if existing_by_id[0] != identity:
+                        raise ProtocolError(
+                            "Conflicting content for existing message ID"
+                        )
+                    return False
+
+                existing_by_key = connection.execute(
+                    """
+                    SELECT message_id, logical_identity
+                    FROM messages
+                    WHERE idempotency_key = ?
+                    """,
+                    (message.idempotency_key,),
+                ).fetchone()
+
+                if existing_by_key is not None:
+                    if existing_by_key[1] != identity:
+                        raise ProtocolError(
+                            "Conflicting content for existing idempotency key"
+                        )
+                    return False
+
+                count_row = connection.execute(
+                    "SELECT message_count FROM task_states WHERE task_id = ?",
+                    (message.task_id,),
+                ).fetchone()
+                count = count_row[0] if count_row else 0
+
+                if count >= self.max_messages_per_task:
+                    raise ProtocolError("Maximum messages per task exceeded")
+
+                current_row = connection.execute(
+                    "SELECT state FROM task_states WHERE task_id = ?",
+                    (message.task_id,),
+                ).fetchone()
+                current = TaskState(current_row[0]) if current_row else None
+
+                target = MESSAGE_TO_STATE.get(message.message_type)
+
+                if message.message_type is MessageType.TASK_ASSIGNMENT:
+                    if current is not None:
+                        raise ProtocolError("Task already exists")
+                    target = TaskState.ASSIGNED
+                elif target is None:
+                    raise ProtocolError("Unsupported message type for transition")
+                else:
+                    if current is None:
+                        raise ProtocolError("Task does not exist")
+                    if target not in ALLOWED_TRANSITIONS.get(current, set()):
+                        raise ProtocolError(
+                            f"Invalid transition: {current.value} -> {target.value}"
+                        )
+
+                connection.execute(
+                    """
+                    INSERT INTO messages (
+                        message_id, idempotency_key, correlation_id,
+                        project_id, task_id, sender, recipient,
+                        message_type, timestamp, authorization_status,
+                        payload_json, parent_message_id, protocol_version,
+                        logical_identity
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message.message_id,
+                        message.idempotency_key,
+                        message.correlation_id,
+                        message.project_id,
+                        message.task_id,
+                        message.sender,
+                        message.recipient,
+                        message.message_type.value,
+                        message.timestamp.isoformat(),
+                        message.authorization_status,
+                        json.dumps(
+                            message.payload,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        message.parent_message_id,
+                        message.protocol_version,
+                        identity,
+                    ),
                 )
-            # Same key, same payload → duplicate delivery
-            return False
 
-        # Bound
-        count = self._task_message_count.get(message.task_id, 0)
-        if count >= self.max_messages_per_task:
-            raise ProtocolError("Maximum messages per task exceeded")
-
-        # State transition
-        current = self._tasks.get(message.task_id)
-        target = MESSAGE_TO_STATE.get(message.message_type)
-
-        if message.message_type is MessageType.TASK_ASSIGNMENT:
-            if current is not None:
-                raise ProtocolError("Task already exists")
-            target = TaskState.ASSIGNED
-        elif target is None:
-            raise ProtocolError("Unsupported message type for transition")
-        else:
-            if current is None:
-                raise ProtocolError("Task does not exist")
-            if target not in ALLOWED_TRANSITIONS.get(current, set()):
-                raise ProtocolError(
-                    f"Invalid transition: {current.value} -> {target.value}"
+                connection.execute(
+                    """
+                    INSERT INTO task_states (task_id, state, message_count)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        state = excluded.state,
+                        message_count = message_count + 1
+                    """,
+                    (message.task_id, target.value),
                 )
 
-        # Accept
-        self._messages[message.message_id] = message
-        self._idempotency[message.idempotency_key] = message.message_id
-        self._tasks[message.task_id] = target
-        self._task_message_count[message.task_id] = count + 1
+                return True
 
-        return True
+        except sqlite3.Error as exc:
+            raise ProtocolError("Persistence failed; transaction rolled back") from exc
 
     def acknowledge(self, message_id: str) -> None:
-        """Record durable acknowledgment of an accepted message."""
-        if message_id not in self._messages:
-            raise ProtocolError("Cannot acknowledge unknown message")
-        self._acks.add(message_id)
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM messages WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+            if row is None:
+                raise ProtocolError("Cannot acknowledge unknown message")
+            connection.execute(
+                "INSERT OR IGNORE INTO acknowledgments (message_id) VALUES (?)",
+                (message_id,),
+            )
 
     def is_acknowledged(self, message_id: str) -> bool:
-        return message_id in self._acks
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM acknowledgments WHERE message_id = ?",
+                (message_id,),
+            ).fetchone()
+        return row is not None
 
-    def unacknowledged(self) -> list[Message]:
-        """Messages accepted but not yet acknowledged."""
-        return [
-            msg
-            for mid, msg in self._messages.items()
-            if mid not in self._acks
-        ]
+    def unacknowledged(self) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.message_id
+                FROM messages AS m
+                LEFT JOIN acknowledgments AS a
+                    ON a.message_id = m.message_id
+                WHERE a.message_id IS NULL
+                """
+            ).fetchall()
+        return [row[0] for row in rows]
 
     def record_approval(self, approval: ApprovalRecord) -> None:
-        """Store a Chief authorization. Separate from AI messages."""
+        """
+        Store a synthetic approval.
+
+        Does not authorize real actions. Execution remains disabled
+        until Step 69E.
+        """
         if not approval.chief_identity:
-            raise ProtocolError("Approval requires authenticated Chief identity")
-        if approval.approval_id in self._approvals:
-            raise ProtocolError("Duplicate approval id")
-        self._approvals[approval.approval_id] = approval
+            raise ProtocolError("Approval requires an identity string")
+
+        with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT 1 FROM approvals WHERE approval_id = ?",
+                (approval.approval_id,),
+            ).fetchone()
+            if existing is not None:
+                raise ProtocolError("Duplicate approval id")
+
+            connection.execute(
+                """
+                INSERT INTO approvals (
+                    approval_id, chief_identity, action, task_id,
+                    issued_at, expires_at, consumed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    approval.approval_id,
+                    approval.chief_identity,
+                    approval.action,
+                    approval.task_id,
+                    approval.issued_at.isoformat(),
+                    approval.expires_at.isoformat(),
+                    None,
+                ),
+            )
 
     def consume_approval(
         self,
@@ -286,33 +549,65 @@ class CollaborationProtocol:
         now: datetime | None = None,
     ) -> ApprovalRecord:
         """
-        Atomically consume an approval.
+        Consume a synthetic approval.
 
-        Raises if missing, expired, or already consumed.
+        This does not authorize real actions.
         """
         now = now or datetime.now(timezone.utc)
-        approval = self._approvals.get(approval_id)
 
-        if approval is None:
-            raise ProtocolError("Approval not found")
-        if approval.consumed_at is not None:
-            raise ProtocolError("Approval already consumed")
-        if now > approval.expires_at:
-            raise ProtocolError("Approval expired")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT chief_identity, action, task_id,
+                       issued_at, expires_at, consumed_at
+                FROM approvals
+                WHERE approval_id = ?
+                """,
+                (approval_id,),
+            ).fetchone()
 
-        approval.consumed_at = now
-        return approval
+            if row is None:
+                raise ProtocolError("Approval not found")
+
+            consumed_at = (
+                datetime.fromisoformat(row[5]) if row[5] else None
+            )
+            expires_at = datetime.fromisoformat(row[4])
+
+            if consumed_at is not None:
+                raise ProtocolError("Approval already consumed")
+            if now > expires_at:
+                raise ProtocolError("Approval expired")
+
+            connection.execute(
+                """
+                UPDATE approvals
+                SET consumed_at = ?
+                WHERE approval_id = ?
+                  AND consumed_at IS NULL
+                """,
+                (now.isoformat(), approval_id),
+            )
+
+        return ApprovalRecord(
+            approval_id=approval_id,
+            chief_identity=row[0],
+            action=row[1],
+            task_id=row[2],
+            issued_at=datetime.fromisoformat(row[3]),
+            expires_at=expires_at,
+            consumed_at=now,
+        )
 
     def track_outbound(
         self,
         task_id: str,
         status: str = "PENDING",
     ) -> OutboundRequest:
-        """
-        Track an outbound request separately from internal delivery.
+        if self._halted:
+            raise ProtocolError("Protocol is halted; outbound requests rejected")
 
-        Uncertain outcomes are recorded but never automatically retried.
-        """
         if status not in {"PENDING", "CONFIRMED", "UNCERTAIN", "FAILED"}:
             raise ProtocolError("Invalid outbound status")
 
@@ -322,26 +617,57 @@ class CollaborationProtocol:
             status=status,
             created_at=datetime.now(timezone.utc),
         )
-        self._outbound[request.request_id] = request
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO outbound_requests (
+                    request_id, task_id, status, created_at, attempts
+                ) VALUES (?, ?, ?, ?, 0)
+                """,
+                (
+                    request.request_id,
+                    request.task_id,
+                    request.status,
+                    request.created_at.isoformat(),
+                ),
+            )
+
         return request
 
     def mark_outbound_uncertain(self, request_id: str) -> None:
-        """
-        Record an uncertain external outcome.
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT task_id, attempts FROM outbound_requests WHERE request_id = ?",
+                (request_id,),
+            ).fetchone()
 
-        Does not retry. Approval is not reused.
-        """
-        request = self._outbound.get(request_id)
-        if request is None:
-            raise ProtocolError("Unknown outbound request")
-        request.status = "UNCERTAIN"
-        request.attempts += 1
+            if row is None:
+                raise ProtocolError("Unknown outbound request")
 
-        # Reflect uncertainty on the task if it exists.
-        if request.task_id in self._tasks:
-            current = self._tasks[request.task_id]
-            if TaskState.UNCERTAIN in ALLOWED_TRANSITIONS.get(current, set()):
-                self._tasks[request.task_id] = TaskState.UNCERTAIN
+            connection.execute(
+                """
+                UPDATE outbound_requests
+                SET status = 'UNCERTAIN', attempts = attempts + 1
+                WHERE request_id = ?
+                """,
+                (request_id,),
+            )
+
+            task_id = row[0]
+            current_row = connection.execute(
+                "SELECT state FROM task_states WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+
+            if current_row is not None:
+                current = TaskState(current_row[0])
+                if TaskState.UNCERTAIN in ALLOWED_TRANSITIONS.get(current, set()):
+                    connection.execute(
+                        "UPDATE task_states SET state = ? WHERE task_id = ?",
+                        (TaskState.UNCERTAIN.value, task_id),
+                    )
 
     def simulate_round_trip(
         self,
@@ -353,7 +679,7 @@ class CollaborationProtocol:
         """
         Local synthetic Skyppy → Jason → Skyppy exchange.
 
-        No external APIs. Returns the messages that were accepted.
+        Uses only public accept() transitions. No direct state mutation.
         """
         now = now or datetime.now(timezone.utc)
         correlation = str(uuid.uuid4())
@@ -388,8 +714,20 @@ class CollaborationProtocol:
         self.accept(ack, now=now)
         self.acknowledge(ack.message_id)
 
-        # Move to IN_PROGRESS explicitly for the simulation.
-        self._tasks[task_id] = TaskState.IN_PROGRESS
+        start = Message(
+            message_id=str(uuid.uuid4()),
+            idempotency_key=f"start-{task_id}",
+            correlation_id=correlation,
+            project_id="QLA",
+            task_id=task_id,
+            sender="jason",
+            recipient="bridge",
+            message_type=MessageType.START,
+            timestamp=now,
+            parent_message_id=ack.message_id,
+        )
+        self.accept(start, now=now)
+        self.acknowledge(start.message_id)
 
         result = Message(
             message_id=str(uuid.uuid4()),
@@ -402,7 +740,7 @@ class CollaborationProtocol:
             message_type=MessageType.RESULT,
             timestamp=now,
             payload=result_payload,
-            parent_message_id=ack.message_id,
+            parent_message_id=start.message_id,
         )
         self.accept(result, now=now)
         self.acknowledge(result.message_id)
@@ -423,4 +761,4 @@ class CollaborationProtocol:
         self.accept(review, now=now)
         self.acknowledge(review.message_id)
 
-        return [assignment, ack, result, review]
+        return [assignment, ack, start, result, review]
