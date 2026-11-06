@@ -493,6 +493,34 @@ def test_missing_repository_fields():
 
 
 def test_missing_pull_request_source():
+    """
+    Valid HEAD SHA and source branch, but no head.repo.
+    The provider must reject the missing source repository identity.
+    """
+    transport = make_transport([
+        ("/pulls/1",
+         json_response({
+             "number": 1,
+             "title": "Open",
+             "state": "open",
+             "merged": False,
+             "head": {
+                 "sha": SHA,
+                 "ref": "feature/x",
+             },
+             "base": {"ref": "phase-8-tradingview-integration"},
+         })),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+
+    with pytest.raises(AdapterError, match="source repository"):
+        provider.pull_request(ALLOWED_REPOSITORY, 1)
+
+
+def test_missing_pull_request_head_sha():
+    """
+    Preserve coverage for a pull request that lacks a HEAD SHA.
+    """
     transport = make_transport([
         ("/pulls/1",
          json_response({
@@ -506,7 +534,7 @@ def test_missing_pull_request_source():
     ])
     provider = GitHubLiveProvider(TOKEN, transport)
 
-    with pytest.raises(AdapterError, match="source"):
+    with pytest.raises(AdapterError, match="HEAD SHA is missing"):
         provider.pull_request(ALLOWED_REPOSITORY, 1)
 
 

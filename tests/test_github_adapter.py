@@ -256,8 +256,6 @@ def test_unrelated_branch_and_pr_without_sha(adapter):
 
 
 def test_unrelated_branch_and_pr_same_sha(adapter):
-    # PR 2 head is the integration SHA; pairing it with the feature branch
-    # (different source) must fail even if a SHA is not the differentiator.
     with pytest.raises(AdapterError, match="not the pull request source"):
         adapter.development_report(
             ALLOWED_REPOSITORY,
@@ -430,6 +428,10 @@ def test_wrong_commit_sha_rejected():
 
 
 def test_non_synthetic_source_rejected():
+    """
+    An unrecognized source is rejected as invalid provenance.
+    The synthetic-mode adapter does not accept it as evidence.
+    """
     class Bad:
         def repository(self, repository):
             return RepositorySnapshot(
@@ -440,5 +442,5 @@ def test_non_synthetic_source_rejected():
                 source="live",
             )
 
-    with pytest.raises(AdapterError, match="non-synthetic"):
+    with pytest.raises(AdapterError, match="Invalid provenance"):
         GitHubAdapter(Bad()).repository(ALLOWED_REPOSITORY)
