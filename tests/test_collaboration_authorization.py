@@ -4,6 +4,7 @@ SKIPPY AI Collaboration Bridge — Authorization Policy Tests.
 Synthetic evidence only. No network. No credentials. No execution.
 """
 
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -240,24 +241,62 @@ def test_one_time_consumption(tmp_path):
 
 
 def test_concurrent_consumption(tmp_path):
-    path = tmp_path / "auth.db"
-    policy = AuthorizationPolicy(path)
-    policy.submit(_request())
+    """
+    Two independent policy instances consume the same authorization
+    after a barrier. Exactly one succeeds. Execution stays disabled.
+    """
 
-    other = AuthorizationPolicy(path)
-    first = policy.consume("auth-1")
-    second = other.consume("auth-1")
+    path = tmp_path / "auth.db"
+    first_policy = AuthorizationPolicy(path)
+    first_policy.submit(_request())
+    second_policy = AuthorizationPolicy(path)
+
+    barrier = threading.Barrier(2)
+    results = []
+    errors = []
+
+    def worker(policy):
+        try:
+            barrier.wait(timeout=2)
+            results.append(policy.consume("auth-1"))
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=worker, args=(first_policy,)),
+        threading.Thread(target=worker, args=(second_policy,)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert errors == []
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(results) == 2
 
     successes = [
         decision
-        for decision in (first, second)
+        for decision in results
         if decision.state is AuthorizationState.CONSUMED
         and decision.reason == "Consumed; execution remains disabled"
     ]
+    rejections = [
+        decision
+        for decision in results
+        if decision.reason == "Authorization already consumed"
+    ]
+
     assert len(successes) == 1
-    assert first.execution_enabled is False
-    assert second.execution_enabled is False
-    assert policy.stored_state("auth-1") == "CONSUMED"
+    assert len(rejections) == 1
+    assert all(decision.execution_enabled is False for decision in results)
+    assert first_policy.stored_state("auth-1") == "CONSUMED"
+    assert "Authorization already consumed" in first_policy.events_for("auth-1")
+
+    # Not reusable.
+    third = first_policy.consume("auth-1")
+    assert third.state is AuthorizationState.CONSUMED
+    assert third.allowed is False
 
 
 def test_missing_authorization_audited(tmp_path):
