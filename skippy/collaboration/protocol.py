@@ -7,11 +7,23 @@ No external AI APIs, no repository writes, no trading execution.
 Approval records in this step are synthetic only.
 They do not constitute real human authorization.
 Actual authorization execution remains disabled until Step 69E.
+
+Identity rules:
+* Message envelope identity (message_id): the complete immutable envelope
+  must match for a repeated message_id to be treated as a valid duplicate.
+  Fields: message_id, idempotency_key, correlation_id, project_id, task_id,
+  sender, recipient, message_type, authorization_status, payload,
+  parent_message_id, protocol_version.
+* Logical-operation identity (idempotency_key): the same key represents
+  the same logical operation when project_id, task_id, sender, recipient,
+  message_type, authorization_status, and payload match.
+  Legitimate repeated reviews use a new message_id and a new idempotency_key.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
@@ -102,6 +114,31 @@ MESSAGE_TO_STATE = {
 }
 
 
+def _canonical_json(value: Any) -> str:
+    """Deterministic JSON. Rejects non-finite numbers and non-serializable values."""
+
+    def _check(obj: Any) -> Any:
+        if isinstance(obj, float):
+            if not math.isfinite(obj):
+                raise ProtocolError("Payload contains non-finite number")
+            return obj
+        if isinstance(obj, dict):
+            return {str(k): _check(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_check(v) for v in obj]
+        if isinstance(obj, (str, int, bool)) or obj is None:
+            return obj
+        raise ProtocolError("Payload is not JSON-serializable")
+
+    cleaned = _check(value)
+    return json.dumps(
+        cleaned,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
 @dataclass(frozen=True)
 class Message:
     """Versioned collaboration message. Immutable after creation."""
@@ -149,6 +186,9 @@ class Message:
         if not isinstance(self.payload, dict):
             raise ProtocolError("payload must be a dictionary")
 
+        # Reject non-serializable / non-finite payloads early.
+        _canonical_json(self.payload)
+
         if self.authorization_status not in {
             "NONE",
             "PENDING",
@@ -158,7 +198,6 @@ class Message:
         }:
             raise ProtocolError("invalid authorization_status")
 
-        # AI-generated messages must never independently claim approval.
         if (
             self.sender in {"skyppy", "jason"}
             and self.authorization_status == "APPROVED"
@@ -167,17 +206,46 @@ class Message:
                 "AI message cannot establish an approved authorization state"
             )
 
-    def logical_identity(self) -> tuple:
-        """Fields that must match for a duplicate to be valid."""
-        return (
-            self.project_id,
-            self.task_id,
-            self.sender,
-            self.recipient,
-            self.message_type.value,
-            json.dumps(self.payload, sort_keys=True, separators=(",", ":")),
-            self.protocol_version,
-        )
+    def envelope_identity(self) -> str:
+        """
+        Canonical identity of the complete immutable message envelope.
+
+        Used when a message_id is repeated.
+        """
+        return _canonical_json({
+            "message_id": self.message_id,
+            "idempotency_key": self.idempotency_key,
+            "correlation_id": self.correlation_id,
+            "project_id": self.project_id,
+            "task_id": self.task_id,
+            "sender": self.sender,
+            "recipient": self.recipient,
+            "message_type": self.message_type.value,
+            "authorization_status": self.authorization_status,
+            "payload": self.payload,
+            "parent_message_id": self.parent_message_id,
+            "protocol_version": self.protocol_version,
+        })
+
+    def operation_identity(self) -> str:
+        """
+        Canonical identity of the logical operation.
+
+        Used when an idempotency_key is repeated.
+        Correlation ID and parent are intentionally excluded so that
+        redelivery of the same operation is recognized, while a new
+        review with a new key remains distinct.
+        """
+        return _canonical_json({
+            "project_id": self.project_id,
+            "task_id": self.task_id,
+            "sender": self.sender,
+            "recipient": self.recipient,
+            "message_type": self.message_type.value,
+            "authorization_status": self.authorization_status,
+            "payload": self.payload,
+            "protocol_version": self.protocol_version,
+        })
 
 
 @dataclass
@@ -234,7 +302,7 @@ class CollaborationProtocol:
             raise ProtocolError("Database directory does not exist")
 
         self._init_schema()
-        self._load_halt()
+        self._refresh_halt()
 
     def _connect(self):
         return sqlite3.connect(self.database_path, timeout=5.0)
@@ -257,7 +325,8 @@ class CollaborationProtocol:
                     payload_json TEXT NOT NULL,
                     parent_message_id TEXT,
                     protocol_version TEXT NOT NULL,
-                    logical_identity TEXT NOT NULL
+                    envelope_identity TEXT NOT NULL,
+                    operation_identity TEXT NOT NULL
                 )
                 """
             )
@@ -310,16 +379,17 @@ class CollaborationProtocol:
                 """
             )
 
-    def _load_halt(self) -> None:
+    def _refresh_halt(self) -> bool:
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT value FROM control WHERE key = 'halted'"
             ).fetchone()
             self._halted = bool(row and row[0] == "1")
+        return self._halted
 
     @property
     def is_halted(self) -> bool:
-        return self._halted
+        return self._refresh_halt()
 
     def halt(self) -> None:
         """Global HALT. Survives reopen. No automatic resumption."""
@@ -350,29 +420,44 @@ class CollaborationProtocol:
         Returns False if it is a valid duplicate.
         Raises ProtocolError on conflict, invalid transition, expiration,
         bound exceeded, or HALT.
+
+        HALT is read from SQLite inside the acceptance transaction so a
+        second instance cannot accept work after another instance halts.
         """
 
         now = now or datetime.now(timezone.utc)
 
-        if self._halted and message.message_type is not MessageType.HALT:
-            raise ProtocolError("Protocol is halted; new work rejected")
-
         if now - message.timestamp > self.message_ttl:
             raise ProtocolError("Message expired")
 
-        identity = message.logical_identity()
+        envelope = message.envelope_identity()
+        operation = message.operation_identity()
 
         try:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
 
+                # Authoritative HALT check inside the transaction.
+                halt_row = connection.execute(
+                    "SELECT value FROM control WHERE key = 'halted'"
+                ).fetchone()
+                if halt_row and halt_row[0] == "1":
+                    if message.message_type is not MessageType.HALT:
+                        raise ProtocolError(
+                            "Protocol is halted; new work rejected"
+                        )
+
                 existing_by_id = connection.execute(
-                    "SELECT logical_identity FROM messages WHERE message_id = ?",
+                    """
+                    SELECT envelope_identity
+                    FROM messages
+                    WHERE message_id = ?
+                    """,
                     (message.message_id,),
                 ).fetchone()
 
                 if existing_by_id is not None:
-                    if existing_by_id[0] != identity:
+                    if existing_by_id[0] != envelope:
                         raise ProtocolError(
                             "Conflicting content for existing message ID"
                         )
@@ -380,7 +465,7 @@ class CollaborationProtocol:
 
                 existing_by_key = connection.execute(
                     """
-                    SELECT message_id, logical_identity
+                    SELECT operation_identity
                     FROM messages
                     WHERE idempotency_key = ?
                     """,
@@ -388,7 +473,7 @@ class CollaborationProtocol:
                 ).fetchone()
 
                 if existing_by_key is not None:
-                    if existing_by_key[1] != identity:
+                    if existing_by_key[0] != operation:
                         raise ProtocolError(
                             "Conflicting content for existing idempotency key"
                         )
@@ -432,8 +517,8 @@ class CollaborationProtocol:
                         project_id, task_id, sender, recipient,
                         message_type, timestamp, authorization_status,
                         payload_json, parent_message_id, protocol_version,
-                        logical_identity
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        envelope_identity, operation_identity
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         message.message_id,
@@ -446,14 +531,11 @@ class CollaborationProtocol:
                         message.message_type.value,
                         message.timestamp.isoformat(),
                         message.authorization_status,
-                        json.dumps(
-                            message.payload,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
+                        _canonical_json(message.payload),
                         message.parent_message_id,
                         message.protocol_version,
-                        identity,
+                        envelope,
+                        operation,
                     ),
                 )
 
@@ -471,7 +553,9 @@ class CollaborationProtocol:
                 return True
 
         except sqlite3.Error as exc:
-            raise ProtocolError("Persistence failed; transaction rolled back") from exc
+            raise ProtocolError(
+                "Persistence failed; transaction rolled back"
+            ) from exc
 
     def acknowledge(self, message_id: str) -> None:
         with self._connect() as connection:
@@ -605,9 +689,6 @@ class CollaborationProtocol:
         task_id: str,
         status: str = "PENDING",
     ) -> OutboundRequest:
-        if self._halted:
-            raise ProtocolError("Protocol is halted; outbound requests rejected")
-
         if status not in {"PENDING", "CONFIRMED", "UNCERTAIN", "FAILED"}:
             raise ProtocolError("Invalid outbound status")
 
@@ -618,20 +699,36 @@ class CollaborationProtocol:
             created_at=datetime.now(timezone.utc),
         )
 
-        with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO outbound_requests (
-                    request_id, task_id, status, created_at, attempts
-                ) VALUES (?, ?, ?, ?, 0)
-                """,
-                (
-                    request.request_id,
-                    request.task_id,
-                    request.status,
-                    request.created_at.isoformat(),
-                ),
-            )
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+
+                halt_row = connection.execute(
+                    "SELECT value FROM control WHERE key = 'halted'"
+                ).fetchone()
+                if halt_row and halt_row[0] == "1":
+                    raise ProtocolError(
+                        "Protocol is halted; outbound requests rejected"
+                    )
+
+                connection.execute(
+                    """
+                    INSERT INTO outbound_requests (
+                        request_id, task_id, status, created_at, attempts
+                    ) VALUES (?, ?, ?, ?, 0)
+                    """,
+                    (
+                        request.request_id,
+                        request.task_id,
+                        request.status,
+                        request.created_at.isoformat(),
+                    ),
+                )
+
+        except sqlite3.Error as exc:
+            raise ProtocolError(
+                "Persistence failed; transaction rolled back"
+            ) from exc
 
         return request
 
