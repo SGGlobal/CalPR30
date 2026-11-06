@@ -1,11 +1,12 @@
 """
 SKIPPY AI Collaboration Bridge — Production Transport Tests.
 
-No real GitHub contact. Redirect and status tests use a mocked HTTPS
-handler inside a real OpenerDirector.
+No real GitHub contact. Redirect and status tests use a BaseHandler
+mock inside a real OpenerDirector.
 """
 
 import json
+from email.message import Message
 from io import BytesIO
 
 import pytest
@@ -36,17 +37,59 @@ def _guarded_factory():
     return factory
 
 
+class MockResponse(BytesIO):
+    """
+    urllib-compatible response.
+
+    Provides code, msg, info(), read(), and url so HTTPErrorProcessor
+    can inspect it without network access.
+    """
+
+    def __init__(self, status, body, url, location=None):
+        super().__init__(body)
+        self.status = status
+        self.code = status
+        self.msg = "mock"
+        self.url = url
+        self._headers = Message()
+        if location:
+            self._headers["Location"] = location
+
+    def info(self):
+        return self._headers
+
+    def geturl(self):
+        return self.url
+
+
 class MockHTTPSHandler:
     """
-    Fully mocked HTTPS handler that records requests and returns a
-    prepared response. Used inside a real OpenerDirector.
+    BaseHandler-compatible mock.
+
+    Registered with a real OpenerDirector. Returns responses rather than
+    raising HTTPError so the processor chain runs.
     """
 
     def __init__(self, status, body=b"ok", location=None):
+        from urllib.request import BaseHandler
+
+        # Dynamically become a BaseHandler subclass instance.
+        self.__class__ = type(
+            "MockHTTPSHandler",
+            (BaseHandler,),
+            {
+                "https_open": MockHTTPSHandler.https_open,
+                "https_request": MockHTTPSHandler.https_request,
+            },
+        )
+        BaseHandler.__init__(self)
         self.status = status
         self.body = body
         self.location = location
         self.requests = []
+
+    def https_request(self, req):
+        return req
 
     def https_open(self, req):
         self.requests.append(
@@ -55,33 +98,12 @@ class MockHTTPSHandler:
                 "headers": dict(req.headers),
             }
         )
-
-        headers = {}
-        if self.location:
-            headers["Location"] = self.location
-
-        response = BytesIO(self.body)
-        response.status = self.status
-        response.code = self.status
-        response.headers = headers
-        response.url = req.full_url
-        response.msg = "mock"
-
-        from urllib.error import HTTPError
-
-        if self.status >= 400:
-            raise HTTPError(
-                req.full_url,
-                self.status,
-                "err",
-                headers,
-                BytesIO(b""),
-            )
-
-        return response
-
-    def https_request(self, req):
-        return req
+        return MockResponse(
+            self.status,
+            self.body,
+            req.full_url,
+            self.location,
+        )
 
 
 def _opener_with(handler):
@@ -99,7 +121,7 @@ def _opener_with(handler):
     return opener
 
 
-def test_http_200_returns_normally():
+def test_http_200_succeeds():
     handler = MockHTTPSHandler(200, body=b"{\"ok\":true}")
     opener = _opener_with(handler)
     transport = ProductionHTTPTransport(opener=opener)
@@ -215,6 +237,10 @@ def test_redirect_error_does_not_reveal_credentials():
 
 @pytest.mark.parametrize("status", [401, 403, 404, 429, 500])
 def test_error_status_retained(status):
+    """
+    Non-2xx responses are returned by the mock so HTTPErrorProcessor
+    and HTTPDefaultErrorHandler run. The transport preserves the status.
+    """
     handler = MockHTTPSHandler(status)
     opener = _opener_with(handler)
     transport = ProductionHTTPTransport(opener=opener)
@@ -225,6 +251,7 @@ def test_error_status_retained(status):
 
     assert response.status == status
     assert response.body == b""
+    assert len(handler.requests) == 1
 
 
 def test_secure_opener_chain():
