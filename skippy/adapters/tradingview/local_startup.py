@@ -146,6 +146,15 @@ class LocalTradingViewStartup:
         other threads that hold or request the lock.
         """
 
+        if (
+            not self.ready
+            or self.event_bus is None
+            or self.ingestion is None
+        ):
+            raise LocalStartupError(
+                "Local observational system is not ready"
+            )
+
         return self.event_bus.controlled_ingest(
             self._verify_observer_readiness,
             self.ingestion.ingest,

@@ -1,4 +1,4 @@
-ï»¿"""
+"""
 SKIPPY AI TRADER - PHASE 8
 
 Controlled Local Startup Tests.
@@ -240,10 +240,12 @@ def test_ingestion_blocked_when_observer_verification_fails(tmp_path):
 def test_concurrent_subscription_change_serialized_by_lock(tmp_path):
     """
     Demonstrates that the controlled bus serializes subscription changes
-    relative to the locked ingest path. No timing-dependent sleeps are used;
-    the test simply confirms the lock is held for the duration of the
-    controlled operation by checking that a concurrent subscribe is blocked
-    until the locked section completes.
+    relative to the locked ingest path using deterministic Event coordination.
+
+    Limitation: This test proves that a concurrent subscribe is blocked
+    until the locked controlled_ingest section completes. It does not
+    exhaustively prove absence of all possible races under arbitrary
+    scheduling; it verifies the lock is held across the protected interval.
     """
     database = tmp_path / "startup.db"
 
@@ -253,24 +255,33 @@ def test_concurrent_subscription_change_serialized_by_lock(tmp_path):
     bus = startup.event_bus
     assert isinstance(bus, ControlledTradingViewEventBus)
 
-    entered = threading.Event()
-    release = threading.Event()
+    lock_held = threading.Event()
+    allow_release = threading.Event()
+    subscribe_started = threading.Event()
+    subscribe_finished = threading.Event()
     results = []
+    results_lock = threading.Lock()
 
     def slow_verify():
-        entered.set()
-        # Wait until the test signals release; this holds the lock.
-        release.wait(timeout=2)
-        results.append("VERIFY_DONE")
+        with results_lock:
+            results.append("VERIFY_ENTER")
+        lock_held.set()
+        # Hold the bus lock until the test permits release.
+        allow_release.wait(timeout=5)
+        with results_lock:
+            results.append("VERIFY_EXIT")
 
     def slow_ingest(body, token):
-        results.append("INGEST")
+        with results_lock:
+            results.append("INGEST")
         return {"ok": True}
 
     def concurrent_subscribe():
-        # This will block until the lock is released.
+        subscribe_started.set()
         bus.subscribe("test.event", lambda p: None)
-        results.append("SUBSCRIBE")
+        with results_lock:
+            results.append("SUBSCRIBE")
+        subscribe_finished.set()
 
     t_ingest = threading.Thread(
         target=lambda: bus.controlled_ingest(
@@ -278,30 +289,33 @@ def test_concurrent_subscription_change_serialized_by_lock(tmp_path):
             slow_ingest,
             b"body",
             "token",
-        )
+        ),
+        daemon=True,
     )
-    t_sub = threading.Thread(target=concurrent_subscribe)
+    t_sub = threading.Thread(target=concurrent_subscribe, daemon=True)
 
     t_ingest.start()
-    # Ensure the locked section has started before attempting the concurrent subscribe.
-    assert entered.wait(timeout=2)
+    assert lock_held.wait(timeout=5), "locked section did not start"
 
     t_sub.start()
+    assert subscribe_started.wait(timeout=5), "subscribe thread did not start"
 
-    # Give the subscribe thread a moment to block on the lock, then release.
-    # (Deterministic: we only proceed after entered is set and after a short
-    # yield; the lock guarantees ordering.)
-    threading.Event().wait(0.05)
+    # At this point the subscribe thread has started and must be blocked
+    # on the bus lock. It cannot have finished yet.
+    assert not subscribe_finished.is_set()
 
-    # At this point the subscribe should still be waiting.
-    assert "SUBSCRIBE" not in results
+    # Permit the locked section to complete.
+    allow_release.set()
 
-    release.set()
+    t_ingest.join(timeout=5)
+    t_sub.join(timeout=5)
 
-    t_ingest.join(timeout=2)
-    t_sub.join(timeout=2)
+    assert not t_ingest.is_alive()
+    assert not t_sub.is_alive()
+    assert subscribe_finished.is_set()
 
-    assert results == ["VERIFY_DONE", "INGEST", "SUBSCRIBE"]
+    with results_lock:
+        assert results == ["VERIFY_ENTER", "VERIFY_EXIT", "INGEST", "SUBSCRIBE"]
 
 
 def test_existing_successful_ingestion_unchanged(tmp_path):
