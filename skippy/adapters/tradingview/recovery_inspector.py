@@ -13,7 +13,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from skippy.adapters.tradingview.deduplicator import SignalDeduplicator
-from skippy.adapters.tradingview.validator import validate_signal
+from skippy.adapters.tradingview.validator import (
+    SignalValidationError,
+    validate_signal,
+)
 
 
 class RecoveryInspectionError(RuntimeError):
@@ -303,7 +306,7 @@ class RecoveryInspector:
 
         try:
             validated = validate_signal(parsed)
-        except Exception as exc:
+        except SignalValidationError as exc:
             raise RecoveryInspectionError(
                 "Stored evidence failed signal validation"
             ) from exc

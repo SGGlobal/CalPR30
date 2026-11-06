@@ -14,6 +14,7 @@ import pytest
 
 from skippy.adapters.tradingview.atomic_registry import AtomicSignalRegistry
 from skippy.adapters.tradingview.deduplicator import SignalDeduplicator
+from skippy.adapters.tradingview.investigation_report import InvestigationReport
 from skippy.adapters.tradingview.observation_repository import (
     ObservationRepository,
 )
@@ -320,6 +321,39 @@ def test_standard_investigation_report_unchanged(tmp_path):
         "REVIEW_REQUIRED",
         "INCONSISTENT",
     }
+
+
+def test_investigation_report_generate_compatible(tmp_path):
+    """
+    Confirm InvestigationReport.generate() retains its existing contract.
+
+    Evidence must not appear in the report, and the classification
+    vocabulary must remain unchanged.
+    """
+    database = prepare_database(tmp_path)
+    registry = AtomicSignalRegistry(database)
+
+    payload = make_payload()
+    fingerprint = matching_fingerprint(payload)
+
+    registry.register(fingerprint, evidence=payload)
+
+    report = InvestigationReport(database).generate()
+
+    assert "total_signals" in report
+    assert "summary" in report
+    assert "findings" in report
+    assert "requires_attention" in report
+
+    assert report["total_signals"] == 1
+
+    finding = report["findings"][0]
+    assert finding["fingerprint"] == fingerprint
+    assert "evidence" not in finding
+    assert finding["classification"] in InvestigationReport.CLASSIFICATIONS
+
+    # Summary keys must match the existing classification set.
+    assert set(report["summary"].keys()) == set(InvestigationReport.CLASSIFICATIONS)
 
 
 def test_interrupted_registration_evidence_inspectable(tmp_path):
