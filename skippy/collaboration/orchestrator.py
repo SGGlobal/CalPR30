@@ -44,6 +44,18 @@ class RecoveryBlocked(OrchestratorError):
     """Raised when safe continuation cannot be established."""
 
 
+def _agent_payload(message: Message) -> dict[str, Any]:
+    """
+    Reconstruct a JSON-compatible payload for simulated agents.
+
+    The protocol freezes nested lists into tuples. Agents expect lists.
+    Loading the canonical payload restores JSON arrays as Python lists
+    without altering the stored identity.
+    """
+
+    return json.loads(message.canonical_payload)
+
+
 class CollaborationOrchestrator:
     """
     Drives a complete synthetic collaboration workflow.
@@ -63,9 +75,8 @@ class CollaborationOrchestrator:
 
     def _register_handlers(self) -> None:
         def _skyppy(message: Message) -> None:
-            # Skyppy reviews RESULT payloads.
             if message.message_type is MessageType.RESULT:
-                plan = dict(message.payload)
+                plan = _agent_payload(message)
                 self._handler_results[message.message_id] = self.skyppy.review(plan)
             else:
                 self._handler_results[message.message_id] = {
@@ -73,13 +84,12 @@ class CollaborationOrchestrator:
                 }
 
         def _jason(message: Message) -> None:
-            # Jason produces a plan from an assignment or correction.
             if message.message_type is MessageType.TASK_ASSIGNMENT:
-                plan = self.jason.plan(dict(message.payload), correction=False)
+                plan = self.jason.plan(_agent_payload(message), correction=False)
                 self._handler_results[message.message_id] = plan
             elif message.message_type is MessageType.CORRECTION:
                 plan = self.jason.plan(
-                    {"objective": message.payload.get("objective", "unspecified")},
+                    _agent_payload(message),
                     correction=True,
                 )
                 self._handler_results[message.message_id] = plan
@@ -290,7 +300,6 @@ class CollaborationOrchestrator:
             now,
         )
 
-        # Jason's handler produced the plan from the assignment.
         plan = self._handler_results.get(assignment.message_id)
         if not isinstance(plan, dict) or "steps" not in plan:
             raise OrchestratorError("Jason handler did not produce a plan")
@@ -322,7 +331,6 @@ class CollaborationOrchestrator:
             now,
         )
 
-        # Skyppy's handler reviewed the result.
         review_payload = self._handler_results.get(result.message_id)
         if not isinstance(review_payload, dict) or "decision" not in review_payload:
             raise OrchestratorError("Skyppy handler did not produce a review")

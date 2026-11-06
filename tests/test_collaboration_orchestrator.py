@@ -71,18 +71,6 @@ def test_skyppy_handler_processes_review(tmp_path):
     orchestrator = CollaborationOrchestrator(protocol)
     now = datetime.now(timezone.utc)
 
-    msg = Message(
-        message_id="sh1", idempotency_key="sh-k", correlation_id="c",
-        project_id="QLA", task_id="TS", sender="jason", recipient="skyppy",
-        message_type=MessageType.RESULT, timestamp=now,
-        payload={
-            "objective": "x",
-            "steps": ["a", "b"],
-            "needs_correction": False,
-        },
-    )
-
-    # RESULT requires an existing task in IN_PROGRESS. Create the path.
     assignment = Message(
         message_id="sh-a", idempotency_key="sh-ak", correlation_id="c",
         project_id="QLA", task_id="TS", sender="skyppy", recipient="jason",
@@ -109,6 +97,17 @@ def test_skyppy_handler_processes_review(tmp_path):
     )
     protocol.accept(start, now=now)
     protocol.acknowledge(start.message_id)
+
+    msg = Message(
+        message_id="sh1", idempotency_key="sh-k", correlation_id="c",
+        project_id="QLA", task_id="TS", sender="jason", recipient="skyppy",
+        message_type=MessageType.RESULT, timestamp=now,
+        payload={
+            "objective": "x",
+            "steps": ["a", "b"],
+            "needs_correction": False,
+        },
+    )
 
     orchestrator._send(msg, now)
     review = orchestrator._handler_results["sh1"]
@@ -167,18 +166,6 @@ def test_duplicate_delivery_does_not_repeat_processing(tmp_path):
 
 
 def test_complete_with_unacknowledged_completion(tmp_path):
-    database = tmp_path / "bridge.db"
-    protocol = CollaborationProtocol(database)
-    now = datetime.now(timezone.utc)
-
-    # Drive to UNDER_REVIEW then accept a COMPLETION without acknowledging it.
-    orchestrator = CollaborationOrchestrator(protocol)
-    orchestrator.run("TC", "complete me")
-
-    # Manually insert an unacknowledged extra message is not possible after
-    # COMPLETE (terminal). Instead, accept a completion-shaped message on a
-    # fresh path that ends COMPLETE but leave the final message unacked.
-    # We simulate by accepting messages up to COMPLETION and skipping ack.
     protocol2 = CollaborationProtocol(tmp_path / "bridge2.db")
     now = datetime.now(timezone.utc)
 
@@ -227,18 +214,31 @@ def test_complete_all_acknowledged(tmp_path):
 
 
 def test_earlier_unacknowledged_blocks_later_ack(tmp_path):
+    """
+    An earlier unacknowledged assignment plus a later acknowledged ACK
+    must still be classified as uncertain, identifying the earlier message.
+    """
     database = tmp_path / "bridge.db"
     protocol = CollaborationProtocol(database)
     now = datetime.now(timezone.utc)
 
-    first = Message(
+    assignment = Message(
         message_id="early", idempotency_key="k-early", correlation_id="c",
         project_id="QLA", task_id="TE", sender="skyppy", recipient="jason",
         message_type=MessageType.TASK_ASSIGNMENT, timestamp=now,
         payload={"objective": "early"},
     )
-    protocol.accept(first, now=now)
-    # Not acknowledged.
+    protocol.accept(assignment, now=now)
+    # Intentionally not acknowledged.
+
+    ack = Message(
+        message_id="later", idempotency_key="k-later", correlation_id="c",
+        project_id="QLA", task_id="TE", sender="jason", recipient="skyppy",
+        message_type=MessageType.ACK, timestamp=now,
+        payload={"received": True}, parent_message_id="early",
+    )
+    protocol.accept(ack, now=now)
+    protocol.acknowledge("later")
 
     status = CollaborationOrchestrator(
         CollaborationProtocol(database)
@@ -246,6 +246,7 @@ def test_earlier_unacknowledged_blocks_later_ack(tmp_path):
 
     assert status["recovery"] == "uncertain"
     assert "early" in status["outstanding"]
+    assert "later" not in status["outstanding"]
 
 
 def test_recovery_after_assignment(tmp_path):
