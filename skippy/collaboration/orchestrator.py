@@ -4,11 +4,21 @@ SKIPPY AI Collaboration Bridge — Local Orchestrator.
 LOCAL SYNTHETIC ONLY.
 Coordinates simulated Skyppy and Jason through CollaborationProtocol.
 No external APIs, no repository writes, no trading execution.
+
+Delivery sequence for every message:
+1. Validate recipient.
+2. Durably accept.
+3. Dispatch to the simulated handler.
+4. Acknowledge only after successful handling.
+
+Recovery reconstructs progress from persisted protocol records and
+resumes only when the next stage is proven safe.
 """
 
 from __future__ import annotations
 
 import json
+import sqlite3
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -24,11 +34,12 @@ from skippy.collaboration.protocol import (
 from skippy.collaboration.router import LocalRouter
 
 
-MAX_CORRECTIONS = 1
-
-
 class OrchestratorError(RuntimeError):
     """Raised when the orchestrator cannot complete a workflow."""
+
+
+class RecoveryBlocked(OrchestratorError):
+    """Raised when safe continuation cannot be established."""
 
 
 class CollaborationOrchestrator:
@@ -43,8 +54,6 @@ class CollaborationOrchestrator:
         self.router = LocalRouter(protocol)
         self.skyppy = SimulatedSkyppy()
         self.jason = SimulatedJason()
-        self._corrections: dict[str, int] = {}
-        self._outcomes: dict[str, str] = {}
 
     def _message(
         self,
@@ -73,16 +82,116 @@ class CollaborationOrchestrator:
         )
 
     def _send(self, message: Message, now: datetime) -> Message:
-        if self.protocol.is_halted:
+        """
+        Accept, then dispatch, then acknowledge.
+
+        If acceptance fails, the message is not acknowledged.
+        If dispatch fails, the message remains accepted but unacknowledged.
+        """
+
+        if self.protocol.is_halted and message.message_type is not MessageType.HALT:
             raise ProtocolError("Protocol is halted; new work rejected")
 
-        delivery = self.router.deliver(message)
-        if delivery == "duplicate":
+        self.router.validate_recipient(message)
+
+        accepted = self.protocol.accept(message, now=now)
+        if not accepted:
+            # Valid duplicate; do not reprocess.
             return message
 
-        self.protocol.accept(message, now=now)
+        outcome = self.router.dispatch(message)
+        if outcome == "duplicate":
+            return message
+
         self.protocol.acknowledge(message.message_id)
         return message
+
+    def _task_messages(self, task_id: str) -> list[dict[str, Any]]:
+        with sqlite3.connect(self.protocol.database_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT message_id, message_type, correlation_id,
+                       sender, recipient, payload_json
+                FROM messages
+                WHERE task_id = ?
+                ORDER BY rowid
+                """,
+                (task_id,),
+            ).fetchall()
+
+        return [
+            {
+                "message_id": row[0],
+                "message_type": row[1],
+                "correlation_id": row[2],
+                "sender": row[3],
+                "recipient": row[4],
+                "payload": json.loads(row[5]),
+            }
+            for row in rows
+        ]
+
+    def recover(self, task_id: str) -> dict[str, Any]:
+        """
+        Reconstruct progress from persisted records.
+
+        Returns a status describing whether the task is complete,
+        resumable, or blocked. Does not replay completed tasks and
+        does not create a second assignment.
+        """
+
+        state = self.protocol.get_state(task_id)
+        if state is None:
+            return {"task_id": task_id, "recovery": "not_found"}
+
+        if state is TaskState.COMPLETE:
+            return {
+                "task_id": task_id,
+                "recovery": "complete_not_replayed",
+                "status": state.value,
+            }
+
+        messages = self._task_messages(task_id)
+        if not messages:
+            raise RecoveryBlocked("No messages for existing task")
+
+        last = messages[-1]
+        acknowledged = self.protocol.is_acknowledged(last["message_id"])
+
+        if not acknowledged:
+            return {
+                "task_id": task_id,
+                "recovery": "uncertain",
+                "status": state.value,
+                "last_message_id": last["message_id"],
+                "reason": "Last accepted message is unacknowledged",
+            }
+
+        # Safe resume points: the next stage is determined by state.
+        resumable = {
+            TaskState.ASSIGNED,
+            TaskState.ACKNOWLEDGED,
+            TaskState.IN_PROGRESS,
+            TaskState.RESULT_SUBMITTED,
+            TaskState.UNDER_REVIEW,
+            TaskState.CORRECTION_REQUESTED,
+        }
+
+        if state in resumable:
+            return {
+                "task_id": task_id,
+                "recovery": "resumable",
+                "status": state.value,
+                "last_message_id": last["message_id"],
+                "correlation_id": last["correlation_id"],
+            }
+
+        return {
+            "task_id": task_id,
+            "recovery": "blocked",
+            "status": state.value,
+            "reason": "State does not permit safe continuation",
+        }
 
     def run(
         self,
@@ -99,6 +208,12 @@ class CollaborationOrchestrator:
 
         if self.protocol.is_halted:
             raise ProtocolError("Protocol is halted; new work rejected")
+
+        existing = self.protocol.get_state(task_id)
+        if existing is TaskState.COMPLETE:
+            raise ProtocolError("Completed task is not replayed")
+        if existing is not None:
+            raise ProtocolError("Task already exists; use recover()")
 
         now = now or datetime.now(timezone.utc)
         correlation = str(uuid.uuid4())
@@ -155,12 +270,7 @@ class CollaborationOrchestrator:
             now,
         )
 
-        corrections = 0
-
         if review_payload["decision"] == "correction_required":
-            corrections = 1
-            self._corrections[task_id] = corrections
-
             correction = self._send(
                 self._message(
                     task_id, correlation, "skyppy", "jason",
@@ -171,49 +281,6 @@ class CollaborationOrchestrator:
                 ),
                 now,
             )
-
-            # Correction transitions to CORRECTION_REQUESTED.
-            # Move back to IN_PROGRESS via START is not allowed from
-            # CORRECTION_REQUESTED; the protocol allows
-            # CORRECTION_REQUESTED -> IN_PROGRESS. We use a START-equivalent
-            # by sending a message that maps to IN_PROGRESS. The protocol
-            # maps START to IN_PROGRESS, and CORRECTION_REQUESTED allows
-            # IN_PROGRESS. So we send START again? START is only valid from
-            # ACKNOWLEDGED. We need a path. Looking at ALLOWED_TRANSITIONS:
-            # CORRECTION_REQUESTED -> IN_PROGRESS.
-            # MESSAGE_TO_STATE has no dedicated type for that except we can
-            # only get IN_PROGRESS from START, which is only valid from
-            # ACKNOWLEDGED. This is a protocol limitation.
-            #
-            # For the prototype we complete the correction by having Jason
-            # submit a new RESULT. But RESULT is only valid from IN_PROGRESS.
-            # So we must transition CORRECTION_REQUESTED -> IN_PROGRESS.
-            #
-            # The protocol does not expose a public message type that maps
-            # to IN_PROGRESS from CORRECTION_REQUESTED except START, and
-            # START is only accepted from ACKNOWLEDGED.
-            #
-            # Workaround used here: send a message of type START is invalid.
-            # Instead we document that the orchestrator uses the existing
-            # START type only from ACKNOWLEDGED, and for correction we
-            # rely on the protocol allowing CORRECTION_REQUESTED -> IN_PROGRESS
-            # if we had a message type. Since we don't, we complete via
-            # a second result only after an explicit IN_PROGRESS transition
-            # that the protocol already supports if we add nothing.
-            #
-            # Practical approach: after CORRECTION, the state is
-            # CORRECTION_REQUESTED. The protocol allows transition to
-            # IN_PROGRESS. We need a message type that maps to IN_PROGRESS
-            # and is allowed from CORRECTION_REQUESTED. START maps to
-            # IN_PROGRESS but is only valid from ACKNOWLEDGED in the
-            # current MESSAGE_TO_STATE check... wait, the check is:
-            # target not in ALLOWED_TRANSITIONS[current]. START's target
-            # is IN_PROGRESS. From CORRECTION_REQUESTED, IN_PROGRESS is
-            # allowed. So START from CORRECTION_REQUESTED is valid!
-            #
-            # Yes: MESSAGE_TO_STATE[START] = IN_PROGRESS, and
-            # ALLOWED_TRANSITIONS[CORRECTION_REQUESTED] includes IN_PROGRESS.
-            # So a second START is the correct public transition.
 
             restart = self._send(
                 self._message(
@@ -246,12 +313,11 @@ class CollaborationOrchestrator:
             )
 
         if review_payload["decision"] != "approved":
-            self._outcomes[task_id] = "correction_exhausted"
             raise OrchestratorError(
                 "Correction loop exhausted; task not completed"
             )
 
-        completion = self._send(
+        self._send(
             self._message(
                 task_id, correlation, "skyppy", "bridge",
                 MessageType.COMPLETION,
@@ -262,23 +328,43 @@ class CollaborationOrchestrator:
             now,
         )
 
-        self._outcomes[task_id] = "approved"
-        self._corrections[task_id] = corrections
-
         return self.report(task_id)
 
     def report(self, task_id: str) -> dict[str, Any]:
-        """Read-only mission report. No sensitive payloads."""
+        """
+        Read-only mission report derived from persisted records.
+
+        Accurate after orchestrator restart. No private payloads.
+        """
 
         state = self.protocol.get_state(task_id)
-        unacked = self.protocol.unacknowledged()
+        messages = self._task_messages(task_id)
+
+        corrections = sum(
+            1 for msg in messages if msg["message_type"] == "CORRECTION"
+        )
+
+        reviews = [
+            msg for msg in messages if msg["message_type"] == "REVIEW"
+        ]
+        outcome = None
+        if reviews:
+            outcome = reviews[-1]["payload"].get("decision")
+
+        task_ids = {msg["message_id"] for msg in messages}
+        unacked = [
+            mid
+            for mid in self.protocol.unacknowledged()
+            if mid in task_ids
+        ]
 
         return {
             "task_id": task_id,
             "status": state.value if state else None,
             "assigned_agent": "jason",
-            "corrections": self._corrections.get(task_id, 0),
-            "outcome": self._outcomes.get(task_id),
+            "message_count": len(messages),
+            "corrections": corrections,
+            "outcome": outcome,
             "unacknowledged": unacked,
             "halted": self.protocol.is_halted,
         }

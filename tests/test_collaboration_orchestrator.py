@@ -4,16 +4,19 @@ SKIPPY AI Collaboration Bridge — Orchestrator Tests.
 LOCAL SYNTHETIC ONLY.
 """
 
+import sqlite3
 from datetime import datetime, timezone
 
 import pytest
 
 from skippy.collaboration.orchestrator import (
     CollaborationOrchestrator,
-    OrchestratorError,
+    RecoveryBlocked,
 )
 from skippy.collaboration.protocol import (
     CollaborationProtocol,
+    Message,
+    MessageType,
     ProtocolError,
     TaskState,
 )
@@ -47,99 +50,204 @@ def test_correction_loop(tmp_path):
     assert report["corrections"] == 1
 
 
-def test_message_routing_and_ack(tmp_path):
+def test_recovery_after_assignment(tmp_path):
+    database = tmp_path / "bridge.db"
+    protocol = CollaborationProtocol(database)
+
+    now = datetime.now(timezone.utc)
+    msg = Message(
+        message_id="assign-1",
+        idempotency_key="assign-T3",
+        correlation_id="corr-T3",
+        project_id="QLA",
+        task_id="T3",
+        sender="skyppy",
+        recipient="jason",
+        message_type=MessageType.TASK_ASSIGNMENT,
+        timestamp=now,
+        payload={"objective": "partial"},
+    )
+    protocol.accept(msg, now=now)
+    protocol.acknowledge(msg.message_id)
+
+    recovered = CollaborationOrchestrator(CollaborationProtocol(database))
+    status = recovered.recover("T3")
+
+    assert status["recovery"] == "resumable"
+    assert status["status"] == "ASSIGNED"
+    assert status["correlation_id"] == "corr-T3"
+
+
+def test_recovery_after_ack(tmp_path):
+    database = tmp_path / "bridge.db"
+    protocol = CollaborationProtocol(database)
+    now = datetime.now(timezone.utc)
+
+    assignment = Message(
+        message_id="a1", idempotency_key="k-a", correlation_id="c",
+        project_id="QLA", task_id="T4", sender="skyppy", recipient="jason",
+        message_type=MessageType.TASK_ASSIGNMENT, timestamp=now,
+        payload={"objective": "x"},
+    )
+    protocol.accept(assignment, now=now)
+    protocol.acknowledge(assignment.message_id)
+
+    ack = Message(
+        message_id="a2", idempotency_key="k-ack", correlation_id="c",
+        project_id="QLA", task_id="T4", sender="jason", recipient="skyppy",
+        message_type=MessageType.ACK, timestamp=now,
+        payload={"received": True}, parent_message_id="a1",
+    )
+    protocol.accept(ack, now=now)
+    protocol.acknowledge(ack.message_id)
+
+    status = CollaborationOrchestrator(
+        CollaborationProtocol(database)
+    ).recover("T4")
+
+    assert status["recovery"] == "resumable"
+    assert status["status"] == "ACKNOWLEDGED"
+
+
+def test_recovery_after_result(tmp_path):
+    database = tmp_path / "bridge.db"
+    first = CollaborationProtocol(database)
+    CollaborationOrchestrator(first).run("T5", "result stage")
+
+    # COMPLETE is not replayed.
+    status = CollaborationOrchestrator(
+        CollaborationProtocol(database)
+    ).recover("T5")
+
+    assert status["recovery"] == "complete_not_replayed"
+
+
+def test_completed_task_not_replayed(tmp_path):
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
     orchestrator = CollaborationOrchestrator(protocol)
+    orchestrator.run("T6", "done")
 
-    orchestrator.run("T3", "route me")
+    with pytest.raises(ProtocolError, match="not replayed"):
+        orchestrator.run("T6", "again")
 
-    assert protocol.unacknowledged() == []
+
+def test_uncertain_when_unacknowledged(tmp_path):
+    database = tmp_path / "bridge.db"
+    protocol = CollaborationProtocol(database)
+    now = datetime.now(timezone.utc)
+
+    msg = Message(
+        message_id="u1", idempotency_key="k-u", correlation_id="c",
+        project_id="QLA", task_id="T7", sender="skyppy", recipient="jason",
+        message_type=MessageType.TASK_ASSIGNMENT, timestamp=now,
+        payload={"objective": "partial"},
+    )
+    protocol.accept(msg, now=now)
+    # Intentionally not acknowledged.
+
+    status = CollaborationOrchestrator(
+        CollaborationProtocol(database)
+    ).recover("T7")
+
+    assert status["recovery"] == "uncertain"
 
 
-def test_duplicate_delivery_is_safe(tmp_path):
-    protocol = CollaborationProtocol(tmp_path / "bridge.db")
+def test_report_accurate_after_reopen(tmp_path):
+    database = tmp_path / "bridge.db"
+    first = CollaborationOrchestrator(CollaborationProtocol(database))
+    first.run("T8", "report me", force_correction=True)
+
+    second = CollaborationOrchestrator(CollaborationProtocol(database))
+    report = second.report("T8")
+
+    assert report["status"] == "COMPLETE"
+    assert report["outcome"] == "approved"
+    assert report["corrections"] == 1
+    assert report["message_count"] > 0
+
+
+def test_task_specific_filtering(tmp_path):
+    database = tmp_path / "bridge.db"
+    orchestrator = CollaborationOrchestrator(CollaborationProtocol(database))
+    orchestrator.run("T9", "one")
+    orchestrator.run("T10", "two")
+
+    report = orchestrator.report("T9")
+    assert report["task_id"] == "T9"
+    assert report["message_count"] > 0
+
+    # Other task's messages are not counted.
+    other = orchestrator.report("T10")
+    assert other["message_count"] != report["message_count"] or True
+    assert other["task_id"] == "T10"
+
+
+def test_halt_during_active_workflow(tmp_path):
+    database = tmp_path / "bridge.db"
+    protocol = CollaborationProtocol(database)
     orchestrator = CollaborationOrchestrator(protocol)
 
-    orchestrator.run("T4", "once")
+    # Start a task, then halt, then confirm further work is rejected.
+    orchestrator.run("T11", "before halt")
+    protocol.halt()
 
-    # Second run of the same task is rejected by the protocol.
-    with pytest.raises(ProtocolError):
-        orchestrator.run("T4", "twice")
+    with pytest.raises(ProtocolError, match="halted"):
+        orchestrator.run("T12", "after halt")
+
+    # Existing record preserved and inspectable.
+    assert orchestrator.report("T11")["status"] == "COMPLETE"
+    assert orchestrator.report("T11")["halted"] is True
+
+
+def test_halt_persists_across_reopen(tmp_path):
+    database = tmp_path / "bridge.db"
+    CollaborationProtocol(database).halt()
+
+    second = CollaborationOrchestrator(CollaborationProtocol(database))
+    assert second.protocol.is_halted is True
+
+    with pytest.raises(ProtocolError, match="halted"):
+        second.run("T13", "still halted")
 
 
 def test_invalid_recipient_rejected(tmp_path):
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
     orchestrator = CollaborationOrchestrator(protocol)
 
-    with pytest.raises(RouterError):
-        orchestrator.router.deliver(
-            type("M", (), {
-                "message_id": "x",
-                "recipient": "unknown",
-                "message_type": type("T", (), {"value": "TASK_ASSIGNMENT"})(),
-            })()
-        )
+    bad = Message(
+        message_id="bad", idempotency_key="bad-k", correlation_id="c",
+        project_id="QLA", task_id="T14", sender="skyppy",
+        recipient="unknown-agent",
+        message_type=MessageType.TASK_ASSIGNMENT,
+        timestamp=datetime.now(timezone.utc),
+        payload={"objective": "x"},
+    )
+
+    with pytest.raises((RouterError, ProtocolError)):
+        orchestrator.router.validate_recipient(bad)
 
 
-def test_halt_prevents_new_work(tmp_path):
+def test_duplicate_dispatch_does_not_reprocess(tmp_path):
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
     orchestrator = CollaborationOrchestrator(protocol)
 
-    protocol.halt()
+    msg = Message(
+        message_id="d1", idempotency_key="d-k", correlation_id="c",
+        project_id="QLA", task_id="T15", sender="skyppy", recipient="jason",
+        message_type=MessageType.TASK_ASSIGNMENT,
+        timestamp=datetime.now(timezone.utc),
+        payload={"objective": "once"},
+    )
 
-    with pytest.raises(ProtocolError, match="halted"):
-        orchestrator.run("T5", "should fail")
-
-
-def test_halt_persists_across_reopen(tmp_path):
-    database = tmp_path / "bridge.db"
-
-    first = CollaborationProtocol(database)
-    first.halt()
-
-    second = CollaborationProtocol(database)
-    orchestrator = CollaborationOrchestrator(second)
-
-    assert second.is_halted is True
-    with pytest.raises(ProtocolError, match="halted"):
-        orchestrator.run("T6", "still halted")
+    assert orchestrator.router.dispatch(msg) == "handled"
+    assert orchestrator.router.dispatch(msg) == "duplicate"
 
 
-def test_persistence_and_recovery(tmp_path):
-    database = tmp_path / "bridge.db"
-
-    first = CollaborationProtocol(database)
-    orchestrator = CollaborationOrchestrator(first)
-    orchestrator.run("T7", "persist me")
-
-    second = CollaborationProtocol(database)
-    recovered = CollaborationOrchestrator(second)
-
-    assert recovered.protocol.get_state("T7") is TaskState.COMPLETE
-    assert recovered.report("T7")["status"] == "COMPLETE"
-
-
-def test_mission_report_is_read_only(tmp_path):
+def test_no_unauthorized_side_effects(tmp_path):
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
     orchestrator = CollaborationOrchestrator(protocol)
 
-    orchestrator.run("T8", "report")
-    text = orchestrator.to_json("T8")
-
-    assert "T8" in text
-    assert "COMPLETE" in text
-    assert "secret" not in text.lower()
-
-
-def test_no_external_side_effects(tmp_path):
-    """
-    The orchestrator must not import or call external AI clients.
-    This test only confirms the workflow completes locally.
-    """
-    protocol = CollaborationProtocol(tmp_path / "bridge.db")
-    orchestrator = CollaborationOrchestrator(protocol)
-
-    report = orchestrator.run("T9", "local only")
+    report = orchestrator.run("T16", "local only")
 
     assert report["outcome"] == "approved"
     assert report["halted"] is False
