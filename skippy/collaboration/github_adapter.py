@@ -67,6 +67,7 @@ class PullRequestSnapshot:
     title: str
     state: str
     head_sha: str
+    head_branch: str
     base_branch: str
     source: str = "synthetic"
 
@@ -117,6 +118,11 @@ def _require_synthetic(source: str) -> None:
         raise AdapterError(
             "Provider claimed non-synthetic provenance; rejected"
         )
+
+
+def _require_sha(value: str, label: str) -> None:
+    if not isinstance(value, str) or not SHA_PATTERN.match(value):
+        raise AdapterError(f"Malformed {label} SHA")
 
 
 def _require_counts(passed: int | None, failed: int | None, status: CIStatus) -> None:
@@ -172,6 +178,7 @@ class GitHubAdapter:
             raise AdapterError("Malformed branch snapshot")
         if snap.name != name:
             raise AdapterError("Branch identity mismatch")
+        _require_sha(snap.sha, "branch HEAD")
         _require_synthetic(snap.source)
         return snap
 
@@ -180,6 +187,7 @@ class GitHubAdapter:
             raise AdapterError("Malformed commit snapshot")
         if snap.sha != sha:
             raise AdapterError("Commit identity mismatch")
+        _require_sha(snap.sha, "commit")
         _require_synthetic(snap.source)
         return snap
 
@@ -190,6 +198,9 @@ class GitHubAdapter:
             raise AdapterError("Pull request identity mismatch")
         if snap.state not in {"open", "closed", "merged"}:
             raise AdapterError("Invalid pull request state")
+        if not isinstance(snap.head_branch, str) or not snap.head_branch:
+            raise AdapterError("Pull request source branch is missing")
+        _require_sha(snap.head_sha, "pull request HEAD")
         _require_synthetic(snap.source)
         return snap
 
@@ -200,6 +211,7 @@ class GitHubAdapter:
             raise AdapterError("Workflow SHA mismatch")
         if not isinstance(snap.status, CIStatus):
             raise AdapterError("Invalid CI status")
+        _require_sha(snap.head_sha, "workflow")
         _require_synthetic(snap.source)
         return snap
 
@@ -211,6 +223,7 @@ class GitHubAdapter:
         if not isinstance(snap.status, CIStatus):
             raise AdapterError("Invalid CI status")
         _require_counts(snap.passed, snap.failed, snap.status)
+        _require_sha(snap.sha, "CI")
         _require_synthetic(snap.source)
         return snap
 
@@ -259,13 +272,17 @@ class GitHubAdapter:
         """
         Build a synthetic development report.
 
-        Validates every supplied identifier. When a branch or PR is given
-        together with a SHA, the provider HEAD must match that SHA.
+        Validates every supplied identifier. When a branch and PR are both
+        given, the branch must match the PR source branch. When a SHA is
+        also given, branch HEAD and PR HEAD must match that SHA.
         Commit-only reports are allowed for historical commits.
         CI success is evidence of testing, not permission to merge.
         """
 
         self._check_repository(repository)
+
+        branch_snap = None
+        pr_snap = None
 
         if branch is not None:
             self._check_branch(branch)
@@ -283,9 +300,19 @@ class GitHubAdapter:
                     "Pull request HEAD does not match requested commit"
                 )
 
+        if branch_snap is not None and pr_snap is not None:
+            # Source branch, not base branch.
+            if branch_snap.name != pr_snap.head_branch:
+                raise AdapterError(
+                    "Branch is not the pull request source branch"
+                )
+            if branch_snap.sha != pr_snap.head_sha:
+                raise AdapterError(
+                    "Branch HEAD and pull request HEAD disagree"
+                )
+
         if sha is not None:
             self._check_sha(sha)
-            # Confirm the commit exists; do not invent results.
             self.commit(repository, sha)
 
         ci_status = CIStatus.UNAVAILABLE
@@ -367,18 +394,27 @@ class SyntheticGitHubProvider:
         }
         self._pulls = {
             (ALLOWED_REPOSITORY, 1): PullRequestSnapshot(
-                number=1, title="Open PR", state="open",
+                number=1,
+                title="Open PR",
+                state="open",
                 head_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                head_branch="feature/phase9-github-adapter",
                 base_branch="phase-8-tradingview-integration",
             ),
             (ALLOWED_REPOSITORY, 2): PullRequestSnapshot(
-                number=2, title="Merged PR", state="merged",
+                number=2,
+                title="Merged PR",
+                state="merged",
                 head_sha="79925e4aa80bef170778fc02a022f5c338739c91",
+                head_branch="phase-8-tradingview-integration",
                 base_branch="phase-8-tradingview-integration",
             ),
             (ALLOWED_REPOSITORY, 3): PullRequestSnapshot(
-                number=3, title="Closed PR", state="closed",
+                number=3,
+                title="Closed PR",
+                state="closed",
                 head_sha="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                head_branch="feature/closed-work",
                 base_branch="phase-8-tradingview-integration",
             ),
         }

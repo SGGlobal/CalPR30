@@ -52,6 +52,7 @@ def test_commit_metadata(adapter):
 def test_open_pull_request(adapter):
     snap = adapter.pull_request(ALLOWED_REPOSITORY, 1)
     assert snap.state == "open"
+    assert snap.head_branch == "feature/phase9-github-adapter"
 
 
 def test_merged_pull_request(adapter):
@@ -231,6 +232,75 @@ def test_commit_only_historical_report(adapter):
     assert report.sha == sha
     assert report.branch is None
     assert report.ci_status is CIStatus.SUCCESS
+
+
+def test_valid_branch_and_pr_association(adapter):
+    report = adapter.development_report(
+        ALLOWED_REPOSITORY,
+        branch="feature/phase9-github-adapter",
+        pull_request=1,
+        sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    )
+    assert report.branch == "feature/phase9-github-adapter"
+    assert report.pull_request == 1
+    assert report.ci_status is CIStatus.SUCCESS
+
+
+def test_unrelated_branch_and_pr_without_sha(adapter):
+    with pytest.raises(AdapterError, match="not the pull request source"):
+        adapter.development_report(
+            ALLOWED_REPOSITORY,
+            branch="phase-8-tradingview-integration",
+            pull_request=1,
+        )
+
+
+def test_unrelated_branch_and_pr_same_sha(adapter):
+    # PR 2 head is the integration SHA; pairing it with the feature branch
+    # (different source) must fail even if a SHA is not the differentiator.
+    with pytest.raises(AdapterError, match="not the pull request source"):
+        adapter.development_report(
+            ALLOWED_REPOSITORY,
+            branch="feature/phase9-github-adapter",
+            pull_request=2,
+        )
+
+
+def test_malformed_branch_head_sha():
+    class Bad:
+        def branch(self, repository, name):
+            return BranchSnapshot(name=name, sha="not-a-sha")
+
+    with pytest.raises(AdapterError, match="Malformed branch HEAD SHA"):
+        GitHubAdapter(Bad()).branch(
+            ALLOWED_REPOSITORY, "phase-8-tradingview-integration"
+        )
+
+
+def test_malformed_pr_head_sha():
+    class Bad:
+        def pull_request(self, repository, number):
+            return PullRequestSnapshot(
+                number=number,
+                title="bad",
+                state="open",
+                head_sha="not-a-sha",
+                head_branch="feature/x",
+                base_branch="main",
+            )
+
+    with pytest.raises(AdapterError, match="Malformed pull request HEAD SHA"):
+        GitHubAdapter(Bad()).pull_request(ALLOWED_REPOSITORY, 1)
+
+
+def test_existing_successful_report(adapter):
+    report = adapter.development_report(
+        ALLOWED_REPOSITORY,
+        branch="phase-8-tradingview-integration",
+        sha="79925e4aa80bef170778fc02a022f5c338739c91",
+    )
+    assert report.ci_status is CIStatus.SUCCESS
+    assert report.ci_passed == 267
 
 
 def test_malformed_repository_snapshot():
