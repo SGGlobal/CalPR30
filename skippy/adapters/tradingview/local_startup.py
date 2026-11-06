@@ -15,13 +15,15 @@ from skippy.adapters.tradingview.receiver import (
 from skippy.adapters.tradingview.atomic_ingestion import (
     AtomicTradingViewIngestion,
 )
+from skippy.adapters.tradingview.controlled_event_bus import (
+    ControlledTradingViewEventBus,
+)
 from skippy.adapters.tradingview.database_initializer import (
     TradingViewDatabaseInitializer,
 )
 from skippy.adapters.tradingview.durable_observer import (
     DurableTradingViewObserver,
 )
-from skippy.kernel.event_bus import EventBus
 from skippy.reasoning.hermes import Hermes
 
 
@@ -66,7 +68,7 @@ class LocalTradingViewStartup:
             initializer.initialize()
             initializer.verify()
 
-            bus = EventBus()
+            bus = ControlledTradingViewEventBus()
 
             observer = DurableTradingViewObserver(
                 event_bus=bus,
@@ -132,8 +134,21 @@ class LocalTradingViewStartup:
         """
         Accept local simulated signals only when the
         designated durable observer is registered exactly once.
+
+        Observer verification and atomic ingestion execute under
+        the ControlledTradingViewEventBus lock so that subscription
+        changes cannot race between the two steps.
+
+        Note: the lock is held for the duration of the synchronous
+        ingest() call (including any callbacks invoked by publish).
+        Callbacks must not attempt to re-acquire the same lock in a
+        way that would deadlock, and they must not block waiting for
+        other threads that hold or request the lock.
         """
 
-        self._verify_observer_readiness()
-
-        return self.ingestion.ingest(body, token)
+        return self.event_bus.controlled_ingest(
+            self._verify_observer_readiness,
+            self.ingestion.ingest,
+            body,
+            token,
+        )
