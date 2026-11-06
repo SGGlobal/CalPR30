@@ -1,4 +1,4 @@
-﻿"""
+"""
 SKIPPY AI TRADER - PHASE 8
 
 Atomic Replay and Processing-State Registration.
@@ -7,6 +7,7 @@ LOCAL SIMULATION ONLY.
 No external connections, retries, or trade execution.
 """
 
+import json
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,9 @@ from pathlib import Path
 
 class AtomicRegistryError(RuntimeError):
     """Raised when atomic registration cannot be guaranteed."""
+
+
+ALLOWED_EVIDENCE_KEYS = frozenset({"symbol", "action", "price", "timestamp"})
 
 
 class AtomicSignalRegistry:
@@ -47,6 +51,19 @@ class AtomicSignalRegistry:
                     """
                 )
 
+                # Idempotent additive migration for durable evidence.
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(signals)"
+                    ).fetchall()
+                }
+
+                if "evidence_json" not in columns:
+                    connection.execute(
+                        "ALTER TABLE signals ADD COLUMN evidence_json TEXT"
+                    )
+
         except sqlite3.Error as exc:
             raise AtomicRegistryError(
                 "Failed to initialize atomic registry"
@@ -59,12 +76,52 @@ class AtomicSignalRegistry:
     def _timestamp():
         return datetime.now(timezone.utc).isoformat()
 
-    def register(self, fingerprint: str) -> bool:
+    @staticmethod
+    def _normalize_evidence(evidence: dict | None) -> str | None:
+        """
+        Accept only the four validated signal fields.
+
+        Returns a canonical JSON string or None.
+        Rejects anything else fail-closed.
+        """
+
+        if evidence is None:
+            return None
+
+        if not isinstance(evidence, dict):
+            raise ValueError("Evidence must be a dictionary")
+
+        if set(evidence.keys()) != ALLOWED_EVIDENCE_KEYS:
+            raise ValueError(
+                "Evidence must contain exactly symbol, action, price, and timestamp"
+            )
+
+        # Reject non-JSON-safe values early.
+        try:
+            serialized = json.dumps(
+                evidence,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Evidence is not valid JSON data") from exc
+
+        return serialized
+
+    def register(
+        self,
+        fingerprint: str,
+        evidence: dict | None = None,
+    ) -> bool:
         """
         Atomically register replay protection and processing state.
 
         Returns True only for a new signal.
         Returns False for an existing signal.
+
+        When evidence is supplied it is stored in the same transaction.
+        Duplicate registrations do not modify existing evidence.
         """
 
         if (
@@ -73,6 +130,8 @@ class AtomicSignalRegistry:
             or any(character not in "0123456789abcdef" for character in fingerprint)
         ):
             raise ValueError("Invalid SHA-256 fingerprint")
+
+        evidence_json = self._normalize_evidence(evidence)
 
         timestamp = self._timestamp()
 
@@ -84,11 +143,12 @@ class AtomicSignalRegistry:
                     """
                     INSERT OR IGNORE INTO signals (
                         fingerprint,
-                        first_seen
+                        first_seen,
+                        evidence_json
                     )
-                    VALUES (?, ?)
+                    VALUES (?, ?, ?)
                     """,
-                    (fingerprint, timestamp),
+                    (fingerprint, timestamp, evidence_json),
                 )
 
                 if cursor.rowcount == 0:
@@ -133,3 +193,37 @@ class AtomicSignalRegistry:
             raise AtomicRegistryError(
                 "Atomic registry state lookup failed"
             ) from exc
+
+    def get_evidence(self, fingerprint: str) -> dict | None:
+        """Return stored validated evidence or None."""
+
+        try:
+            with self._connect() as connection:
+                row = connection.execute(
+                    """
+                    SELECT evidence_json
+                    FROM signals
+                    WHERE fingerprint = ?
+                    """,
+                    (fingerprint,),
+                ).fetchone()
+
+        except sqlite3.Error as exc:
+            raise AtomicRegistryError(
+                "Atomic registry evidence lookup failed"
+            ) from exc
+
+        if row is None or row[0] is None:
+            return None
+
+        try:
+            parsed = json.loads(row[0])
+        except (TypeError, ValueError) as exc:
+            raise AtomicRegistryError(
+                "Stored evidence contains invalid JSON"
+            ) from exc
+
+        if not isinstance(parsed, dict):
+            raise AtomicRegistryError("Stored evidence is not an object")
+
+        return parsed

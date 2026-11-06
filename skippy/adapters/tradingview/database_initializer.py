@@ -25,6 +25,7 @@ class TradingViewDatabaseInitializer:
         "signals": {
             "fingerprint",
             "first_seen",
+            "evidence_json",
         },
         "processing_states": {
             "fingerprint",

@@ -68,7 +68,10 @@ class AtomicTradingViewIngestion:
 
         fingerprint = self.deduplicator.fingerprint(validated)
 
-        registered = self.registry.register(fingerprint)
+        # Persist only the normalized validated fields.
+        evidence = asdict(validated)
+
+        registered = self.registry.register(fingerprint, evidence=evidence)
 
         if not registered:
             raise DuplicateSignalError(
