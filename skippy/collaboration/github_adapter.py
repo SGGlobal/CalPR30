@@ -1,12 +1,13 @@
 """
-SKIPPY AI Collaboration Bridge — Offline GitHub Adapter.
+SKIPPY AI Collaboration Bridge — GitHub Adapter.
 
-LOCAL SYNTHETIC ONLY.
-No live GitHub API, no credentials, no repository writes, no trading.
+Read-only contract with provenance-aware validation.
 
-This module defines the read-only contract and a deterministic simulated
-provider. A future authenticated provider may implement the same contract.
-Simulated observations must never be presented as live GitHub results.
+Modes:
+* synthetic (default) — accepts only source="synthetic"
+* github_live — accepts only source="github_live"
+
+Mixed provenance is rejected. Synthetic is never treated as live evidence.
 """
 
 from __future__ import annotations
@@ -22,6 +23,8 @@ MAX_SUMMARY_LENGTH = 500
 
 BRANCH_PATTERN = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
 SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+VALID_SOURCES = frozenset({"synthetic", "github_live"})
 
 
 class AdapterError(ValueError):
@@ -113,10 +116,12 @@ class GitHubProvider(Protocol):
     def ci_result(self, repository: str, sha: str) -> CIResultSnapshot: ...
 
 
-def _require_synthetic(source: str) -> None:
-    if source != "synthetic":
+def _require_source(source: str, expected: str) -> None:
+    if source not in VALID_SOURCES:
+        raise AdapterError("Invalid provenance")
+    if source != expected:
         raise AdapterError(
-            "Provider claimed non-synthetic provenance; rejected"
+            f"Provenance mismatch: expected {expected}, got {source}"
         )
 
 
@@ -142,12 +147,19 @@ class GitHubAdapter:
     """
     Read-only adapter over a provider.
 
-    Enforces the repository allowlist, input validation, snapshot
-    validation, and fail-closed evidence consistency.
+    expected_source controls provenance. Default is synthetic.
+    github_live must be selected explicitly.
     """
 
-    def __init__(self, provider: GitHubProvider):
+    def __init__(
+        self,
+        provider: GitHubProvider,
+        expected_source: str = "synthetic",
+    ):
+        if expected_source not in VALID_SOURCES:
+            raise AdapterError("Invalid expected provenance")
         self._provider = provider
+        self._expected_source = expected_source
 
     def _check_repository(self, repository: str) -> None:
         if not isinstance(repository, str) or repository != ALLOWED_REPOSITORY:
@@ -170,7 +182,7 @@ class GitHubAdapter:
             raise AdapterError("Malformed repository snapshot")
         if f"{snap.owner}/{snap.name}" != repository:
             raise AdapterError("Repository identity mismatch")
-        _require_synthetic(snap.source)
+        _require_source(snap.source, self._expected_source)
         return snap
 
     def _validate_branch(self, snap, name: str) -> BranchSnapshot:
@@ -179,7 +191,7 @@ class GitHubAdapter:
         if snap.name != name:
             raise AdapterError("Branch identity mismatch")
         _require_sha(snap.sha, "branch HEAD")
-        _require_synthetic(snap.source)
+        _require_source(snap.source, self._expected_source)
         return snap
 
     def _validate_commit(self, snap, sha: str) -> CommitSnapshot:
@@ -188,7 +200,7 @@ class GitHubAdapter:
         if snap.sha != sha:
             raise AdapterError("Commit identity mismatch")
         _require_sha(snap.sha, "commit")
-        _require_synthetic(snap.source)
+        _require_source(snap.source, self._expected_source)
         return snap
 
     def _validate_pull(self, snap, number: int) -> PullRequestSnapshot:
@@ -201,7 +213,7 @@ class GitHubAdapter:
         if not isinstance(snap.head_branch, str) or not snap.head_branch:
             raise AdapterError("Pull request source branch is missing")
         _require_sha(snap.head_sha, "pull request HEAD")
-        _require_synthetic(snap.source)
+        _require_source(snap.source, self._expected_source)
         return snap
 
     def _validate_workflow(self, snap, sha: str) -> WorkflowSnapshot:
@@ -212,7 +224,7 @@ class GitHubAdapter:
         if not isinstance(snap.status, CIStatus):
             raise AdapterError("Invalid CI status")
         _require_sha(snap.head_sha, "workflow")
-        _require_synthetic(snap.source)
+        _require_source(snap.source, self._expected_source)
         return snap
 
     def _validate_ci(self, snap, sha: str) -> CIResultSnapshot:
@@ -224,7 +236,7 @@ class GitHubAdapter:
             raise AdapterError("Invalid CI status")
         _require_counts(snap.passed, snap.failed, snap.status)
         _require_sha(snap.sha, "CI")
-        _require_synthetic(snap.source)
+        _require_source(snap.source, self._expected_source)
         return snap
 
     def repository(self, repository: str) -> RepositorySnapshot:
@@ -270,13 +282,10 @@ class GitHubAdapter:
         pull_request: int | None = None,
     ) -> DevelopmentReport:
         """
-        Build a synthetic development report.
+        Build a development report from the configured provider.
 
-        Validates every supplied identifier. When a branch and PR are both
-        given, the branch must match the PR source branch. When a SHA is
-        also given, branch HEAD and PR HEAD must match that SHA.
-        Commit-only reports are allowed for historical commits.
-        CI success is evidence of testing, not permission to merge.
+        Provenance is the adapter's expected source. Mixed sources are
+        rejected by snapshot validation. CI success is not merge authorization.
         """
 
         self._check_repository(repository)
@@ -301,7 +310,6 @@ class GitHubAdapter:
                 )
 
         if branch_snap is not None and pr_snap is not None:
-            # Source branch, not base branch.
             if branch_snap.name != pr_snap.head_branch:
                 raise AdapterError(
                     "Branch is not the pull request source branch"
@@ -325,9 +333,11 @@ class GitHubAdapter:
             passed = result.passed
             failed = result.failed
 
-        note = (
-            "Synthetic observation. CI success is not merge authorization."
-        )
+        if self._expected_source == "synthetic":
+            note = "Synthetic observation. CI success is not merge authorization."
+        else:
+            note = "Live GitHub observation. CI success is not merge authorization."
+
         if len(note) > MAX_SUMMARY_LENGTH:
             raise AdapterError("Report exceeds size bound")
 
@@ -340,6 +350,7 @@ class GitHubAdapter:
             ci_passed=passed,
             ci_failed=failed,
             note=note,
+            source=self._expected_source,
         )
 
 
