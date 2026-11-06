@@ -12,7 +12,12 @@ from __future__ import annotations
 import ssl
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, build_opener, HTTPSHandler
+from urllib.request import (
+    HTTPSHandler,
+    HTTPRedirectHandler,
+    OpenerDirector,
+    Request,
+)
 
 from skippy.collaboration.github_live_provider import (
     GITHUB_API_HOST,
@@ -26,16 +31,50 @@ from skippy.collaboration.github_live_provider import (
 ALLOWED_HOST = "api.github.com"
 
 
-class RedirectRejectingHandler(HTTPSHandler):
+class RedirectRejectingHandler(HTTPRedirectHandler):
     """
-    HTTPS handler that refuses every redirect before a second request.
+    Replaces urllib's default redirect handler.
 
-    Authorization headers are never forwarded because the redirect is
-    rejected rather than followed.
+    Inheriting from HTTPRedirectHandler is required so the opener uses
+    this handler for 301/302/303/307/308 instead of the default one.
+    Every redirect is rejected before a second request is issued.
     """
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         raise CredentialSafeError("Unexpected redirect")
+
+    def http_error_301(self, req, fp, code, msg, headers):
+        raise CredentialSafeError("Unexpected redirect")
+
+    def http_error_302(self, req, fp, code, msg, headers):
+        raise CredentialSafeError("Unexpected redirect")
+
+    def http_error_303(self, req, fp, code, msg, headers):
+        raise CredentialSafeError("Unexpected redirect")
+
+    def http_error_307(self, req, fp, code, msg, headers):
+        raise CredentialSafeError("Unexpected redirect")
+
+    def http_error_308(self, req, fp, code, msg, headers):
+        raise CredentialSafeError("Unexpected redirect")
+
+
+def build_secure_opener() -> OpenerDirector:
+    """
+    Build an opener with exactly two handlers:
+
+    * HTTPSHandler with certificate validation enabled.
+    * RedirectRejectingHandler, which replaces the default redirect handler.
+
+    No HTTPRedirectHandler is added by default because we construct the
+    opener ourselves rather than calling build_opener().
+    """
+
+    context = ssl.create_default_context()
+    opener = OpenerDirector()
+    opener.add_handler(HTTPSHandler(context=context))
+    opener.add_handler(RedirectRejectingHandler())
+    return opener
 
 
 def _validate_url(method: str, url: str) -> None:
@@ -64,7 +103,6 @@ class ProductionHTTPTransport:
     """
 
     def __init__(self, opener=None):
-        # opener is injectable so tests never touch the network.
         self._opener = opener
 
     def __call__(
@@ -82,9 +120,7 @@ class ProductionHTTPTransport:
         for key, value in headers.items():
             request.add_header(key, value)
 
-        opener = self._opener or build_opener(
-            RedirectRejectingHandler(context=ssl.create_default_context())
-        )
+        opener = self._opener or build_secure_opener()
 
         try:
             with opener.open(request, timeout=effective_timeout) as response:
@@ -111,8 +147,6 @@ class ProductionHTTPTransport:
         except CredentialSafeError:
             raise
         except HTTPError as exc:
-            # Preserve the status so the provider can classify it.
-            # Do not include the body or any header in the message.
             return HTTPResponse(status=exc.code, body=b"", headers={})
         except TimeoutError:
             raise CredentialSafeError("GitHub request timed out") from None

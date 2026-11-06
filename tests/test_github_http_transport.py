@@ -2,6 +2,7 @@
 SKIPPY AI Collaboration Bridge — Production Transport Tests.
 
 No real GitHub contact. Every probe path injects a fake transport.
+Redirect tests exercise the actual handler chain.
 """
 
 import json
@@ -11,6 +12,7 @@ import pytest
 from skippy.collaboration.github_http_transport import (
     ProductionHTTPTransport,
     RedirectRejectingHandler,
+    build_secure_opener,
     production_transport,
 )
 from skippy.collaboration.github_live_probe import (
@@ -65,6 +67,173 @@ class FakeOpener:
         return self.response
 
 
+class RedirectingOpener:
+    """
+    Fully mocked opener that simulates urllib's redirect processing.
+
+    On the first open it invokes the installed RedirectRejectingHandler
+    the same way urllib would, then records whether a second request
+    was attempted.
+    """
+
+    def __init__(self, code, location, handler):
+        self.code = code
+        self.location = location
+        self.handler = handler
+        self.requests = []
+
+    def open(self, request, timeout=None):
+        self.requests.append(
+            {
+                "url": request.full_url,
+                "headers": dict(request.headers),
+            }
+        )
+        # Simulate urllib dispatching the redirect status to the handler.
+        self.handler.http_error_default = None
+        method = getattr(self.handler, f"http_error_{self.code}")
+        method(request, None, self.code, "redirect", {}, self.location)
+        # If the handler returned instead of raising, a second request
+        # would be issued here. Record that it must not happen.
+        self.requests.append({"url": self.location, "followed": True})
+        raise AssertionError("Redirect was followed")
+
+
+@pytest.mark.parametrize("code", [301, 302, 307, 308])
+def test_redirect_codes_rejected_by_handler_chain(code):
+    handler = RedirectRejectingHandler()
+    opener = RedirectingOpener(
+        code=code,
+        location="https://evil.example/steal",
+        handler=handler,
+    )
+    transport = ProductionHTTPTransport(opener=opener)
+
+    with pytest.raises(CredentialSafeError, match="Unexpected redirect"):
+        transport(
+            "GET",
+            "https://api.github.com/repos/SGGlobal/QLA",
+            {"Authorization": "Bearer secret-token"},
+            5,
+        )
+
+    assert len(opener.requests) == 1
+    assert opener.requests[0]["url"].startswith("https://api.github.com")
+
+
+def test_redirect_to_other_host_not_followed():
+    handler = RedirectRejectingHandler()
+    opener = RedirectingOpener(
+        code=302,
+        location="https://evil.example/steal",
+        handler=handler,
+    )
+    transport = ProductionHTTPTransport(opener=opener)
+
+    with pytest.raises(CredentialSafeError, match="Unexpected redirect"):
+        transport(
+            "GET",
+            "https://api.github.com/repos/SGGlobal/QLA",
+            {"Authorization": "Bearer secret-token"},
+            5,
+        )
+
+    assert all("evil.example" not in item["url"] for item in opener.requests)
+
+
+def test_redirect_to_approved_host_also_rejected():
+    handler = RedirectRejectingHandler()
+    opener = RedirectingOpener(
+        code=302,
+        location="https://api.github.com/repos/SGGlobal/QLA/other",
+        handler=handler,
+    )
+    transport = ProductionHTTPTransport(opener=opener)
+
+    with pytest.raises(CredentialSafeError, match="Unexpected redirect"):
+        transport(
+            "GET",
+            "https://api.github.com/repos/SGGlobal/QLA",
+            {"Authorization": "Bearer secret-token"},
+            5,
+        )
+
+    assert len(opener.requests) == 1
+
+
+def test_only_initial_request_occurs():
+    handler = RedirectRejectingHandler()
+    opener = RedirectingOpener(
+        code=301,
+        location="https://api.github.com/elsewhere",
+        handler=handler,
+    )
+    transport = ProductionHTTPTransport(opener=opener)
+
+    with pytest.raises(CredentialSafeError):
+        transport(
+            "GET",
+            "https://api.github.com/repos/SGGlobal/QLA",
+            {},
+            5,
+        )
+
+    assert len(opener.requests) == 1
+
+
+def test_authorization_not_forwarded_on_redirect():
+    handler = RedirectRejectingHandler()
+    opener = RedirectingOpener(
+        code=302,
+        location="https://evil.example/steal",
+        handler=handler,
+    )
+    transport = ProductionHTTPTransport(opener=opener)
+
+    with pytest.raises(CredentialSafeError):
+        transport(
+            "GET",
+            "https://api.github.com/repos/SGGlobal/QLA",
+            {"Authorization": "Bearer secret-token"},
+            5,
+        )
+
+    # No second request exists, so the header cannot have been forwarded.
+    assert len(opener.requests) == 1
+
+
+def test_redirect_error_does_not_reveal_credentials():
+    handler = RedirectRejectingHandler()
+    opener = RedirectingOpener(
+        code=302,
+        location="https://evil.example/steal",
+        handler=handler,
+    )
+    transport = ProductionHTTPTransport(opener=opener)
+
+    try:
+        transport(
+            "GET",
+            "https://api.github.com/repos/SGGlobal/QLA",
+            {"Authorization": "Bearer secret-token"},
+            5,
+        )
+    except CredentialSafeError as exc:
+        assert "secret-token" not in str(exc)
+        assert "Bearer" not in str(exc)
+    else:
+        raise AssertionError("expected redirect rejection")
+
+
+def test_secure_opener_has_cert_validation_and_redirect_rejector():
+    opener = build_secure_opener()
+    handler_types = {type(handler).__name__ for handler in opener.handlers}
+
+    assert "HTTPSHandler" in handler_types
+    assert "RedirectRejectingHandler" in handler_types
+    assert "HTTPRedirectHandler" not in handler_types
+
+
 def test_https_enforcement():
     transport = ProductionHTTPTransport()
     with pytest.raises(CredentialSafeError, match="HTTPS required"):
@@ -103,16 +272,6 @@ def test_get_only():
     transport = ProductionHTTPTransport()
     with pytest.raises(CredentialSafeError, match="Unsupported HTTP method"):
         transport("POST", "https://api.github.com/repos/SGGlobal/QLA", {}, 5)
-
-
-def test_redirect_rejected_before_follow():
-    from urllib.error import HTTPError
-
-    handler = RedirectRejectingHandler()
-    with pytest.raises(CredentialSafeError, match="Unexpected redirect"):
-        handler.redirect_request(
-            None, None, 302, "Found", {}, "https://evil.example"
-        )
 
 
 def test_http_error_preserves_status():
