@@ -35,8 +35,10 @@ GITHUB_API_HOST = "https://api.github.com"
 MAX_RESPONSE_BYTES = 1_000_000
 REQUEST_TIMEOUT_SECONDS = 10
 
-# Only this workflow name counts as the required QLA test suite.
-REQUIRED_WORKFLOW_NAME = "tests"
+# Stable identity of the required QLA test workflow.
+# Display name is "Test"; the trusted identifier is the workflow path.
+REQUIRED_WORKFLOW_PATH = ".github/workflows/test.yml"
+REQUIRED_WORKFLOW_NAME = "Test"
 
 
 class TransportError(AdapterError):
@@ -57,18 +59,13 @@ class CredentialSafeError(TransportError):
     """
     Transport error that never includes credential material.
 
-    The original exception is not chained, so a token that appeared in a
-    lower-level message cannot surface in a traceback or log.
+    Raised with `from None` so the original exception context is suppressed.
+    Messages are static classifications; arbitrary transport text is not
+    interpolated.
     """
 
     def __init__(self, message: str):
         super().__init__(message)
-
-
-def _redact(text: str, secret: str) -> str:
-    if not secret:
-        return text
-    return text.replace(secret, "[REDACTED]")
 
 
 class GitHubLiveProvider:
@@ -109,42 +106,40 @@ class GitHubLiveProvider:
                 "GET", url, self._headers(), REQUEST_TIMEOUT_SECONDS
             )
         except TimeoutError:
-            raise CredentialSafeError("GitHub request timed out")
-        except Exception as exc:
-            # Do not chain; the original message may contain the token.
-            safe = _redact(str(exc), self._token)
-            raise CredentialSafeError(
-                f"GitHub request failed: {safe}"
-            ) from None
+            raise CredentialSafeError("GitHub request timed out") from None
+        except Exception:
+            # Static message. Do not interpolate the original text.
+            # Do not chain, so a token in the original cannot surface.
+            raise CredentialSafeError("GitHub request failed") from None
 
         if response.status in {301, 302, 303, 307, 308}:
-            raise CredentialSafeError("Unexpected redirect")
+            raise CredentialSafeError("Unexpected redirect") from None
 
         if response.status == 401:
-            raise CredentialSafeError("Authentication failed")
+            raise CredentialSafeError("Authentication failed") from None
         if response.status == 403:
-            raise CredentialSafeError("Insufficient permissions or forbidden")
+            raise CredentialSafeError(
+                "Insufficient permissions or forbidden"
+            ) from None
         if response.status == 404:
             raise AdapterError("Resource not found")
         if response.status == 429:
-            raise CredentialSafeError("GitHub rate limit exceeded")
+            raise CredentialSafeError("GitHub rate limit exceeded") from None
         if response.status >= 500:
-            raise CredentialSafeError("GitHub server error")
+            raise CredentialSafeError("GitHub server error") from None
         if response.status != 200:
-            raise CredentialSafeError(
-                f"Unexpected GitHub status {response.status}"
-            )
+            raise CredentialSafeError("Unexpected GitHub status") from None
 
         if len(response.body) > MAX_RESPONSE_BYTES:
-            raise CredentialSafeError("Response exceeds size bound")
+            raise CredentialSafeError("Response exceeds size bound") from None
 
         try:
             payload = json.loads(response.body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError):
-            raise CredentialSafeError("Malformed JSON")
+            raise CredentialSafeError("Malformed JSON") from None
 
         if not isinstance(payload, (dict, list)):
-            raise CredentialSafeError("Unexpected response type")
+            raise CredentialSafeError("Unexpected response type") from None
 
         return payload
 
@@ -228,6 +223,10 @@ class GitHubLiveProvider:
         if not isinstance(data, dict):
             raise AdapterError("Malformed pull request response")
 
+        returned_number = data.get("number")
+        if not isinstance(returned_number, int) or returned_number != number:
+            raise AdapterError("Pull request number mismatch")
+
         head = data.get("head")
         base = data.get("base")
         if not isinstance(head, dict) or not isinstance(base, dict):
@@ -244,12 +243,20 @@ class GitHubLiveProvider:
         if not isinstance(base_branch, str) or not base_branch:
             raise AdapterError("Pull request base branch is missing")
 
-        head_repo = head.get("repo") or {}
+        # Explicit source repository identity is required.
+        # A deleted or missing repo is not treated as same-repo.
+        head_repo = head.get("repo")
         if not isinstance(head_repo, dict):
-            raise AdapterError("Pull request source repository is malformed")
+            raise AdapterError(
+                "Pull request source repository identity is missing"
+            )
 
         head_full = head_repo.get("full_name")
-        if head_full not in {None, repository}:
+        if not isinstance(head_full, str) or not head_full:
+            raise AdapterError(
+                "Pull request source repository identity is missing"
+            )
+        if head_full != repository:
             raise AdapterError("Unsupported fork pull request")
 
         state = data.get("state")
@@ -283,7 +290,7 @@ class GitHubLiveProvider:
     def _runs_for_sha(self, repository: str, sha: str) -> list[dict]:
         owner, repo = self._check_repository(repository)
         data = self._get(
-            f"/repos/{owner}/{repo}/actions/runs?head_sha={sha}&per_page=10"
+            f"/repos/{owner}/{repo}/actions/runs?head_sha={sha}&per_page=20"
         )
         if not isinstance(data, dict):
             return []
@@ -317,15 +324,18 @@ class GitHubLiveProvider:
         """
         Return the status of the required QLA test workflow only.
 
-        Unrelated workflow success is ignored. If the required workflow
-        is absent, the result is UNAVAILABLE, never SUCCESS.
+        Identity is the workflow path `.github/workflows/test.yml`.
+        Display name is recorded but not used as the sole identifier.
+        Unrelated workflow success is ignored.
+        If multiple matching runs exist and ordering cannot be established,
+        the result is UNAVAILABLE.
         """
 
         runs = self._runs_for_sha(repository, sha)
         required = [
             run
             for run in runs
-            if run.get("name") == REQUIRED_WORKFLOW_NAME
+            if run.get("path") == REQUIRED_WORKFLOW_PATH
             and run.get("head_sha") == sha
         ]
 
@@ -336,6 +346,18 @@ class GitHubLiveProvider:
                 head_sha=sha,
                 source="github_live",
             )
+
+        if len(required) > 1:
+            # Cannot establish which run is authoritative without a
+            # reliable ordering field. Fail closed.
+            ids = {run.get("id") for run in required}
+            if len(ids) > 1 or None in ids:
+                return WorkflowSnapshot(
+                    name=REQUIRED_WORKFLOW_NAME,
+                    status=CIStatus.UNAVAILABLE,
+                    head_sha=sha,
+                    source="github_live",
+                )
 
         run = required[0]
         return WorkflowSnapshot(
@@ -348,7 +370,6 @@ class GitHubLiveProvider:
     def ci_result(self, repository: str, sha: str) -> CIResultSnapshot:
         workflow = self.workflow(repository, sha)
 
-        # Counts remain None; GitHub does not provide verified pytest totals.
         return CIResultSnapshot(
             sha=sha,
             status=workflow.status,

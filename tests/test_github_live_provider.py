@@ -25,6 +25,7 @@ from skippy.collaboration.github_live_provider import (
 
 SHA = "79925e4aa80bef170778fc02a022f5c338739c91"
 TOKEN = "ghp_test_token_not_real"
+WORKFLOW_PATH = ".github/workflows/test.yml"
 
 
 def json_response(payload, status=200):
@@ -49,6 +50,21 @@ def make_transport(routes):
 
     transport.calls = calls
     return transport
+
+
+def _pr_payload(number, state, merged, ref):
+    return {
+        "number": number,
+        "title": state.title(),
+        "state": state,
+        "merged": merged,
+        "head": {
+            "sha": SHA,
+            "ref": ref,
+            "repo": {"full_name": "SGGlobal/QLA"},
+        },
+        "base": {"ref": "phase-8-tradingview-integration"},
+    }
 
 
 def test_repository_metadata():
@@ -100,40 +116,19 @@ def test_commit_retrieval():
 
 def test_open_pull_request():
     transport = make_transport([
-        ("/pulls/1",
-         json_response({
-             "title": "Open",
-             "state": "open",
-             "merged": False,
-             "head": {
-                 "sha": SHA,
-                 "ref": "feature/x",
-                 "repo": {"full_name": "SGGlobal/QLA"},
-             },
-             "base": {"ref": "phase-8-tradingview-integration"},
-         })),
+        ("/pulls/1", json_response(_pr_payload(1, "open", False, "feature/x"))),
     ])
     provider = GitHubLiveProvider(TOKEN, transport)
     snap = provider.pull_request(ALLOWED_REPOSITORY, 1)
 
     assert snap.state == "open"
     assert snap.head_branch == "feature/x"
+    assert snap.base_branch == "phase-8-tradingview-integration"
 
 
 def test_merged_pull_request():
     transport = make_transport([
-        ("/pulls/2",
-         json_response({
-             "title": "Merged",
-             "state": "closed",
-             "merged": True,
-             "head": {
-                 "sha": SHA,
-                 "ref": "feature/y",
-                 "repo": {"full_name": "SGGlobal/QLA"},
-             },
-             "base": {"ref": "phase-8-tradingview-integration"},
-         })),
+        ("/pulls/2", json_response(_pr_payload(2, "closed", True, "feature/y"))),
     ])
     provider = GitHubLiveProvider(TOKEN, transport)
     snap = provider.pull_request(ALLOWED_REPOSITORY, 2)
@@ -143,18 +138,7 @@ def test_merged_pull_request():
 
 def test_closed_unmerged_pull_request():
     transport = make_transport([
-        ("/pulls/3",
-         json_response({
-             "title": "Closed",
-             "state": "closed",
-             "merged": False,
-             "head": {
-                 "sha": SHA,
-                 "ref": "feature/z",
-                 "repo": {"full_name": "SGGlobal/QLA"},
-             },
-             "base": {"ref": "phase-8-tradingview-integration"},
-         })),
+        ("/pulls/3", json_response(_pr_payload(3, "closed", False, "feature/z"))),
     ])
     provider = GitHubLiveProvider(TOKEN, transport)
     snap = provider.pull_request(ALLOWED_REPOSITORY, 3)
@@ -162,12 +146,133 @@ def test_closed_unmerged_pull_request():
     assert snap.state == "closed"
 
 
+def test_valid_source_repository():
+    transport = make_transport([
+        ("/pulls/1", json_response(_pr_payload(1, "open", False, "feature/x"))),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+    snap = provider.pull_request(ALLOWED_REPOSITORY, 1)
+
+    assert snap.head_branch == "feature/x"
+
+
+def test_missing_source_repository_rejected():
+    payload = _pr_payload(1, "open", False, "feature/x")
+    payload["head"]["repo"] = None
+
+    transport = make_transport([
+        ("/pulls/1", json_response(payload)),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+
+    with pytest.raises(AdapterError, match="source repository"):
+        provider.pull_request(ALLOWED_REPOSITORY, 1)
+
+
+def test_incorrect_source_repository_rejected():
+    payload = _pr_payload(1, "open", False, "feature/x")
+    payload["head"]["repo"] = {"full_name": "other/fork"}
+
+    transport = make_transport([
+        ("/pulls/1", json_response(payload)),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+
+    with pytest.raises(AdapterError, match="Unsupported fork"):
+        provider.pull_request(ALLOWED_REPOSITORY, 1)
+
+
+def test_pr_number_mismatch_rejected():
+    payload = _pr_payload(99, "open", False, "feature/x")
+
+    transport = make_transport([
+        ("/pulls/1", json_response(payload)),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+
+    with pytest.raises(AdapterError, match="number mismatch"):
+        provider.pull_request(ALLOWED_REPOSITORY, 1)
+
+
+def test_required_workflow_by_path():
+    transport = make_transport([
+        ("/actions/runs",
+         json_response({
+             "workflow_runs": [{
+                 "id": 1,
+                 "name": "Test",
+                 "path": WORKFLOW_PATH,
+                 "status": "completed",
+                 "conclusion": "success",
+                 "head_sha": SHA,
+             }],
+         })),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+    snap = provider.workflow(ALLOWED_REPOSITORY, SHA)
+
+    assert snap.name == "Test"
+    assert snap.status is CIStatus.SUCCESS
+
+
+def test_unrelated_workflow_success_is_not_required():
+    transport = make_transport([
+        ("/actions/runs",
+         json_response({
+             "workflow_runs": [{
+                 "id": 2,
+                 "name": "Deploy",
+                 "path": ".github/workflows/deploy.yml",
+                 "status": "completed",
+                 "conclusion": "success",
+                 "head_sha": SHA,
+             }],
+         })),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+    snap = provider.workflow(ALLOWED_REPOSITORY, SHA)
+
+    assert snap.status is CIStatus.UNAVAILABLE
+
+
+def test_multiple_matching_runs_unavailable():
+    transport = make_transport([
+        ("/actions/runs",
+         json_response({
+             "workflow_runs": [
+                 {
+                     "id": 10,
+                     "name": "Test",
+                     "path": WORKFLOW_PATH,
+                     "status": "completed",
+                     "conclusion": "success",
+                     "head_sha": SHA,
+                 },
+                 {
+                     "id": 11,
+                     "name": "Test",
+                     "path": WORKFLOW_PATH,
+                     "status": "completed",
+                     "conclusion": "failure",
+                     "head_sha": SHA,
+                 },
+             ],
+         })),
+    ])
+    provider = GitHubLiveProvider(TOKEN, transport)
+    snap = provider.workflow(ALLOWED_REPOSITORY, SHA)
+
+    assert snap.status is CIStatus.UNAVAILABLE
+
+
 def test_pending_workflow():
     transport = make_transport([
         ("/actions/runs",
          json_response({
              "workflow_runs": [{
-                 "name": "tests",
+                 "id": 3,
+                 "name": "Test",
+                 "path": WORKFLOW_PATH,
                  "status": "queued",
                  "conclusion": None,
                  "head_sha": SHA,
@@ -178,7 +283,6 @@ def test_pending_workflow():
     snap = provider.workflow(ALLOWED_REPOSITORY, SHA)
 
     assert snap.status is CIStatus.PENDING
-    assert snap.name == "tests"
 
 
 def test_successful_workflow():
@@ -186,7 +290,9 @@ def test_successful_workflow():
         ("/actions/runs",
          json_response({
              "workflow_runs": [{
-                 "name": "tests",
+                 "id": 4,
+                 "name": "Test",
+                 "path": WORKFLOW_PATH,
                  "status": "completed",
                  "conclusion": "success",
                  "head_sha": SHA,
@@ -201,35 +307,14 @@ def test_successful_workflow():
     assert result.failed is None
 
 
-def test_unrelated_workflow_success_is_not_required():
-    """
-    A successful workflow that is not the required QLA test workflow
-    must not be reported as successful required tests.
-    """
-    transport = make_transport([
-        ("/actions/runs",
-         json_response({
-             "workflow_runs": [{
-                 "name": "deploy",
-                 "status": "completed",
-                 "conclusion": "success",
-                 "head_sha": SHA,
-             }],
-         })),
-    ])
-    provider = GitHubLiveProvider(TOKEN, transport)
-    snap = provider.workflow(ALLOWED_REPOSITORY, SHA)
-
-    assert snap.name == "tests"
-    assert snap.status is CIStatus.UNAVAILABLE
-
-
 def test_failed_workflow():
     transport = make_transport([
         ("/actions/runs",
          json_response({
              "workflow_runs": [{
-                 "name": "tests",
+                 "id": 5,
+                 "name": "Test",
+                 "path": WORKFLOW_PATH,
                  "status": "completed",
                  "conclusion": "failure",
                  "head_sha": SHA,
@@ -258,7 +343,9 @@ def test_sha_mismatch_is_unavailable():
         ("/actions/runs",
          json_response({
              "workflow_runs": [{
-                 "name": "tests",
+                 "id": 6,
+                 "name": "Test",
+                 "path": WORKFLOW_PATH,
                  "status": "completed",
                  "conclusion": "success",
                  "head_sha": other,
@@ -306,23 +393,25 @@ def test_rate_limiting():
         provider.repository(ALLOWED_REPOSITORY)
 
 
-def test_timeout():
+def test_timeout_does_not_leak_token():
     def boom(method, url, headers, timeout):
-        raise TimeoutError("slow")
+        raise TimeoutError(f"slow with {TOKEN}")
 
     transport = make_transport([("/repos/", boom)])
     provider = GitHubLiveProvider(TOKEN, transport)
 
-    with pytest.raises(TransportError, match="timed out"):
+    try:
         provider.repository(ALLOWED_REPOSITORY)
+    except TransportError as exc:
+        rendered = "".join(traceback.format_exception(exc))
+        assert TOKEN not in str(exc)
+        assert TOKEN not in rendered
+        assert "timed out" in str(exc)
+    else:
+        raise AssertionError("expected TransportError")
 
 
-def test_credential_not_in_traceback():
-    """
-    A transport exception that includes the token must not surface it
-    in the raised error or its traceback.
-    """
-
+def test_unexpected_exception_does_not_leak_token():
     def leaky(method, url, headers, timeout):
         raise RuntimeError(f"failed with token {TOKEN}")
 
@@ -335,6 +424,7 @@ def test_credential_not_in_traceback():
         rendered = "".join(traceback.format_exception(exc))
         assert TOKEN not in str(exc)
         assert TOKEN not in rendered
+        assert str(exc) == "GitHub request failed"
     else:
         raise AssertionError("expected TransportError")
 
@@ -406,6 +496,7 @@ def test_missing_pull_request_source():
     transport = make_transport([
         ("/pulls/1",
          json_response({
+             "number": 1,
              "title": "Open",
              "state": "open",
              "merged": False,
