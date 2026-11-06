@@ -6,7 +6,6 @@ LOCAL SYNTHETIC ONLY.
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
 
 import pytest
 
@@ -99,21 +98,28 @@ def test_identical_messages_recognized_as_duplicates(tmp_path):
 
 
 def test_conflicting_message_id_different_timestamp(tmp_path):
+    """
+    Two messages share a message_id but differ in timestamp.
+
+    Both timestamps are inside the default TTL so the failure is an
+    envelope conflict, not expiration.
+    """
+    now = datetime.now(timezone.utc)
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
 
     first = make_message(
-        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        timestamp=now - timedelta(seconds=10),
     )
-    protocol.accept(first)
+    assert protocol.accept(first, now=now) is True
 
     conflict = make_message(
         message_id=first.message_id,
         idempotency_key=first.idempotency_key,
-        timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        timestamp=now - timedelta(seconds=5),
     )
 
     with pytest.raises(ProtocolError, match="Conflicting content for existing message ID"):
-        protocol.accept(conflict)
+        protocol.accept(conflict, now=now)
 
 
 def test_conflicting_message_id_rejected(tmp_path):
@@ -232,8 +238,10 @@ def test_invalid_transition_rejected(tmp_path):
 
 def test_sqlite_rollback_on_persistence_failure(tmp_path):
     """
-    Force a failure after the message INSERT but before the task-state
-    write. Both must roll back. Existing historical records stay intact.
+    Use an SQLite trigger to abort INSERT on task_states.
+
+    The message INSERT begins, the task-state INSERT fails, and the
+    transaction rolls back. Historical records remain unchanged.
     """
     database = tmp_path / "bridge.db"
     protocol = CollaborationProtocol(database)
@@ -241,18 +249,22 @@ def test_sqlite_rollback_on_persistence_failure(tmp_path):
     historical = make_message(task_id="HIST", idempotency_key="hist")
     protocol.accept(historical)
 
+    # Install a trigger that aborts any new task_states insert.
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER abort_task_states
+            BEFORE INSERT ON task_states
+            BEGIN
+                SELECT RAISE(ABORT, 'injected task_states failure');
+            END;
+            """
+        )
+
     failing = make_message(task_id="NEW", idempotency_key="new")
 
-    original_execute = sqlite3.Connection.execute
-
-    def exploding_execute(self, sql, params=()):
-        if "INSERT INTO task_states" in sql:
-            raise sqlite3.OperationalError("injected failure")
-        return original_execute(self, sql, params)
-
-    with patch.object(sqlite3.Connection, "execute", exploding_execute):
-        with pytest.raises(ProtocolError, match="Persistence failed"):
-            protocol.accept(failing)
+    with pytest.raises(ProtocolError, match="Persistence failed"):
+        protocol.accept(failing)
 
     with sqlite3.connect(database) as connection:
         messages = connection.execute(
