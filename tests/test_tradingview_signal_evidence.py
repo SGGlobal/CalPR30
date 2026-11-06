@@ -7,6 +7,7 @@ LOCAL SIMULATION ONLY.
 """
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 
@@ -84,6 +85,25 @@ def test_mismatched_fingerprint_rejected(tmp_path):
 
     # No records created.
     assert registry.get_state(LEGACY_FINGERPRINT) is None
+
+
+def test_extra_field_rejected_without_records(tmp_path):
+    registry = AtomicSignalRegistry(tmp_path / "evidence.db")
+
+    payload = make_payload()
+    payload["unauthorized"] = "must-not-be-stored"
+
+    with pytest.raises(ValueError, match="exactly"):
+        registry.register(LEGACY_FINGERPRINT, evidence=payload)
+
+    assert registry.get_state(LEGACY_FINGERPRINT) is None
+
+    with sqlite3.connect(tmp_path / "evidence.db") as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM signals"
+        ).fetchone()[0]
+
+    assert count == 0
 
 
 def test_duplicate_does_not_overwrite_evidence(tmp_path):
@@ -277,6 +297,75 @@ def test_interrupted_registration_leaves_evidence_verified(tmp_path):
 def test_schema_migration_failure_fails_closed(tmp_path):
     with pytest.raises(AtomicRegistryError):
         AtomicSignalRegistry(tmp_path / "missing_dir" / "broken.db")
+
+
+def test_sqlite_migration_failure_preserves_historical_records(tmp_path):
+    """
+    Cause a real SQLite ALTER TABLE failure on an existing database
+    that already contains historical records.
+
+    The database file is made read-only after the legacy schema and
+    data are written, so the additive migration cannot proceed.
+    """
+    database = tmp_path / "readonly-legacy.db"
+
+    old_time = "2026-01-01T00:00:00+00:00"
+
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            """
+            CREATE TABLE signals (
+                fingerprint TEXT PRIMARY KEY,
+                first_seen TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE processing_states (
+                fingerprint TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO signals (fingerprint, first_seen) VALUES (?, ?)",
+            (LEGACY_FINGERPRINT, old_time),
+        )
+        connection.execute(
+            """
+            INSERT INTO processing_states (fingerprint, state, updated_at)
+            VALUES (?, 'RECEIVED', ?)
+            """,
+            (LEGACY_FINGERPRINT, old_time),
+        )
+
+    # Make the file read-only so ALTER TABLE fails.
+    os.chmod(database, 0o444)
+
+    try:
+        with pytest.raises(AtomicRegistryError):
+            AtomicSignalRegistry(database)
+
+        # Historical records must be unchanged.
+        with sqlite3.connect(database) as connection:
+            row = connection.execute(
+                "SELECT first_seen FROM signals WHERE fingerprint = ?",
+                (LEGACY_FINGERPRINT,),
+            ).fetchone()
+
+            columns = {
+                col[1]
+                for col in connection.execute("PRAGMA table_info(signals)")
+            }
+
+        assert row == (old_time,)
+        assert "evidence_json" not in columns
+
+    finally:
+        # Restore writability so the temporary file can be cleaned up.
+        os.chmod(database, 0o644)
 
 
 def test_legacy_fingerprint_only_registration_still_works(tmp_path):

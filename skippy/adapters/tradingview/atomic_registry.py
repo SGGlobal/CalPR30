@@ -20,6 +20,9 @@ class AtomicRegistryError(RuntimeError):
     """Raised when atomic registration cannot be guaranteed."""
 
 
+ALLOWED_EVIDENCE_KEYS = frozenset({"symbol", "action", "price", "timestamp"})
+
+
 class AtomicSignalRegistry:
     def __init__(self, database_path: str | Path):
         if str(database_path) == ":memory:":
@@ -91,9 +94,16 @@ class AtomicSignalRegistry:
         if not isinstance(evidence, dict):
             raise ValueError("Evidence must be a dictionary")
 
+        # Strict field set: exactly the four approved keys.
+        # Reject missing or additional keys before calling the validator.
+        if set(evidence.keys()) != ALLOWED_EVIDENCE_KEYS:
+            raise ValueError(
+                "Evidence must contain exactly symbol, action, price, and timestamp"
+            )
+
         # Reuse the existing signal validator.
         # This enforces allowed symbols/actions, numeric price,
-        # timezone-aware timestamp, and exact field set.
+        # and timezone-aware timestamp.
         validated = validate_signal(evidence)
 
         # Canonical representation used for fingerprinting and storage.
