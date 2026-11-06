@@ -34,7 +34,7 @@ def _request(**overrides):
         "task_id": "task-1",
         "expected_sha": "abc1234",
         "environment": "local",
-        "created_at": _now(),
+        "created_at": _now() - timedelta(hours=2),
         "expires_at": _now() + timedelta(hours=1),
         "state": AuthorizationState.APPROVED,
     }
@@ -106,8 +106,15 @@ def test_pending_impersonation_rejected_on_decide(tmp_path):
 
 
 def test_expiration(tmp_path):
+    """Structurally valid request that is already expired."""
     policy = AuthorizationPolicy(tmp_path / "auth.db")
-    policy.submit(_request(expires_at=_now() - timedelta(seconds=1)))
+    created = _now() - timedelta(hours=2)
+    policy.submit(
+        _request(
+            created_at=created,
+            expires_at=created + timedelta(minutes=30),
+        )
+    )
 
     decision = _decide(policy)
     assert decision.state is AuthorizationState.EXPIRED
@@ -115,11 +122,26 @@ def test_expiration(tmp_path):
 
 def test_expiration_blocks_consumption(tmp_path):
     policy = AuthorizationPolicy(tmp_path / "auth.db")
-    policy.submit(_request(expires_at=_now() - timedelta(seconds=1)))
+    created = _now() - timedelta(hours=2)
+    policy.submit(
+        _request(
+            created_at=created,
+            expires_at=created + timedelta(minutes=30),
+        )
+    )
 
     decision = policy.consume("auth-1")
     assert decision.state is AuthorizationState.EXPIRED
     assert decision.execution_enabled is False
+    assert "Expired during consumption" in policy.events_for("auth-1")
+
+
+def test_malformed_timestamps_rejected(tmp_path):
+    with pytest.raises(AuthorizationError, match="after created_at"):
+        _request(
+            created_at=_now(),
+            expires_at=_now() - timedelta(hours=1),
+        )
 
 
 def test_revocation(tmp_path):
@@ -138,6 +160,7 @@ def test_revocation_blocks_consumption(tmp_path):
 
     decision = policy.consume("auth-1")
     assert decision.state is AuthorizationState.REVOKED
+    assert "Authorization revoked" in policy.events_for("auth-1")
 
 
 def test_denied_blocks_consumption(tmp_path):
@@ -146,6 +169,7 @@ def test_denied_blocks_consumption(tmp_path):
 
     decision = policy.consume("auth-1")
     assert decision.state is AuthorizationState.DENIED
+    assert "Authorization denied" in policy.events_for("auth-1")
 
 
 def test_one_time_consumption(tmp_path):
@@ -159,6 +183,24 @@ def test_one_time_consumption(tmp_path):
     assert first.execution_enabled is False
     assert second.state is AuthorizationState.CONSUMED
     assert second.allowed is False
+    assert "Authorization already consumed" in policy.events_for("auth-1")
+
+
+def test_missing_authorization_audited(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    decision = policy.consume("missing")
+
+    assert decision.reason == "Missing authorization"
+    assert "Missing authorization" in policy.events_for("missing")
+
+
+def test_invalid_state_audited(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    policy.submit(_request(state=AuthorizationState.PENDING))
+
+    decision = policy.consume("auth-1")
+    assert decision.reason == "Invalid state for consumption"
+    assert "Invalid state for consumption" in policy.events_for("auth-1")
 
 
 def test_action_mismatch(tmp_path):
@@ -205,6 +247,7 @@ def test_halt_precedence(tmp_path):
     consumed = policy.consume("auth-1")
     assert consumed.allowed is False
     assert consumed.reason == "System is halted"
+    assert "System is halted" in policy.events_for("auth-1")
 
 
 def test_halt_persists(tmp_path):
@@ -214,6 +257,27 @@ def test_halt_persists(tmp_path):
 
     reopened = AuthorizationPolicy(path)
     assert reopened.is_halted() is True
+
+
+def test_protocol_halt_is_independent(tmp_path):
+    """
+    CollaborationProtocol.halt() does not set the authorization policy HALT.
+    This separation is a commissioning blocker.
+    """
+    from skippy.collaboration.protocol import CollaborationProtocol
+
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    policy.submit(_request())
+
+    protocol.halt()
+
+    assert protocol.is_halted is True
+    assert policy.is_halted() is False
+
+    decision = _decide(policy)
+    assert decision.state is AuthorizationState.APPROVED
+    assert decision.execution_enabled is False
 
 
 def test_expires_after_creation_required(tmp_path):

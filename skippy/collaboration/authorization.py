@@ -11,12 +11,15 @@ A message claiming authorization is not proof of authorization.
 An identity string is not authentication.
 Execution permission remains disabled in this milestone.
 
-HALT limitation:
-This policy maintains its own persistent HALT flag. Fully atomic
-coordination with CollaborationProtocol.halt() is not possible in this
-milestone because the two components use separate databases. When either
-flag is set, this policy fails closed. There is no automatic resume and
-no recovery procedure in this step.
+HALT limitation (commissioning blocker):
+AuthorizationPolicy and CollaborationProtocol each maintain an independent
+persistent HALT flag in separate databases. This policy does NOT
+automatically recognize a HALT issued through CollaborationProtocol.halt().
+Coordinated HALT enforcement across both components is a commissioning
+blocker and is reserved for a separately reviewed integration milestone.
+Until then, this policy fails closed only on its own halt() flag.
+There is no automatic resume and no recovery procedure in this step.
+External execution remains disabled while this limitation is unresolved.
 """
 
 from __future__ import annotations
@@ -137,7 +140,8 @@ class AuthorizationPolicy:
     """
     Deny-by-default policy with local audit persistence.
 
-    Execution is always disabled. HALT cannot be overridden.
+    Execution is always disabled. This policy's HALT cannot be overridden.
+    It does not automatically observe CollaborationProtocol HALT.
     """
 
     def __init__(self, database_path: str | Path):
@@ -223,6 +227,18 @@ class AuthorizationPolicy:
                 reason,
             ),
         )
+
+    def events_for(self, authorization_id: str) -> list[str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT reason FROM authorization_events
+                WHERE authorization_id = ?
+                ORDER BY occurred_at
+                """,
+                (authorization_id,),
+            ).fetchall()
+        return [row[0] for row in rows]
 
     def classify(self, action: str) -> OperationClass:
         if action in READ_ONLY_ACTIONS:
@@ -526,8 +542,9 @@ class AuthorizationPolicy:
         One-time consumption.
 
         HALT, expiration, revocation, denial, and prior consumption are
-        checked inside the same transaction. Does not enable execution.
-        Concurrent attempts fail closed because the update is conditional.
+        checked inside the same transaction. Every rejection is audited.
+        Does not enable execution. Concurrent attempts fail closed.
+        Terminal states are not overwritten merely to record a rejection.
         """
 
         now = now or datetime.now(timezone.utc)
@@ -569,18 +586,34 @@ class AuthorizationPolicy:
             state, expires_at, existing_consumption = row
 
             if state == AuthorizationState.REVOKED.value:
+                self._record(
+                    connection, authorization_id, "consume", "authorization",
+                    state, "REVOKED", "Authorization revoked",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.REVOKED, "Authorization revoked"
                 )
             if state == AuthorizationState.DENIED.value:
+                self._record(
+                    connection, authorization_id, "consume", "authorization",
+                    state, "DENIED", "Authorization denied",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.DENIED, "Authorization denied"
                 )
             if state == AuthorizationState.CONSUMED.value or existing_consumption:
+                self._record(
+                    connection, authorization_id, "consume", "authorization",
+                    state, "CONSUMED", "Authorization already consumed",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.CONSUMED, "Authorization already consumed"
                 )
             if state == AuthorizationState.EXPIRED.value:
+                self._record(
+                    connection, authorization_id, "consume", "authorization",
+                    state, "EXPIRED", "Authorization expired",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.EXPIRED, "Authorization expired"
                 )
@@ -600,6 +633,10 @@ class AuthorizationPolicy:
                 )
 
             if state != AuthorizationState.APPROVED.value:
+                self._record(
+                    connection, authorization_id, "consume", "authorization",
+                    state, "DENIED", "Invalid state for consumption",
+                )
                 return AuthorizationDecision(
                     False, AuthorizationState.DENIED, "Invalid state for consumption"
                 )
