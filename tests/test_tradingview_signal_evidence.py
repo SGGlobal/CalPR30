@@ -21,6 +21,9 @@ from skippy.adapters.tradingview.atomic_registry import (
     AtomicSignalRegistry,
 )
 from skippy.adapters.tradingview.deduplicator import SignalDeduplicator
+from skippy.adapters.tradingview.observation_repository import (
+    ObservationRepository,
+)
 from skippy.adapters.tradingview.recovery_inspector import RecoveryInspector
 from skippy.adapters.tradingview.validator import validate_signal
 from skippy.kernel.event_bus import EventBus
@@ -132,9 +135,13 @@ def test_duplicate_does_not_overwrite_evidence(tmp_path):
 
 def test_historical_null_evidence_remains_valid(tmp_path):
     database = tmp_path / "evidence.db"
-    registry = AtomicSignalRegistry(database)
 
-    # Simulate a pre-migration row with fingerprint only.
+    # Initialize the complete observational schema so RecoveryInspector
+    # can join signals, processing_states, and observations.
+    registry = AtomicSignalRegistry(database)
+    ObservationRepository(database)
+
+    # Simulate a pre-migration row with fingerprint only (NULL evidence).
     with sqlite3.connect(database) as connection:
         connection.execute(
             """
