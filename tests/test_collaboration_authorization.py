@@ -106,7 +106,6 @@ def test_pending_impersonation_rejected_on_decide(tmp_path):
 
 
 def test_expiration(tmp_path):
-    """Structurally valid request that is already expired."""
     policy = AuthorizationPolicy(tmp_path / "auth.db")
     created = _now() - timedelta(hours=2)
     policy.submit(
@@ -136,12 +135,19 @@ def test_expiration_blocks_consumption(tmp_path):
     assert "Expired during consumption" in policy.events_for("auth-1")
 
 
-def test_malformed_timestamps_rejected(tmp_path):
+def test_expires_before_created_rejected():
+    created = _now()
     with pytest.raises(AuthorizationError, match="after created_at"):
         _request(
-            created_at=_now(),
-            expires_at=_now() - timedelta(hours=1),
+            created_at=created,
+            expires_at=created - timedelta(seconds=1),
         )
+
+
+def test_expires_equal_created_rejected():
+    created = _now()
+    with pytest.raises(AuthorizationError, match="after created_at"):
+        _request(created_at=created, expires_at=created)
 
 
 def test_revocation(tmp_path):
@@ -151,6 +157,53 @@ def test_revocation(tmp_path):
 
     decision = _decide(policy)
     assert decision.state is AuthorizationState.REVOKED
+
+
+def test_consumed_is_terminal(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    policy.submit(_request())
+    policy.consume("auth-1")
+
+    decision = policy.revoke("auth-1")
+    assert decision.reason == "Terminal state cannot be overwritten"
+    assert policy.stored_state("auth-1") == "CONSUMED"
+    assert "Terminal state cannot be overwritten" in policy.events_for("auth-1")
+
+
+def test_revoked_is_terminal(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    policy.submit(_request())
+    policy.revoke("auth-1")
+
+    decision = policy.revoke("auth-1")
+    assert decision.reason == "Terminal state cannot be overwritten"
+    assert policy.stored_state("auth-1") == "REVOKED"
+
+
+def test_expired_does_not_become_approved(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    created = _now() - timedelta(hours=2)
+    policy.submit(
+        _request(
+            created_at=created,
+            expires_at=created + timedelta(minutes=30),
+        )
+    )
+    _decide(policy)
+
+    assert policy.stored_state("auth-1") == "EXPIRED"
+    second = _decide(policy)
+    assert second.state is AuthorizationState.EXPIRED
+    assert policy.stored_state("auth-1") == "EXPIRED"
+
+
+def test_denied_does_not_become_approved(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    policy.submit(_request(state=AuthorizationState.DENIED))
+
+    decision = _decide(policy)
+    assert decision.state is AuthorizationState.DENIED
+    assert policy.stored_state("auth-1") == "DENIED"
 
 
 def test_revocation_blocks_consumption(tmp_path):
@@ -184,6 +237,27 @@ def test_one_time_consumption(tmp_path):
     assert second.state is AuthorizationState.CONSUMED
     assert second.allowed is False
     assert "Authorization already consumed" in policy.events_for("auth-1")
+
+
+def test_concurrent_consumption(tmp_path):
+    path = tmp_path / "auth.db"
+    policy = AuthorizationPolicy(path)
+    policy.submit(_request())
+
+    other = AuthorizationPolicy(path)
+    first = policy.consume("auth-1")
+    second = other.consume("auth-1")
+
+    successes = [
+        decision
+        for decision in (first, second)
+        if decision.state is AuthorizationState.CONSUMED
+        and decision.reason == "Consumed; execution remains disabled"
+    ]
+    assert len(successes) == 1
+    assert first.execution_enabled is False
+    assert second.execution_enabled is False
+    assert policy.stored_state("auth-1") == "CONSUMED"
 
 
 def test_missing_authorization_audited(tmp_path):
@@ -260,10 +334,6 @@ def test_halt_persists(tmp_path):
 
 
 def test_protocol_halt_is_independent(tmp_path):
-    """
-    CollaborationProtocol.halt() does not set the authorization policy HALT.
-    This separation is a commissioning blocker.
-    """
     from skippy.collaboration.protocol import CollaborationProtocol
 
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
@@ -278,11 +348,6 @@ def test_protocol_halt_is_independent(tmp_path):
     decision = _decide(policy)
     assert decision.state is AuthorizationState.APPROVED
     assert decision.execution_enabled is False
-
-
-def test_expires_after_creation_required(tmp_path):
-    with pytest.raises(AuthorizationError, match="after created_at"):
-        _request(expires_at=_now() - timedelta(hours=1))
 
 
 def test_sqlite_persistence(tmp_path):

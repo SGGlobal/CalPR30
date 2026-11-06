@@ -20,6 +20,11 @@ blocker and is reserved for a separately reviewed integration milestone.
 Until then, this policy fails closed only on its own halt() flag.
 There is no automatic resume and no recovery procedure in this step.
 External execution remains disabled while this limitation is unresolved.
+
+Terminal states:
+CONSUMED, REVOKED, EXPIRED, and DENIED are terminal. They are not
+overwritten by later transitions. Audit events record rejected attempts
+without changing the stored state.
 """
 
 from __future__ import annotations
@@ -75,6 +80,13 @@ PROTECTED_ACTIONS = frozenset({
 
 KNOWN_PARTICIPANTS = frozenset({"skyppy", "jason", "chief", "bridge"})
 AI_PARTICIPANTS = frozenset({"skyppy", "jason", "bridge"})
+
+TERMINAL_STATES = frozenset({
+    AuthorizationState.CONSUMED.value,
+    AuthorizationState.REVOKED.value,
+    AuthorizationState.EXPIRED.value,
+    AuthorizationState.DENIED.value,
+})
 
 
 @dataclass(frozen=True)
@@ -239,6 +251,14 @@ class AuthorizationPolicy:
                 (authorization_id,),
             ).fetchall()
         return [row[0] for row in rows]
+
+    def stored_state(self, authorization_id: str) -> str | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT state FROM authorization_requests WHERE authorization_id = ?",
+                (authorization_id,),
+            ).fetchone()
+        return row[0] if row else None
 
     def classify(self, action: str) -> OperationClass:
         if action in READ_ONLY_ACTIONS:
@@ -434,10 +454,11 @@ class AuthorizationPolicy:
 
             expires = datetime.fromisoformat(expires_at)
             if now >= expires:
-                connection.execute(
-                    "UPDATE authorization_requests SET state = ? WHERE authorization_id = ?",
-                    (AuthorizationState.EXPIRED.value, authorization_id),
-                )
+                if state not in TERMINAL_STATES:
+                    connection.execute(
+                        "UPDATE authorization_requests SET state = ? WHERE authorization_id = ?",
+                        (AuthorizationState.EXPIRED.value, authorization_id),
+                    )
                 self._record(
                     connection, authorization_id, action, repository,
                     state, "EXPIRED", "Authorization expired",
@@ -515,7 +536,13 @@ class AuthorizationPolicy:
                 execution_enabled=False,
             )
 
-    def revoke(self, authorization_id: str) -> None:
+    def revoke(self, authorization_id: str) -> AuthorizationDecision:
+        """
+        Revoke a non-terminal authorization.
+
+        Terminal states are not overwritten. The rejection is audited.
+        """
+
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -524,14 +551,31 @@ class AuthorizationPolicy:
             ).fetchone()
             if row is None:
                 raise AuthorizationError("Missing authorization")
+
+            state = row[0]
+            if state in TERMINAL_STATES:
+                self._record(
+                    connection, authorization_id, "revoke", "authorization",
+                    state, state, "Terminal state cannot be overwritten",
+                )
+                return AuthorizationDecision(
+                    False,
+                    AuthorizationState(state),
+                    "Terminal state cannot be overwritten",
+                )
+
             connection.execute(
                 "UPDATE authorization_requests SET state = ? WHERE authorization_id = ?",
                 (AuthorizationState.REVOKED.value, authorization_id),
             )
             self._record(
                 connection, authorization_id, "revoke", "authorization",
-                row[0], "REVOKED", "Revoked",
+                state, "REVOKED", "Revoked",
             )
+
+        return AuthorizationDecision(
+            False, AuthorizationState.REVOKED, "Revoked"
+        )
 
     def consume(
         self,
