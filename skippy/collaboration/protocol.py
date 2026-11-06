@@ -13,10 +13,12 @@ Identity rules:
   must match for a repeated message_id to be treated as a valid duplicate.
   Fields: message_id, idempotency_key, correlation_id, project_id, task_id,
   sender, recipient, message_type, authorization_status, payload,
-  parent_message_id, protocol_version.
+  parent_message_id, protocol_version, and canonical timestamp.
 * Logical-operation identity (idempotency_key): the same key represents
   the same logical operation when project_id, task_id, sender, recipient,
   message_type, authorization_status, and payload match.
+  Timestamp is intentionally excluded from operation identity so that
+  redelivery of the same operation is recognized.
   Legitimate repeated reviews use a new message_id and a new idempotency_key.
 """
 
@@ -30,6 +32,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 
@@ -114,25 +117,52 @@ MESSAGE_TO_STATE = {
 }
 
 
+def _freeze_payload(value: Any) -> Any:
+    """
+    Produce an immutable canonical snapshot of a payload.
+
+    Rejects non-string keys, non-finite numbers, and non-JSON values.
+    Nested dicts become MappingProxyType; lists become tuples.
+    """
+
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ProtocolError("Payload contains non-finite number")
+        return value
+
+    if isinstance(value, dict):
+        frozen = {}
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ProtocolError("Payload keys must be strings")
+            frozen[key] = _freeze_payload(item)
+        return MappingProxyType(frozen)
+
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_payload(item) for item in value)
+
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+
+    raise ProtocolError("Payload is not JSON-serializable")
+
+
 def _canonical_json(value: Any) -> str:
-    """Deterministic JSON. Rejects non-finite numbers and non-serializable values."""
+    """Deterministic JSON from an already-frozen or plain value."""
 
-    def _check(obj: Any) -> Any:
-        if isinstance(obj, float):
-            if not math.isfinite(obj):
-                raise ProtocolError("Payload contains non-finite number")
-            return obj
+    def _to_plain(obj: Any) -> Any:
+        if isinstance(obj, MappingProxyType):
+            return {k: _to_plain(v) for k, v in obj.items()}
+        if isinstance(obj, tuple):
+            return [_to_plain(v) for v in obj]
         if isinstance(obj, dict):
-            return {str(k): _check(v) for k, v in obj.items()}
-        if isinstance(obj, (list, tuple)):
-            return [_check(v) for v in obj]
-        if isinstance(obj, (str, int, bool)) or obj is None:
-            return obj
-        raise ProtocolError("Payload is not JSON-serializable")
+            return {k: _to_plain(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [_to_plain(v) for v in obj]
+        return obj
 
-    cleaned = _check(value)
     return json.dumps(
-        cleaned,
+        _to_plain(value),
         sort_keys=True,
         separators=(",", ":"),
         allow_nan=False,
@@ -153,9 +183,11 @@ class Message:
     message_type: MessageType
     timestamp: datetime
     authorization_status: str = "NONE"
-    payload: dict[str, Any] = field(default_factory=dict)
+    payload: Any = field(default_factory=dict)
     parent_message_id: str | None = None
     protocol_version: str = PROTOCOL_VERSION
+    # Internal canonical snapshot; set in __post_init__.
+    _canonical_payload: str = field(default="", repr=False, compare=False)
 
     def __post_init__(self):
         if self.protocol_version != PROTOCOL_VERSION:
@@ -186,8 +218,12 @@ class Message:
         if not isinstance(self.payload, dict):
             raise ProtocolError("payload must be a dictionary")
 
-        # Reject non-serializable / non-finite payloads early.
-        _canonical_json(self.payload)
+        frozen = _freeze_payload(self.payload)
+        canonical = _canonical_json(frozen)
+
+        # Replace the mutable payload with the frozen snapshot.
+        object.__setattr__(self, "payload", frozen)
+        object.__setattr__(self, "_canonical_payload", canonical)
 
         if self.authorization_status not in {
             "NONE",
@@ -210,7 +246,7 @@ class Message:
         """
         Canonical identity of the complete immutable message envelope.
 
-        Used when a message_id is repeated.
+        Includes the canonical timestamp. Used when a message_id is repeated.
         """
         return _canonical_json({
             "message_id": self.message_id,
@@ -225,16 +261,15 @@ class Message:
             "payload": self.payload,
             "parent_message_id": self.parent_message_id,
             "protocol_version": self.protocol_version,
+            "timestamp": self.timestamp.isoformat(),
         })
 
     def operation_identity(self) -> str:
         """
         Canonical identity of the logical operation.
 
-        Used when an idempotency_key is repeated.
-        Correlation ID and parent are intentionally excluded so that
-        redelivery of the same operation is recognized, while a new
-        review with a new key remains distinct.
+        Timestamp is excluded so redelivery of the same operation is
+        recognized. A new review with a new key remains distinct.
         """
         return _canonical_json({
             "project_id": self.project_id,
@@ -246,6 +281,11 @@ class Message:
             "payload": self.payload,
             "protocol_version": self.protocol_version,
         })
+
+    @property
+    def canonical_payload(self) -> str:
+        """The immutable canonical JSON snapshot of the payload."""
+        return self._canonical_payload
 
 
 @dataclass
@@ -437,7 +477,6 @@ class CollaborationProtocol:
             with self._connect() as connection:
                 connection.execute("BEGIN IMMEDIATE")
 
-                # Authoritative HALT check inside the transaction.
                 halt_row = connection.execute(
                     "SELECT value FROM control WHERE key = 'halted'"
                 ).fetchone()
@@ -531,7 +570,7 @@ class CollaborationProtocol:
                         message.message_type.value,
                         message.timestamp.isoformat(),
                         message.authorization_status,
-                        _canonical_json(message.payload),
+                        message.canonical_payload,
                         message.parent_message_id,
                         message.protocol_version,
                         envelope,

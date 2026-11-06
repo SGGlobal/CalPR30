@@ -6,6 +6,7 @@ LOCAL SYNTHETIC ONLY.
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -97,6 +98,24 @@ def test_identical_messages_recognized_as_duplicates(tmp_path):
     assert protocol.accept(msg) is False
 
 
+def test_conflicting_message_id_different_timestamp(tmp_path):
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
+
+    first = make_message(
+        timestamp=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    )
+    protocol.accept(first)
+
+    conflict = make_message(
+        message_id=first.message_id,
+        idempotency_key=first.idempotency_key,
+        timestamp=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(ProtocolError, match="Conflicting content for existing message ID"):
+        protocol.accept(conflict)
+
+
 def test_conflicting_message_id_rejected(tmp_path):
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
 
@@ -130,10 +149,6 @@ def test_conflicting_idempotency_key_rejected(tmp_path):
 
 
 def test_legitimate_repeated_operations_distinguishable(tmp_path):
-    """
-    Two reviews with different message IDs and different idempotency keys
-    are distinct operations even if they share a correlation concept.
-    """
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
 
     messages = protocol.simulate_round_trip(
@@ -149,11 +164,50 @@ def test_legitimate_repeated_operations_distinguishable(tmp_path):
     assert len(ids) == 5
 
 
-def test_invalid_json_payload_fails_before_mutation(tmp_path):
+def test_mutating_original_payload_does_not_change_identity(tmp_path):
+    """
+    Mutating the caller's nested dict after Message construction must not
+    change the message's identity or the stored payload.
+    """
     database = tmp_path / "bridge.db"
     protocol = CollaborationProtocol(database)
 
-    with pytest.raises(ProtocolError, match="non-finite|not JSON-serializable"):
+    original = {"step": "plan", "nested": {"value": 1}}
+    msg = make_message(payload=original)
+
+    identity_before = msg.envelope_identity()
+    canonical_before = msg.canonical_payload
+
+    # Mutate the original nested structure.
+    original["nested"]["value"] = 999
+    original["extra"] = "should-not-appear"
+
+    assert msg.envelope_identity() == identity_before
+    assert msg.canonical_payload == canonical_before
+
+    protocol.accept(msg)
+
+    with sqlite3.connect(database) as connection:
+        stored = connection.execute(
+            "SELECT payload_json FROM messages WHERE message_id = ?",
+            (msg.message_id,),
+        ).fetchone()[0]
+
+    assert stored == canonical_before
+    assert "999" not in stored
+    assert "should-not-appear" not in stored
+
+
+def test_non_string_keys_rejected():
+    with pytest.raises(ProtocolError, match="keys must be strings"):
+        make_message(payload={1: "bad"})
+
+
+def test_non_finite_payload_rejected(tmp_path):
+    database = tmp_path / "bridge.db"
+    CollaborationProtocol(database)
+
+    with pytest.raises(ProtocolError, match="non-finite"):
         make_message(payload={"price": float("nan")})
 
     with sqlite3.connect(database) as connection:
@@ -176,6 +230,42 @@ def test_invalid_transition_rejected(tmp_path):
         protocol.accept(complete)
 
 
+def test_sqlite_rollback_on_persistence_failure(tmp_path):
+    """
+    Force a failure after the message INSERT but before the task-state
+    write. Both must roll back. Existing historical records stay intact.
+    """
+    database = tmp_path / "bridge.db"
+    protocol = CollaborationProtocol(database)
+
+    historical = make_message(task_id="HIST", idempotency_key="hist")
+    protocol.accept(historical)
+
+    failing = make_message(task_id="NEW", idempotency_key="new")
+
+    original_execute = sqlite3.Connection.execute
+
+    def exploding_execute(self, sql, params=()):
+        if "INSERT INTO task_states" in sql:
+            raise sqlite3.OperationalError("injected failure")
+        return original_execute(self, sql, params)
+
+    with patch.object(sqlite3.Connection, "execute", exploding_execute):
+        with pytest.raises(ProtocolError, match="Persistence failed"):
+            protocol.accept(failing)
+
+    with sqlite3.connect(database) as connection:
+        messages = connection.execute(
+            "SELECT message_id FROM messages"
+        ).fetchall()
+        states = connection.execute(
+            "SELECT task_id FROM task_states"
+        ).fetchall()
+
+    assert [row[0] for row in messages] == [historical.message_id]
+    assert [row[0] for row in states] == ["HIST"]
+
+
 def test_halt_by_one_instance_blocks_another(tmp_path):
     database = tmp_path / "bridge.db"
 
@@ -184,7 +274,6 @@ def test_halt_by_one_instance_blocks_another(tmp_path):
 
     first.halt()
 
-    # Second instance must observe the authoritative HALT inside accept().
     with pytest.raises(ProtocolError, match="halted"):
         second.accept(make_message())
 
