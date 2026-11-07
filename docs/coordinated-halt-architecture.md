@@ -435,3 +435,32 @@ This checkpoint performs none of the above.
 | execution_enabled | Always False | Always False |
 | Production code | Unchanged in this commit | Unchanged in this commit |
 
+---
+
+## 13. Implemented isolated authority (Step 69E.3B.2A)
+
+**Implemented in this checkpoint (isolated only):**
+- `skippy/collaboration/coordinated_halt.py` provides `HaltStatus`, `HaltError`, and `CoordinatedHalt`.
+- API: `read_status()`, `require_not_halted()`, `activate_halt(reason)`.
+- Opens an existing SQLite authority with URI `mode=rw` / `mode=ro`. Normal construction, reads, and activation never create the database.
+- Mandatory `halt_state` transition commits under `BEGIN IMMEDIATE` before success is returned. Sequence increments once. Duplicate activation is idempotent.
+- Secondary `halt_events` writes are best-effort and occur after the mandatory commit. Audit failure does not roll back HALT.
+- Missing, corrupt, missing row, unknown state, unsupported schema, invalid sequence, and lock timeout produce UNKNOWN or `HaltError`. Fail closed.
+- No public reset/clear API. `execution_enabled` remains `False`.
+- Not integrated into AuthorizationPolicy, CollaborationProtocol, AuthorizationLifecycle, or ChiefIdentityVerifier.
+
+**Not implemented (still proposed / future):**
+- Production bootstrap.
+- Legacy HALT migration and process cutover.
+- Integration into existing components.
+- Execution fencing.
+- Coordinated enforcement across components.
+- HALT clearing or automatic recovery.
+
+**Unresolved limitations:**
+- A NOT_HALTED read is only a point-in-time observation.
+- Separate databases retain independent transaction boundaries. A shared HALT check does not make cross-database transactions atomic.
+- Already-started local operations may race with HALT activation.
+- Storage is not tamper-proof.
+- Coordinated enforcement is not complete.
+
