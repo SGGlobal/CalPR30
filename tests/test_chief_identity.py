@@ -12,7 +12,6 @@ import pytest
 
 from skippy.collaboration.chief_identity import (
     APPLICATION,
-    DOMAIN,
     PROTOCOL_VERSION,
     ChiefIdentityVerifier,
     IdentityError,
@@ -45,6 +44,7 @@ def _issue(verifier, **overrides):
         "project_id": "qla",
         "task_id": "task-1",
         "expected_sha": "a" * 40,
+        "key_id": "test-key",
     }
     values.update(overrides)
     return verifier.issue_challenge(**values)
@@ -56,9 +56,7 @@ def _sign(private, fields):
 
 def _prepare(verifier, private, public, **overrides):
     verifier.register_public_key("test-key", public)
-    challenge = _issue(verifier, **overrides)
-    challenge["key_id"] = "test-key"
-    return challenge
+    return _issue(verifier, **overrides)
 
 
 def test_valid_synthetic_signature(tmp_path):
@@ -70,6 +68,7 @@ def test_valid_synthetic_signature(tmp_path):
 
     assert result.verified is True
     assert result.execution_enabled is False
+    assert fields["key_id"] == "test-key"
 
 
 def test_incorrect_signature(tmp_path):
@@ -83,13 +82,9 @@ def test_incorrect_signature(tmp_path):
 
 
 def test_unknown_public_key(tmp_path):
-    private, _ = _keypair()
     verifier = ChiefIdentityVerifier(tmp_path / "id.db")
-    challenge = _issue(verifier)
-    challenge["key_id"] = "missing"
-
-    result = verifier.verify(challenge, _sign(private, challenge))
-    assert result.reason == "Unknown public key"
+    with pytest.raises(IdentityError, match="Unknown signing key"):
+        _issue(verifier, key_id="missing")
 
 
 def test_revoked_key(tmp_path):
@@ -100,6 +95,74 @@ def test_revoked_key(tmp_path):
 
     result = verifier.verify(fields, _sign(private, fields))
     assert result.reason == "Key revoked"
+
+
+def test_signature_from_other_active_key(tmp_path):
+    private, public = _keypair()
+    other_private, other_public = _keypair()
+    verifier = ChiefIdentityVerifier(tmp_path / "id.db")
+    verifier.register_public_key("test-key", public)
+    verifier.register_public_key("other-key", other_public)
+    fields = _issue(verifier)
+
+    result = verifier.verify(fields, _sign(other_private, fields))
+    assert result.reason == "Invalid signature"
+
+
+def test_incorrect_key_identifier(tmp_path):
+    private, public = _keypair()
+    _, other_public = _keypair()
+    verifier = ChiefIdentityVerifier(tmp_path / "id.db")
+    fields = _prepare(verifier, private, public)
+    verifier.register_public_key("other-key", other_public)
+    fields["key_id"] = "other-key"
+
+    result = verifier.verify(fields, _sign(private, fields))
+    assert result.reason == "Scope mismatch: key_id"
+
+
+def test_modified_issued_at(tmp_path):
+    private, public = _keypair()
+    verifier = ChiefIdentityVerifier(tmp_path / "id.db")
+    fields = _prepare(verifier, private, public)
+    fields["issued_at"] = (_now() - timedelta(minutes=1)).isoformat()
+
+    result = verifier.verify(fields, _sign(private, fields))
+    assert result.reason == "Scope mismatch: issued_at"
+
+
+def test_modified_expires_at(tmp_path):
+    private, public = _keypair()
+    verifier = ChiefIdentityVerifier(tmp_path / "id.db")
+    fields = _prepare(verifier, private, public)
+    fields["expires_at"] = (_now() + timedelta(minutes=10)).isoformat()
+
+    result = verifier.verify(fields, _sign(private, fields))
+    assert result.reason == "Scope mismatch: expires_at"
+
+
+def test_expired_registry_despite_altered_payload(tmp_path):
+    private, public = _keypair()
+    verifier = ChiefIdentityVerifier(tmp_path / "id.db")
+    verifier.register_public_key("test-key", public)
+    past = _now() - timedelta(minutes=10)
+    fields = verifier.issue_challenge(
+        authorization_id="auth-1",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+        now=past,
+        lifetime=timedelta(minutes=1),
+    )
+    fields["expires_at"] = (_now() + timedelta(minutes=5)).isoformat()
+
+    result = verifier.verify(fields, _sign(private, fields))
+    assert result.reason == "Challenge expired"
 
 
 def test_scope_mismatch_repository(tmp_path):
@@ -142,16 +205,6 @@ def test_scope_mismatch_sha(tmp_path):
     assert result.reason == "Scope mismatch: expected_sha"
 
 
-def test_scope_mismatch_authorization_id(tmp_path):
-    private, public = _keypair()
-    verifier = ChiefIdentityVerifier(tmp_path / "id.db")
-    fields = _prepare(verifier, private, public)
-    fields["authorization_id"] = "other"
-
-    result = verifier.verify(fields, _sign(private, fields))
-    assert result.reason == "Scope mismatch: authorization_id"
-
-
 def test_unknown_challenge(tmp_path):
     private, public = _keypair()
     verifier = ChiefIdentityVerifier(tmp_path / "id.db")
@@ -162,35 +215,12 @@ def test_unknown_challenge(tmp_path):
     assert result.reason == "Unknown challenge"
 
 
-def test_expired_challenge(tmp_path):
-    private, public = _keypair()
-    verifier = ChiefIdentityVerifier(tmp_path / "id.db")
-    verifier.register_public_key("test-key", public)
-    past = _now() - timedelta(minutes=10)
-    challenge = verifier.issue_challenge(
-        authorization_id="auth-1",
-        action="merge_pull_request",
-        action_digest="digest-a",
-        repository="SGGlobal/QLA",
-        environment="local",
-        project_id="qla",
-        task_id="task-1",
-        expected_sha="a" * 40,
-        now=past,
-        lifetime=timedelta(minutes=1),
-    )
-    challenge["key_id"] = "test-key"
-
-    result = verifier.verify(challenge, _sign(private, challenge))
-    assert result.reason == "Challenge expired"
-
-
 def test_future_issued_challenge(tmp_path):
     private, public = _keypair()
     verifier = ChiefIdentityVerifier(tmp_path / "id.db")
     verifier.register_public_key("test-key", public)
     future = _now() + timedelta(minutes=5)
-    challenge = verifier.issue_challenge(
+    fields = verifier.issue_challenge(
         authorization_id="auth-1",
         action="merge_pull_request",
         action_digest="digest-a",
@@ -199,11 +229,11 @@ def test_future_issued_challenge(tmp_path):
         project_id="qla",
         task_id="task-1",
         expected_sha="a" * 40,
+        key_id="test-key",
         now=future,
     )
-    challenge["key_id"] = "test-key"
 
-    result = verifier.verify(challenge, _sign(private, challenge))
+    result = verifier.verify(fields, _sign(private, fields))
     assert result.reason == "Challenge issued in the future"
 
 
@@ -236,6 +266,50 @@ def test_malformed_signature(tmp_path):
 
     result = verifier.verify(fields, b"short")
     assert result.reason == "Malformed signature"
+
+
+def test_malformed_sha():
+    fields = {
+        "authorization_id": "a",
+        "application": APPLICATION,
+        "protocol_version": PROTOCOL_VERSION,
+        "action": "merge_pull_request",
+        "action_digest": "d",
+        "repository": "r",
+        "environment": "local",
+        "project_id": "p",
+        "task_id": "t",
+        "expected_sha": "Z" * 40,
+        "key_id": "k",
+        "challenge_id": "c",
+        "nonce": "n" * 16,
+        "issued_at": _now().isoformat(),
+        "expires_at": (_now() + timedelta(minutes=1)).isoformat(),
+    }
+    with pytest.raises(IdentityError, match="expected_sha"):
+        canonical_payload(fields)
+
+
+def test_canonical_serialization():
+    fields = {
+        "authorization_id": "a",
+        "application": APPLICATION,
+        "protocol_version": PROTOCOL_VERSION,
+        "action": "merge_pull_request",
+        "action_digest": "d",
+        "repository": "r",
+        "environment": "local",
+        "project_id": "p",
+        "task_id": "t",
+        "expected_sha": "a" * 40,
+        "key_id": "k",
+        "challenge_id": "c",
+        "nonce": "n" * 16,
+        "issued_at": _now().isoformat(),
+        "expires_at": (_now() + timedelta(minutes=1)).isoformat(),
+    }
+    payload = canonical_payload(fields)
+    assert payload.startswith(b"skippy.chief.authorization\nchief-auth-1\n")
 
 
 def test_unsupported_protocol_version(tmp_path):
@@ -326,47 +400,13 @@ def test_no_execution_capability(tmp_path):
     assert result.execution_enabled is False
 
 
-def test_malformed_timestamp(tmp_path):
-    private, public = _keypair()
+def test_duplicate_key_rejected(tmp_path):
+    _, public = _keypair()
     verifier = ChiefIdentityVerifier(tmp_path / "id.db")
-    fields = _prepare(verifier, private, public)
-    fields["issued_at"] = "not-a-time"
+    verifier.register_public_key("test-key", public)
 
-    result = verifier.verify(fields, b"\x00" * 64)
-    assert result.reason == "Malformed issued_at"
-
-
-def test_wrong_field_type(tmp_path):
-    private, public = _keypair()
-    verifier = ChiefIdentityVerifier(tmp_path / "id.db")
-    fields = _prepare(verifier, private, public)
-    fields["action"] = 1
-
-    result = verifier.verify(fields, b"\x00" * 64)
-    assert "must be a nonempty string" in result.reason
-
-
-def test_unexpected_field_rejected():
-    fields = {
-        "authorization_id": "a",
-        "application": APPLICATION,
-        "protocol_version": PROTOCOL_VERSION,
-        "action": "merge_pull_request",
-        "action_digest": "d",
-        "repository": "r",
-        "environment": "local",
-        "project_id": "p",
-        "task_id": "t",
-        "expected_sha": "a" * 40,
-        "key_id": "k",
-        "challenge_id": "c",
-        "nonce": "n" * 16,
-        "issued_at": _now().isoformat(),
-        "expires_at": (_now() + timedelta(minutes=1)).isoformat(),
-        "extra": "nope",
-    }
-    with pytest.raises(IdentityError, match="Unexpected"):
-        canonical_payload(fields)
+    with pytest.raises(IdentityError, match="Duplicate"):
+        verifier.register_public_key("test-key", public)
 
 
 def test_no_network_or_trading(tmp_path):

@@ -22,84 +22,64 @@ Domain-separated, deterministic UTF-8:
 skippy.chief.authorization\nchief-auth-1\n<json>
 ```
 
-The JSON object contains exactly these fields, in this order:
+The JSON object contains exactly the required fields in fixed order.
+Unknown fields fail closed. `expected_sha` must be 40 hexadecimal characters.
+Timestamps must be timezone-aware ISO. Lifetime is capped at 15 minutes.
 
-- authorization_id
-- application (`skippy-ai-collaboration-bridge`)
-- protocol_version (`chief-auth-1`)
-- action
-- action_digest
-- repository
-- environment
-- project_id
-- task_id
-- expected_sha
-- key_id
-- challenge_id
+## Trusted challenge binding
+
+Challenges originate from the verifier. Each challenge stores:
+
+- authorization scope (action, digest, repository, environment, project,
+  task, expected SHA, authorization identifier)
+- intended key identifier
 - nonce
-- issued_at
-- expires_at
+- issued_at and expires_at
+- status (`open` or `consumed`)
 
-Unknown fields fail closed. A different application or protocol version
-fails closed. The domain prefix prevents cross-protocol reuse.
+Issuance requires an active registered key. The returned challenge already
+contains the trusted key identifier. Callers cannot modify the stored
+challenge after issuance.
 
-## Verification lifecycle
+Verification compares the signed payload against every trusted field,
+including `issued_at`, `expires_at`, and `key_id`. A signature over altered
+timestamps is rejected. Expiration is evaluated from the trusted registry
+timestamp, so a payload that claims a later expiration is still rejected
+when the registry challenge has expired.
 
-1. A participant proposes an action. The proposal is not an approval.
-2. The bridge builds the canonical payload, including a fresh nonce.
-3. A signature is presented. In this milestone it is synthetic.
-4. The verifier checks expiration, key identity, key status, nonce reuse,
-   and the signature over the exact bytes.
-5. On success the result is `verified=True` with `execution_enabled=False`.
-6. On failure the result is `verified=False` and the attempt is rejected.
+## Signing-key binding
 
-Sender fields, unsigned claims, and identity strings are not evidence.
+The challenge is bound to one key identifier. A signature from a different
+registered key fails. A revoked key fails. An unknown key cannot be used to
+issue a challenge. Duplicate key identifiers are rejected.
 
 ## Replay protection
 
-- Nonces are single-use and stored in SQLite.
-- Acceptance and nonce recording occur in one transaction.
-- A reused nonce is rejected, including after a verifier restart.
-- Expired challenges are rejected.
-- Revoked keys are rejected.
-- Concurrent attempts: exactly one succeeds.
-- There are no automatic retries.
+Acceptance and challenge consumption occur in one transaction. A reused
+challenge is rejected, including after a verifier restart. Concurrent
+attempts: exactly one succeeds. There are no automatic retries.
 
-## Key handling
+## Synthetic registration
 
-- Tests generate disposable Ed25519 key pairs in memory.
-- Only the public key is registered with the verifier.
-- Private keys are never written to fixtures, source, databases, logs,
-  or collaboration messages.
-- The production-facing verifier does not sign.
-- No real Chief private key is requested or stored.
+`register_public_key()` is a synthetic, test-facing configuration method.
+It does not establish authenticated Chief enrollment. It must not be
+exposed through a production collaboration interface without a separately
+reviewed trusted enrollment mechanism. Private keys are never accepted or
+persisted.
 
-## Trust boundaries
+## Trusted clock
 
-```
-Synthetic test key  -- signature -->  ChiefIdentityVerifier
-                                      |
-                                      v
-                            VerificationResult
-                            (execution_enabled=False)
-
-AI agents  -- proposals only -->  Bridge
-AI agents  -- cannot -->  enroll, approve, replace key, execute
-```
+The optional `now` argument exists for deterministic tests. Any future
+production verification entrypoint must obtain time from a trusted local
+clock. An untrusted caller must not be able to override that clock to
+revive an expired authorization.
 
 ## Human intent limitation
 
 A valid signature establishes possession of a signing key, not necessarily
 informed human consent. Future real approval capture must display the exact
 action, repository, target, and consequences through a trusted Chief-controlled
-interface. This milestone does not implement that interface. AI-generated
-approval descriptions are not trusted consent evidence.
-
-## Future enrollment
-
-Real enrollment remains a human-only, out-of-band procedure reserved for a
-later reviewed step. AI agents cannot enroll or replace the active key.
-GitHub PATs are excluded.
+interface. This milestone does not implement that interface.
 
 ## Remaining commissioning blockers
 

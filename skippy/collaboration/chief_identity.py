@@ -7,7 +7,18 @@ A valid signature establishes possession of a signing key. It does not
 establish informed human consent, and it does not enable execution.
 
 Challenges originate from this verifier. A signature is accepted only when
-it matches both the cryptographic payload and the trusted challenge scope.
+it matches the cryptographic payload and every trusted challenge field,
+including timestamps and the intended key identifier.
+
+register_public_key() is a synthetic, test-facing configuration method.
+It does not establish authenticated Chief enrollment. It must not be
+exposed through a production collaboration interface without a separately
+reviewed trusted enrollment mechanism.
+
+The optional `now` argument exists for deterministic tests. Any future
+production verification entrypoint must obtain time from a trusted local
+clock. An untrusted caller must not be able to override that clock to
+revive an expired authorization.
 
 The verifier does not provide a general-purpose signing capability.
 Private keys are never persisted by this module.
@@ -71,6 +82,10 @@ SCOPE_FIELDS = (
     "project_id",
     "task_id",
     "expected_sha",
+    "key_id",
+    "nonce",
+    "issued_at",
+    "expires_at",
 )
 
 
@@ -84,6 +99,14 @@ def _parse_timestamp(value: str, name: str) -> datetime:
     if parsed.tzinfo is None:
         raise IdentityError(f"{name} must be timezone-aware")
     return parsed
+
+
+def _valid_sha(value: str) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == SHA_LENGTH
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def canonical_payload(fields: dict) -> bytes:
@@ -120,7 +143,7 @@ def canonical_payload(fields: dict) -> bytes:
     if expires - issued > MAX_CHALLENGE_LIFETIME:
         raise IdentityError("Challenge lifetime exceeds maximum")
 
-    if len(fields["expected_sha"]) != SHA_LENGTH:
+    if not _valid_sha(fields["expected_sha"]):
         raise IdentityError("expected_sha is invalid")
     if len(fields["nonce"]) < 16:
         raise IdentityError("nonce is invalid")
@@ -176,6 +199,7 @@ class ChiefIdentityVerifier:
                     project_id TEXT NOT NULL,
                     task_id TEXT NOT NULL,
                     expected_sha TEXT NOT NULL,
+                    key_id TEXT NOT NULL,
                     issued_at TEXT NOT NULL,
                     expires_at TEXT NOT NULL,
                     status TEXT NOT NULL
@@ -188,7 +212,8 @@ class ChiefIdentityVerifier:
         Register a synthetic trusted public key.
 
         Test-facing and isolated. Does not accept a private key and does
-        not enroll an AI identity as Chief.
+        not enroll an AI identity as Chief. Duplicate key identifiers are
+        rejected. This is not authenticated Chief enrollment.
         """
 
         if not isinstance(key_id, str) or not key_id:
@@ -200,6 +225,12 @@ class ChiefIdentityVerifier:
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT key_id FROM trusted_keys WHERE key_id = ?",
+                (key_id,),
+            ).fetchone()
+            if existing is not None:
+                raise IdentityError("Duplicate key identifier")
             connection.execute(
                 """
                 INSERT INTO trusted_keys (key_id, public_key, status)
@@ -229,47 +260,60 @@ class ChiefIdentityVerifier:
         project_id: str,
         task_id: str,
         expected_sha: str,
+        key_id: str,
         now: datetime | None = None,
         lifetime: timedelta = timedelta(minutes=5),
     ) -> dict:
         """
-        Issue a trusted challenge bound to an exact authorization scope.
+        Issue a trusted challenge bound to an exact authorization scope
+        and an active signing key.
 
-        The nonce is unpredictable. The challenge is persistent.
+        The returned challenge already contains the trusted key identifier.
+        Callers cannot modify the stored challenge after issuance.
         """
 
         now = now or datetime.now(timezone.utc)
         if lifetime <= timedelta(0) or lifetime > MAX_CHALLENGE_LIFETIME:
             raise IdentityError("Invalid challenge lifetime")
 
-        challenge = {
-            "authorization_id": authorization_id,
-            "application": APPLICATION,
-            "protocol_version": PROTOCOL_VERSION,
-            "action": action,
-            "action_digest": action_digest,
-            "repository": repository,
-            "environment": environment,
-            "project_id": project_id,
-            "task_id": task_id,
-            "expected_sha": expected_sha,
-            "key_id": "pending",
-            "challenge_id": uuid.uuid4().hex,
-            "nonce": uuid.uuid4().hex,
-            "issued_at": now.isoformat(),
-            "expires_at": (now + lifetime).isoformat(),
-        }
-        canonical_payload(challenge)
-
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            key = connection.execute(
+                "SELECT status FROM trusted_keys WHERE key_id = ?",
+                (key_id,),
+            ).fetchone()
+            if key is None:
+                raise IdentityError("Unknown signing key")
+            if key[0] != "active":
+                raise IdentityError("Signing key is not active")
+
+            challenge = {
+                "authorization_id": authorization_id,
+                "application": APPLICATION,
+                "protocol_version": PROTOCOL_VERSION,
+                "action": action,
+                "action_digest": action_digest,
+                "repository": repository,
+                "environment": environment,
+                "project_id": project_id,
+                "task_id": task_id,
+                "expected_sha": expected_sha,
+                "key_id": key_id,
+                "challenge_id": uuid.uuid4().hex,
+                "nonce": uuid.uuid4().hex,
+                "issued_at": now.isoformat(),
+                "expires_at": (now + lifetime).isoformat(),
+            }
+            canonical_payload(challenge)
+
             connection.execute(
                 """
                 INSERT INTO challenges (
                     challenge_id, nonce, authorization_id, action,
                     action_digest, repository, environment, project_id,
-                    task_id, expected_sha, issued_at, expires_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
+                    task_id, expected_sha, key_id, issued_at, expires_at,
+                    status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open')
                 """,
                 (
                     challenge["challenge_id"],
@@ -282,6 +326,7 @@ class ChiefIdentityVerifier:
                     project_id,
                     task_id,
                     expected_sha,
+                    key_id,
                     challenge["issued_at"],
                     challenge["expires_at"],
                 ),
@@ -297,7 +342,12 @@ class ChiefIdentityVerifier:
         """
         Verify a signature against the trusted challenge scope.
 
+        Timestamps and key identifier are compared against the registry.
+        Expiration is evaluated from the trusted registry timestamp.
         Always returns execution_enabled=False.
+
+        The `now` argument is for tests. Production verification must use
+        a trusted local clock.
         """
 
         now = now or datetime.now(timezone.utc)
@@ -310,13 +360,6 @@ class ChiefIdentityVerifier:
         if not isinstance(signature, bytes) or len(signature) != 64:
             return VerificationResult(False, "Malformed signature")
 
-        issued = datetime.fromisoformat(fields["issued_at"])
-        expires = datetime.fromisoformat(fields["expires_at"])
-        if issued > now:
-            return VerificationResult(False, "Challenge issued in the future")
-        if now >= expires:
-            return VerificationResult(False, "Challenge expired")
-
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
 
@@ -324,7 +367,7 @@ class ChiefIdentityVerifier:
                 """
                 SELECT authorization_id, action, action_digest, repository,
                        environment, project_id, task_id, expected_sha,
-                       nonce, status
+                       key_id, nonce, issued_at, expires_at, status
                 FROM challenges
                 WHERE challenge_id = ?
                 """,
@@ -343,12 +386,23 @@ class ChiefIdentityVerifier:
                 project_id,
                 task_id,
                 expected_sha,
+                key_id,
                 nonce,
+                issued_at,
+                expires_at,
                 status,
             ) = challenge
 
             if status != "open":
                 return VerificationResult(False, "Challenge already consumed")
+
+            trusted_expires = datetime.fromisoformat(expires_at)
+            if now >= trusted_expires:
+                return VerificationResult(False, "Challenge expired")
+
+            trusted_issued = datetime.fromisoformat(issued_at)
+            if trusted_issued > now:
+                return VerificationResult(False, "Challenge issued in the future")
 
             scope = {
                 "authorization_id": authorization_id,
@@ -359,18 +413,20 @@ class ChiefIdentityVerifier:
                 "project_id": project_id,
                 "task_id": task_id,
                 "expected_sha": expected_sha,
+                "key_id": key_id,
+                "nonce": nonce,
+                "issued_at": issued_at,
+                "expires_at": expires_at,
             }
             for name in SCOPE_FIELDS:
                 if fields[name] != scope[name]:
                     return VerificationResult(
                         False, f"Scope mismatch: {name}"
                     )
-            if fields["nonce"] != nonce:
-                return VerificationResult(False, "Nonce does not match challenge")
 
             key = connection.execute(
                 "SELECT public_key, status FROM trusted_keys WHERE key_id = ?",
-                (fields["key_id"],),
+                (key_id,),
             ).fetchone()
 
             if key is None:
