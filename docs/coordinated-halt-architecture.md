@@ -464,3 +464,14 @@ This checkpoint performs none of the above.
 - Storage is not tamper-proof.
 - Coordinated enforcement is not complete.
 
+---
+
+## 14. Isolated authority hardening (Step 69E.3B.2A.1)
+
+**Implemented:**
+- `activate_halt()` maps connection, configuration, transaction, validation, update, and commit failures to `HaltError`. Uncontrolled `sqlite3` exceptions are not exposed on the public activation path. Success is reported only after the mandatory commit.
+- State consistency: `NOT_HALTED` requires `sequence == 0`; `HALTED` requires `sequence >= 1`. Incompatible combinations return `UNKNOWN`. No repair or reset.
+- Reason persistence uses a controlled allowlist (`operator`, `policy`, `protocol`, `migration`, `coordination`, `test`, `unspecified`). Arbitrary caller text, including credential-bearing strings, is never stored.
+- Best-effort audit events supported: `halt_requested`, `halt_activated`, `duplicate_halt_request`, `halt_read_failure`, `coordination_failure`. An unavailable authority cannot be assumed to persist its own read-failure. Mandatory HALT state does not depend on secondary audit.
+
+**Still not implemented:** production bootstrap, legacy migration, component integration, execution fencing, HALT clearing.

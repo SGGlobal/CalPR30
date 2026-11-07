@@ -20,6 +20,16 @@ roll back a committed HALT.
 
 A successful read of NOT_HALTED is only a point-in-time observation.
 Separate databases retain independent transaction boundaries.
+
+Audit events currently supported (best-effort, secondary):
+- halt_requested
+- halt_activated
+- duplicate_halt_request
+- halt_read_failure
+- coordination_failure
+
+An unavailable authority cannot always persist its own read-failure event.
+The mandatory HALT state never depends on secondary audit persistence.
 """
 
 from __future__ import annotations
@@ -31,8 +41,19 @@ from enum import Enum
 from pathlib import Path
 
 SUPPORTED_SCHEMA_VERSION = "1"
-MAX_REASON_LENGTH = 128
 LOCK_TIMEOUT_SECONDS = 5.0
+
+ALLOWED_REASON_CODES = frozenset(
+    {
+        "operator",
+        "policy",
+        "protocol",
+        "migration",
+        "coordination",
+        "test",
+        "unspecified",
+    }
+)
 
 
 class HaltStatus(str, Enum):
@@ -76,10 +97,13 @@ class CoordinatedHalt:
                 connection.execute("BEGIN")
                 status, sequence = self._read_validated(connection)
                 connection.rollback()
-                return status, sequence
             finally:
                 connection.close()
+            if status is HaltStatus.UNKNOWN:
+                self._audit_best_effort("halt_read_failure", None, "unspecified")
+            return status, sequence
         except Exception:
+            self._audit_best_effort("halt_read_failure", None, "unspecified")
             return HaltStatus.UNKNOWN, None
 
     def require_not_halted(self) -> None:
@@ -103,19 +127,22 @@ class CoordinatedHalt:
         Raises HaltError if the write cannot be committed.
         Never creates a missing authority. Never clears HALT.
         Never grants execution permission.
+        Public API raises only HaltError for expected persistence failures.
         """
 
         if not self.database_path.is_file():
             raise HaltError("Authority database missing")
 
-        normalized = self._normalize_reason(reason)
+        code = self._reason_code(reason)
+        self._audit_best_effort("halt_requested", None, code)
 
-        connection = self._connect(readonly=False)
+        connection = None
         try:
+            connection = self._connect(readonly=False)
             connection.execute("BEGIN IMMEDIATE")
             status, sequence = self._read_validated(connection)
             if status is HaltStatus.UNKNOWN or sequence is None:
-                connection.rollback()
+                self._rollback(connection)
                 raise HaltError("Authority state cannot be trusted")
             if status is HaltStatus.HALTED:
                 connection.commit()
@@ -124,43 +151,45 @@ class CoordinatedHalt:
             elif status is HaltStatus.NOT_HALTED:
                 committed_sequence = sequence + 1
                 now = datetime.now(timezone.utc).isoformat()
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE halt_state
                     SET state = ?, sequence = ?, updated_at = ?, reason = ?
-                    WHERE singleton = 1 AND state = ?
+                    WHERE singleton = 1 AND state = ? AND sequence = 0
                     """,
                     (
                         HaltStatus.HALTED.value,
                         committed_sequence,
                         now,
-                        normalized,
+                        code,
                         HaltStatus.NOT_HALTED.value,
                     ),
                 )
-                if connection.total_changes != 1:
-                    connection.rollback()
+                if cursor.rowcount != 1:
+                    self._rollback(connection)
                     raise HaltError("HALT transition did not apply")
                 connection.commit()
                 duplicate = False
             else:
-                connection.rollback()
+                self._rollback(connection)
                 raise HaltError("Unexpected HALT state")
         except HaltError:
             raise
-        except sqlite3.Error as exc:
-            try:
-                connection.rollback()
-            except sqlite3.Error:
-                pass
+        except Exception as exc:
+            self._rollback(connection)
+            self._audit_best_effort("coordination_failure", None, "unspecified")
             raise HaltError("HALT activation failed") from exc
         finally:
-            connection.close()
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
 
         self._audit_best_effort(
             "duplicate_halt_request" if duplicate else "halt_activated",
             committed_sequence,
-            normalized,
+            code,
         )
         return committed_sequence
 
@@ -169,6 +198,8 @@ class CoordinatedHalt:
         Open the existing authority database.
 
         Uses SQLite URI mode=rw or mode=ro so a missing file is never created.
+        Configuration failures propagate to the caller, which maps them to
+        HaltError on the public activation path.
         """
 
         if not self.database_path.is_file():
@@ -202,33 +233,49 @@ class CoordinatedHalt:
             return HaltStatus.UNKNOWN, None
 
         state, sequence = row
-        if state not in (HaltStatus.NOT_HALTED.value, HaltStatus.HALTED.value):
+        if not isinstance(sequence, int):
             return HaltStatus.UNKNOWN, None
-        if not isinstance(sequence, int) or sequence < 0:
-            return HaltStatus.UNKNOWN, None
-        return HaltStatus(state), sequence
+        if state == HaltStatus.NOT_HALTED.value:
+            if sequence != 0:
+                return HaltStatus.UNKNOWN, None
+            return HaltStatus.NOT_HALTED, sequence
+        if state == HaltStatus.HALTED.value:
+            if sequence < 1:
+                return HaltStatus.UNKNOWN, None
+            return HaltStatus.HALTED, sequence
+        return HaltStatus.UNKNOWN, None
 
-    def _normalize_reason(self, reason: str) -> str:
+    def _reason_code(self, reason: str) -> str:
+        """
+        Map caller input to a controlled reason code.
+
+        Arbitrary free-form text, including credential-bearing strings, is
+        never persisted. Unknown or malformed input becomes 'unspecified'.
+        """
+
         if not isinstance(reason, str):
             return "unspecified"
-        cleaned = "".join(ch for ch in reason if ch.isprintable())
-        cleaned = cleaned.strip()
-        if not cleaned:
-            return "unspecified"
-        if len(cleaned) > MAX_REASON_LENGTH:
-            cleaned = cleaned[:MAX_REASON_LENGTH]
-        return cleaned
+        candidate = reason.strip()
+        if candidate in ALLOWED_REASON_CODES:
+            return candidate
+        return "unspecified"
 
     def _audit_best_effort(
         self, event_type: str, sequence: int | None, detail: str
     ) -> None:
         """
         Best-effort secondary audit. Never raises. Never rolls back HALT.
+
+        detail must already be a controlled reason code. If the authority
+        cannot be opened, the event is dropped. An unavailable authority
+        cannot be assumed to persist its own failure event.
         """
 
         try:
             if not self.database_path.is_file():
                 return
+            if detail not in ALLOWED_REASON_CODES:
+                detail = "unspecified"
             connection = self._connect(readonly=False)
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -249,5 +296,14 @@ class CoordinatedHalt:
                 connection.commit()
             finally:
                 connection.close()
+        except Exception:
+            return
+
+    @staticmethod
+    def _rollback(connection: sqlite3.Connection | None) -> None:
+        if connection is None:
+            return
+        try:
+            connection.rollback()
         except Exception:
             return

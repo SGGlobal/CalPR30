@@ -156,7 +156,8 @@ def test_concurrent_thread_activation(tmp_path):
     for thread in threads:
         thread.start()
     for thread in threads:
-        thread.join()
+        thread.join(timeout=30)
+        assert not thread.is_alive()
 
     assert not errors
     assert results
@@ -324,21 +325,6 @@ def test_failed_mandatory_transaction(tmp_path, monkeypatch):
 
     real_connect = sqlite3.connect
 
-    def failing_connect(target, *args, **kwargs):
-        connection = real_connect(target, *args, **kwargs)
-        original_execute = connection.execute
-
-        def failing_execute(sql, *a, **kw):
-            if isinstance(sql, str) and "UPDATE halt_state" in sql:
-                raise sqlite3.OperationalError("forced mandatory failure")
-            return original_execute(sql, *a, **kw)
-
-        # sqlite3.Connection.execute is read-only; wrap via a proxy method
-        # by replacing the connection object used by CoordinatedHalt._connect.
-        connection.execute = failing_execute  # may fail; handled below
-        return connection
-
-    # Connection.execute cannot be assigned. Inject via _connect instead.
     def failing_open(self, readonly=False):
         connection = real_connect(
             self.database_path.resolve().as_uri()
@@ -364,7 +350,59 @@ def test_failed_mandatory_transaction(tmp_path, monkeypatch):
 
     monkeypatch.setattr(CoordinatedHalt, "_connect", failing_open)
     with pytest.raises(HaltError):
-        CoordinatedHalt(database).activate_halt("fail")
+        CoordinatedHalt(database).activate_halt("operator")
+    monkeypatch.undo()
+    status, sequence = CoordinatedHalt(database).read_status()
+    assert status is HaltStatus.NOT_HALTED
+    assert sequence == 0
+
+
+def test_connection_failure_raises_halt_error(tmp_path, monkeypatch):
+    database = tmp_path / "halt.db"
+    _init_authority(database)
+
+    def fail_connect(self, readonly=False):
+        raise sqlite3.OperationalError("cannot open")
+
+    monkeypatch.setattr(CoordinatedHalt, "_connect", fail_connect)
+    with pytest.raises(HaltError):
+        CoordinatedHalt(database).activate_halt("operator")
+    monkeypatch.undo()
+    status, sequence = CoordinatedHalt(database).read_status()
+    assert status is HaltStatus.NOT_HALTED
+    assert sequence == 0
+
+
+def test_configuration_failure_raises_halt_error(tmp_path, monkeypatch):
+    database = tmp_path / "halt.db"
+    _init_authority(database)
+
+    real_connect = sqlite3.connect
+
+    def fail_pragma(self, readonly=False):
+        connection = real_connect(
+            self.database_path.resolve().as_uri() + "?mode=rw",
+            uri=True,
+            timeout=5.0,
+        )
+        original_execute = connection.execute
+
+        class Proxy:
+            def execute(self, sql, *a, **kw):
+                if isinstance(sql, str) and sql.startswith("PRAGMA"):
+                    raise sqlite3.OperationalError("pragma failed")
+                return original_execute(sql, *a, **kw)
+
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+        proxy = Proxy()
+        proxy.execute("PRAGMA synchronous=FULL")
+        return proxy
+
+    monkeypatch.setattr(CoordinatedHalt, "_connect", fail_pragma)
+    with pytest.raises(HaltError):
+        CoordinatedHalt(database).activate_halt("operator")
     monkeypatch.undo()
     status, sequence = CoordinatedHalt(database).read_status()
     assert status is HaltStatus.NOT_HALTED
@@ -429,14 +467,112 @@ def test_database_path_handling(tmp_path):
     assert sequence == 1
 
 
-def test_reason_is_normalized(tmp_path):
+def test_reason_codes_do_not_persist_credentials(tmp_path):
     database = tmp_path / "halt.db"
     _init_authority(database)
-    halt = CoordinatedHalt(database)
-    halt.activate_halt("x" * 500)
+    secret = "password=hunter2 api_key=sk-test signature=abcdef"
+    CoordinatedHalt(database).activate_halt(secret)
     with sqlite3.connect(database) as connection:
         reason = connection.execute(
             "SELECT reason FROM halt_state WHERE singleton = 1"
         ).fetchone()[0]
-    assert len(reason) <= 128
-    assert "BEGIN" not in reason
+        details = [
+            row[0]
+            for row in connection.execute("SELECT detail FROM halt_events")
+        ]
+    assert reason == "unspecified"
+    assert secret not in reason
+    assert all(secret not in detail for detail in details)
+    assert "hunter2" not in reason
+    assert "sk-test" not in " ".join(details)
+
+
+def test_allowed_reason_code_is_persisted(tmp_path):
+    database = tmp_path / "halt.db"
+    _init_authority(database)
+    CoordinatedHalt(database).activate_halt("operator")
+    with sqlite3.connect(database) as connection:
+        reason = connection.execute(
+            "SELECT reason FROM halt_state WHERE singleton = 1"
+        ).fetchone()[0]
+    assert reason == "operator"
+
+
+def test_not_halted_with_positive_sequence_is_unknown(tmp_path):
+    database = tmp_path / "halt.db"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE halt_state (
+                singleton INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                reason TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1')"
+        )
+        connection.execute(
+            """
+            INSERT INTO halt_state (singleton, state, sequence, updated_at, reason)
+            VALUES (1, 'NOT_HALTED', 3, '2026-01-01T00:00:00+00:00', 'bad')
+            """
+        )
+    status, sequence = CoordinatedHalt(database).read_status()
+    assert status is HaltStatus.UNKNOWN
+    assert sequence is None
+    with pytest.raises(HaltError):
+        CoordinatedHalt(database).activate_halt("operator")
+
+
+def test_halted_with_zero_sequence_is_unknown(tmp_path):
+    database = tmp_path / "halt.db"
+    database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE halt_state (
+                singleton INTEGER PRIMARY KEY,
+                state TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                updated_at TEXT NOT NULL,
+                reason TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', '1')"
+        )
+        connection.execute(
+            """
+            INSERT INTO halt_state (singleton, state, sequence, updated_at, reason)
+            VALUES (1, 'HALTED', 0, '2026-01-01T00:00:00+00:00', 'bad')
+            """
+        )
+    status, sequence = CoordinatedHalt(database).read_status()
+    assert status is HaltStatus.UNKNOWN
+    assert sequence is None
+
+
+def test_existing_halted_persistence(tmp_path):
+    database = tmp_path / "halt.db"
+    _init_authority(database, state="HALTED", sequence=4)
+    halt = CoordinatedHalt(database)
+    status, sequence = halt.read_status()
+    assert status is HaltStatus.HALTED
+    assert sequence == 4
+    again = halt.activate_halt("operator")
+    assert again == 4
+    status, sequence = CoordinatedHalt(database).read_status()
+    assert status is HaltStatus.HALTED
+    assert sequence == 4
