@@ -362,3 +362,128 @@ def test_no_protected_execution_capability(tmp_path):
     assert result.execution_enabled is False
     assert not hasattr(env["gate"], "submit_order")
     assert not hasattr(env["gate"], "deploy")
+
+
+class _RaisingGate:
+    def __init__(self, policy, protocol, message="secret-token-should-not-leak"):
+        self.policy = policy
+        self.protocol = protocol
+        self.message = message
+
+    def check(self):
+        raise RuntimeError(self.message)
+
+
+class _BadResultGate:
+    def __init__(self, policy, protocol, result):
+        self.policy = policy
+        self.protocol = protocol
+        self.result = result
+
+    def check(self):
+        return self.result
+
+
+def test_gate_exception_rejects_without_consuming_challenge(tmp_path):
+    env = _setup(tmp_path)
+    lifecycle = AuthorizationLifecycle(
+        env["verifier"],
+        env["policy"],
+        env["protocol"],
+        coordinated_gate=_RaisingGate(env["policy"], env["protocol"]),
+    )
+
+    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is False
+    assert result.identity_verified is False
+    assert result.execution_enabled is False
+    assert result.reason == "Coordinated gate evaluation failed"
+    assert "secret-token" not in result.reason
+    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
+    assert env["policy"].stored_state("auth-1") == "PENDING"
+
+
+def test_invalid_gate_result_rejects(tmp_path):
+    env = _setup(tmp_path)
+    lifecycle = AuthorizationLifecycle(
+        env["verifier"],
+        env["policy"],
+        env["protocol"],
+        coordinated_gate=_BadResultGate(env["policy"], env["protocol"], {"allowed": True}),
+    )
+
+    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is False
+    assert result.execution_enabled is False
+    assert result.reason == "Coordinated gate result invalid"
+    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
+
+
+def test_component_mismatch_rejected(tmp_path):
+    env = _setup(tmp_path)
+    other_policy = AuthorizationPolicy(tmp_path / "other-auth.db")
+    mismatched = CoordinatedHaltGate(env["coordinated"], other_policy, env["protocol"])
+
+    with pytest.raises(ValueError, match="authorization policy mismatch"):
+        AuthorizationLifecycle(
+            env["verifier"],
+            env["policy"],
+            env["protocol"],
+            coordinated_gate=mismatched,
+        )
+
+    other_protocol = CollaborationProtocol(tmp_path / "other-bridge.db")
+    mismatched_protocol = CoordinatedHaltGate(env["coordinated"], env["policy"], other_protocol)
+    with pytest.raises(ValueError, match="collaboration protocol mismatch"):
+        AuthorizationLifecycle(
+            env["verifier"],
+            env["policy"],
+            env["protocol"],
+            coordinated_gate=mismatched_protocol,
+        )
+
+
+def test_aligned_components_accepted(tmp_path):
+    env = _setup(tmp_path)
+    assert env["lifecycle"].coordinated_gate.policy is env["policy"]
+    assert env["lifecycle"].coordinated_gate.protocol is env["protocol"]
+    result = env["lifecycle"].evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is True
+    assert result.execution_enabled is False
+
+
+def test_default_construction_unchanged(tmp_path):
+    env = _setup(tmp_path)
+    lifecycle = AuthorizationLifecycle(env["verifier"], env["policy"], env["protocol"])
+    assert lifecycle.coordinated_gate is None
+    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is True
+    assert result.execution_enabled is False
+
+
+def test_lifecycle_result_execution_disabled_cannot_be_overridden():
+    from skippy.collaboration.authorization_lifecycle import LifecycleResult
+
+    result = LifecycleResult(False, "rejected", False, None)
+    assert result.execution_enabled is False
+    with pytest.raises(TypeError):
+        LifecycleResult(False, "rejected", False, None, execution_enabled=True)
+    with pytest.raises(Exception):
+        result.execution_enabled = True
+    assert result.execution_enabled is False
+
+
+def test_all_outcomes_report_execution_disabled(tmp_path):
+    env = _setup(tmp_path)
+    accepted = env["lifecycle"].evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert accepted.accepted is True
+    assert accepted.execution_enabled is False
+
+    halted_dir = tmp_path / "halted"
+    halted_dir.mkdir()
+    halted = _setup(halted_dir, coordinated_state="HALTED")
+    rejected = halted["lifecycle"].evaluate(
+        halted["challenge"], _sign(halted["private"], halted["challenge"])
+    )
+    assert rejected.accepted is False
+    assert rejected.execution_enabled is False

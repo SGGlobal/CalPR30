@@ -2,6 +2,8 @@
 
 **Status:** Isolated, opt-in integration checkpoint. Not a production cutover. Not production-ready.
 
+Hardening (Step 69E.3B.2C.1A): unexpected gate exceptions become controlled rejections and do not consume challenges. The lifecycle and gate must reference the same policy and protocol instances. `LifecycleResult.execution_enabled` cannot be overridden.
+
 ## Integration architecture
 
 ```

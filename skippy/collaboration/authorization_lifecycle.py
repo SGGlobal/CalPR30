@@ -30,7 +30,7 @@ remain outside it. This is not a production cutover.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from skippy.collaboration.authorization import (
@@ -43,11 +43,19 @@ from skippy.collaboration.protocol import CollaborationProtocol
 
 @dataclass(frozen=True)
 class LifecycleResult:
+    """
+    Synthetic evaluation outcome.
+
+    execution_enabled is not a constructor argument. It is fixed False
+    and cannot be overridden during normal construction. The frozen
+    dataclass also prevents later assignment.
+    """
+
     accepted: bool
     reason: str
     identity_verified: bool
     policy_state: str | None
-    execution_enabled: bool = False
+    execution_enabled: bool = field(default=False, init=False)
 
 
 class AuthorizationLifecycle:
@@ -69,6 +77,8 @@ class AuthorizationLifecycle:
         self.policy = policy
         self.protocol = protocol
         # None preserves existing default behavior.
+        if coordinated_gate is not None:
+            self._require_aligned_gate(coordinated_gate)
         self.coordinated_gate = coordinated_gate
 
     def evaluate(
@@ -116,17 +126,11 @@ class AuthorizationLifecycle:
                 )
 
         # Opt-in only. Runs before challenge consumption and policy evaluation.
-        # A failed gate is never converted into permission to proceed.
+        # Unexpected failures reject without consuming the challenge.
         if self.coordinated_gate is not None:
-            gate = self.coordinated_gate.check()
-            if not gate.allowed or gate.execution_enabled:
-                self._audit(auth_id, f"Coordinated gate rejected: {gate.reason}")
-                return LifecycleResult(
-                    False,
-                    gate.reason,
-                    False,
-                    None,
-                )
+            rejection = self._evaluate_gate(auth_id)
+            if rejection is not None:
+                return rejection
 
         if self.protocol.is_halted:
             self._audit(auth_id, "Protocol is halted")
@@ -184,6 +188,57 @@ class AuthorizationLifecycle:
             True,
             AuthorizationState.PENDING.value,
         )
+
+    def _require_aligned_gate(self, gate) -> None:
+        """Reject a gate bound to different policy or protocol instances."""
+        if getattr(gate, "policy", None) is not self.policy:
+            raise ValueError("Coordinated gate authorization policy mismatch")
+        if getattr(gate, "protocol", None) is not self.protocol:
+            raise ValueError("Coordinated gate collaboration protocol mismatch")
+
+    def _gate_result_valid(self, gate) -> bool:
+        """Reject malformed results. Do not treat them as permission."""
+        from skippy.collaboration.coordinated_halt_gate import GateResult
+
+        if not isinstance(gate, GateResult):
+            return False
+        if not isinstance(gate.allowed, bool):
+            return False
+        if gate.execution_enabled is not False:
+            return False
+        if not isinstance(gate.reason, str) or not gate.reason:
+            return False
+        return True
+
+    def _evaluate_gate(self, auth_id: str) -> LifecycleResult | None:
+        """
+        Run the opt-in gate.
+
+        Returns a rejection result, or None when the gate allows evaluation.
+        Never exposes exception details. Never consumes a challenge.
+        """
+
+        try:
+            self._require_aligned_gate(self.coordinated_gate)
+            gate = self.coordinated_gate.check()
+        except Exception:
+            self._audit(auth_id, "Coordinated gate rejected: evaluation failed")
+            return LifecycleResult(
+                False,
+                "Coordinated gate evaluation failed",
+                False,
+                None,
+            )
+
+        if not self._gate_result_valid(gate) or not gate.allowed:
+            reason = (
+                gate.reason
+                if self._gate_result_valid(gate)
+                else "Coordinated gate result invalid"
+            )
+            self._audit(auth_id, f"Coordinated gate rejected: {reason}")
+            return LifecycleResult(False, reason, False, None)
+        return None
 
     def _safe_stored_state(self, authorization_id: str) -> str | None:
         """Query stored state only after identifier validation."""
