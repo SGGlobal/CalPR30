@@ -355,6 +355,11 @@ class AuthorizationPolicy:
         """Read-only view of the established guard, if any."""
         return self._coordinated_guard
 
+    @property
+    def coordinated_enforcement_required(self) -> bool:
+        """True after opt-in. Does not itself prove the guard is still valid."""
+        return self._coordinated_enforcement_required
+
     def _guard_rejection(self) -> str | None:
         """
         Run the opt-in guard before any local write lock.

@@ -116,6 +116,8 @@ def _setup(tmp_path):
             """
         )
     gate = CoordinatedHaltGate(coordinated, policy, protocol)
+    policy.require_coordinated_guard(gate)
+    protocol.require_coordinated_guard(gate)
     bridge = AuthorizationLifecycle(verifier, policy, protocol, coordinated_gate=gate)
     return bridge, private, challenge, policy, protocol, verifier
 

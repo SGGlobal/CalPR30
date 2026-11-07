@@ -29,7 +29,7 @@ Failure raises `ProtocolError("Work admission rejected")`. An orchestrator const
 
 ## Lifecycle
 
-`AuthorizationLifecycle.evaluate()` requires the originally injected gate. Construction without a gate rejects evaluation. Replacing the gate reference after construction rejects evaluation. Alignment, result consistency, and successful evaluation are required before challenge consumption or policy evaluation.
+`AuthorizationLifecycle.evaluate()` requires the originally injected genuine `CoordinatedHaltGate`. Arbitrary substitutes, subclasses, and replaced `check` methods are rejected. The policy and protocol must have explicitly bound that same guard. Configuration drift in authority path, database paths, migration settings, or component identity is rejected. Construction without a gate rejects evaluation. Evaluation does not bind an ungated component. Alignment, result consistency, and a successful evaluation are required before challenge consumption or policy evaluation.
 
 Rejection does not consume the identity challenge and does not advance authorization state. A successful result remains synthetic. `execution_enabled` stays false.
 

@@ -76,9 +76,12 @@ class AuthorizationLifecycle:
         self.verifier = verifier
         self.policy = policy
         self.protocol = protocol
-        # Work evaluation requires this exact gate. None rejects admission.
+        # Work evaluation requires this exact genuine gate. None rejects.
         if coordinated_gate is not None:
             self._require_aligned_gate(coordinated_gate)
+            self._admission_snapshot = self._snapshot_gate(coordinated_gate)
+        else:
+            self._admission_snapshot = None
         self.coordinated_gate = coordinated_gate
         self._admission_gate = coordinated_gate
 
@@ -126,14 +129,12 @@ class AuthorizationLifecycle:
                     False, f"Malformed field: {key}", False, None
                 )
 
-        # Work admission requires the originally bound gate. A missing,
-        # replaced, or failed gate rejects before challenge consumption.
-        if (
-            self._admission_gate is None
-            or self.coordinated_gate is not self._admission_gate
-        ):
-            self._audit(auth_id, "Work admission rejected")
-            return LifecycleResult(False, "Work admission rejected", False, None)
+        # Work admission requires the originally bound genuine gate, aligned
+        # component enforcement, and a successful current evaluation.
+        binding = self._binding_rejection()
+        if binding is not None:
+            self._audit(auth_id, binding)
+            return LifecycleResult(False, binding, False, None)
         rejection = self._evaluate_gate(auth_id)
         if rejection is not None:
             return rejection
@@ -196,11 +197,84 @@ class AuthorizationLifecycle:
         )
 
     def _require_aligned_gate(self, gate) -> None:
-        """Reject a gate bound to different policy or protocol instances."""
-        if getattr(gate, "policy", None) is not self.policy:
+        """
+        Require a genuine CoordinatedHaltGate aligned to these components.
+
+        Arbitrary objects with compatible attributes are rejected.
+        Subclasses and replaced check methods are rejected.
+        """
+
+        from skippy.collaboration.coordinated_halt_gate import CoordinatedHaltGate
+
+        if type(gate) is not CoordinatedHaltGate:
+            raise ValueError("Coordinated gate must be a CoordinatedHaltGate")
+        if getattr(gate.check, "__func__", None) is not CoordinatedHaltGate.check:
+            raise ValueError("Coordinated gate method was replaced")
+        if gate.policy is not self.policy:
             raise ValueError("Coordinated gate authorization policy mismatch")
-        if getattr(gate, "protocol", None) is not self.protocol:
+        if gate.protocol is not self.protocol:
             raise ValueError("Coordinated gate collaboration protocol mismatch")
+
+    def _snapshot_gate(self, gate) -> dict:
+        from pathlib import Path
+
+        return {
+            "guard": gate,
+            "policy": gate.policy,
+            "protocol": gate.protocol,
+            "policy_path": Path(gate.policy.database_path),
+            "protocol_path": Path(gate.protocol.database_path),
+            "coordinated_path": Path(gate.coordinated_path),
+            "absent_legacy_policy": gate.absent_legacy_policy,
+            "omitted_source_policy": gate.omitted_source_policy,
+        }
+
+    def _binding_rejection(self) -> str | None:
+        """
+        Re-verify original identity, component binding, and configuration.
+
+        Does not bind an ungated component. Does not expose exception details.
+        """
+
+        from pathlib import Path
+        from skippy.collaboration.coordinated_halt_gate import CoordinatedHaltGate
+
+        gate = self.coordinated_gate
+        snapshot = self._admission_snapshot
+        if gate is None or snapshot is None or gate is not self._admission_gate:
+            return "Work admission rejected"
+        try:
+            if type(gate) is not CoordinatedHaltGate:
+                return "Work admission rejected"
+            if getattr(gate.check, "__func__", None) is not CoordinatedHaltGate.check:
+                return "Work admission rejected"
+            if gate is not snapshot["guard"]:
+                return "Work admission rejected"
+            if gate.policy is not self.policy or gate.policy is not snapshot["policy"]:
+                return "Work admission rejected"
+            if gate.protocol is not self.protocol or gate.protocol is not snapshot["protocol"]:
+                return "Work admission rejected"
+            if not self.policy.coordinated_enforcement_required:
+                return "Work admission rejected"
+            if not self.protocol.coordinated_enforcement_required:
+                return "Work admission rejected"
+            if self.policy.coordinated_guard is not gate:
+                return "Work admission rejected"
+            if self.protocol.coordinated_guard is not gate:
+                return "Work admission rejected"
+            if Path(gate.policy.database_path) != snapshot["policy_path"]:
+                return "Work admission rejected"
+            if Path(gate.protocol.database_path) != snapshot["protocol_path"]:
+                return "Work admission rejected"
+            if Path(gate.coordinated_path) != snapshot["coordinated_path"]:
+                return "Work admission rejected"
+            if gate.absent_legacy_policy != snapshot["absent_legacy_policy"]:
+                return "Work admission rejected"
+            if gate.omitted_source_policy != snapshot["omitted_source_policy"]:
+                return "Work admission rejected"
+            return None
+        except Exception:
+            return "Work admission rejected"
 
     def _inspect_gate_result(self, gate) -> tuple[bool, bool, str]:
         """

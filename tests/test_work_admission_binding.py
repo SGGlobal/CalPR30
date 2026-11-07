@@ -131,6 +131,8 @@ def _lifecycle(tmp_path, state="NOT_HALTED"):
         key_id="test-key",
     )
     gate = CoordinatedHaltGate(coordinated, policy, protocol)
+    policy.require_coordinated_guard(gate)
+    protocol.require_coordinated_guard(gate)
     lifecycle = AuthorizationLifecycle(verifier, policy, protocol, coordinated_gate=gate)
     return {
         "private": private,
@@ -348,3 +350,107 @@ def test_execution_disabled_throughout(tmp_path):
     result = env["lifecycle"].evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
     assert result.execution_enabled is False
     assert env["gate"].execution_enabled is False
+
+
+def test_fabricated_gate_cannot_authorize_lifecycle(tmp_path):
+    env = _lifecycle(tmp_path)
+
+    class _Fake:
+        def __init__(self):
+            self.policy = env["policy"]
+            self.protocol = env["protocol"]
+
+        def check(self):
+            return GateResult(True, "fabricated", "NOT_HALTED", True, False, False)
+
+    with pytest.raises(ValueError, match="must be a CoordinatedHaltGate"):
+        AuthorizationLifecycle(
+            env["verifier"], env["policy"], env["protocol"], coordinated_gate=_Fake()
+        )
+    assert _status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
+
+
+def test_unbound_policy_rejects_lifecycle(tmp_path):
+    env = _lifecycle(tmp_path)
+    other = AuthorizationPolicy(tmp_path / "fresh-auth.db")
+    protocol = CollaborationProtocol(tmp_path / "fresh-bridge.db")
+    _init_authority(tmp_path / "fresh-coord.db")
+    gate = CoordinatedHaltGate(tmp_path / "fresh-coord.db", other, protocol)
+    protocol.require_coordinated_guard(gate)
+    with pytest.raises(ValueError, match="policy mismatch"):
+        AuthorizationLifecycle(
+            env["verifier"], env["policy"], protocol, coordinated_gate=gate
+        )
+
+
+def test_unbound_protocol_rejects_lifecycle(tmp_path):
+    env = _lifecycle(tmp_path)
+    env["protocol"]._coordinated_guard = None
+    env["protocol"]._coordinated_enforcement_required = False
+    result = env["lifecycle"].evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is False
+    assert result.reason == "Work admission rejected"
+    assert _status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
+    assert env["policy"].stored_state("auth-1") == "PENDING"
+
+
+def test_aligned_bound_components_succeed(tmp_path):
+    env = _lifecycle(tmp_path)
+    assert env["policy"].coordinated_guard is env["gate"]
+    assert env["protocol"].coordinated_guard is env["gate"]
+    result = env["lifecycle"].evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is True
+    assert result.execution_enabled is False
+
+
+def test_lifecycle_replaced_guard_identity_rejects(tmp_path):
+    env = _lifecycle(tmp_path)
+    env["lifecycle"].coordinated_gate = CoordinatedHaltGate(
+        env["coordinated"], env["policy"], env["protocol"]
+    )
+    result = env["lifecycle"].evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is False
+    assert result.reason == "Work admission rejected"
+    assert _status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
+
+
+def test_coordinated_path_drift_rejects_lifecycle(tmp_path):
+    env = _lifecycle(tmp_path)
+    env["gate"].coordinated_path = tmp_path / "other-coord.db"
+    result = env["lifecycle"].evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is False
+    assert result.reason == "Work admission rejected"
+    assert _status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
+
+
+def test_migration_drift_rejects_lifecycle(tmp_path):
+    env = _lifecycle(tmp_path)
+    env["gate"].absent_legacy_policy = AbsentLegacyPolicy.ABSENT_LEGACY_IS_SAFE
+    result = env["lifecycle"].evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is False
+    assert result.reason == "Work admission rejected"
+    assert env["policy"].stored_state("auth-1") == "PENDING"
+
+
+def test_lifecycle_halted_and_unknown_reject(tmp_path):
+    halted_dir = tmp_path / "halted"
+    halted_dir.mkdir()
+    halted = _lifecycle(halted_dir, state="HALTED")
+    result = halted["lifecycle"].evaluate(
+        halted["challenge"], _sign(halted["private"], halted["challenge"])
+    )
+    assert result.accepted is False
+    assert result.execution_enabled is False
+    assert _status(halted["verifier"], halted["challenge"]["challenge_id"]) == "open"
+
+    unknown_dir = tmp_path / "unknown"
+    unknown_dir.mkdir()
+    unknown = _lifecycle(unknown_dir)
+    with sqlite3.connect(unknown["coordinated"]) as connection:
+        connection.execute("UPDATE halt_state SET sequence = 4")
+    result = unknown["lifecycle"].evaluate(
+        unknown["challenge"], _sign(unknown["private"], unknown["challenge"])
+    )
+    assert result.accepted is False
+    assert result.execution_enabled is False
+    assert _status(unknown["verifier"], unknown["challenge"]["challenge_id"]) == "open"
