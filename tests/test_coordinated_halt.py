@@ -576,3 +576,72 @@ def test_existing_halted_persistence(tmp_path):
     status, sequence = CoordinatedHalt(database).read_status()
     assert status is HaltStatus.HALTED
     assert sequence == 4
+
+
+def test_filesystem_error_during_activate_halt_becomes_halterror(tmp_path, monkeypatch):
+    """Unexpected filesystem errors during HALT activation become HaltError."""
+    database = tmp_path / "halt.db"
+    _init_authority(database)
+    halt = CoordinatedHalt(database)
+
+    def boom_is_file(self):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(Path, "is_file", boom_is_file)
+
+    with pytest.raises(HaltError, match="HALT activation failed"):
+        halt.activate_halt("operator")
+
+    # Authority remains NOT_HALTED (no partial activation).
+    # Re-open without the patch.
+    monkeypatch.undo()
+    status, sequence = CoordinatedHalt(database).read_status()
+    assert status is HaltStatus.NOT_HALTED
+    assert sequence == 0
+
+
+def test_sqlite_configuration_failure_closes_connection(tmp_path, monkeypatch):
+    """
+    When SQLite configuration (PRAGMA) fails inside _connect,
+    the connection is closed before the error propagates.
+    """
+    database = tmp_path / "halt.db"
+    _init_authority(database)
+
+    closed = []
+    real_connect = sqlite3.connect
+
+    class TrackingConnection:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *args, **kwargs):
+            if isinstance(sql, str) and sql.startswith("PRAGMA"):
+                raise sqlite3.OperationalError("injected pragma failure")
+            return self._inner.execute(sql, *args, **kwargs)
+
+        def close(self):
+            closed.append(True)
+            return self._inner.close()
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    def tracking_connect(*args, **kwargs):
+        return TrackingConnection(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(
+        "skippy.collaboration.coordinated_halt.sqlite3.connect",
+        tracking_connect,
+    )
+
+    halt = CoordinatedHalt(database)
+    with pytest.raises(HaltError):
+        halt.activate_halt("operator")
+
+    assert closed, "connection was not closed after configuration failure"
+
+    monkeypatch.undo()
+    status, sequence = CoordinatedHalt(database).read_status()
+    assert status is HaltStatus.NOT_HALTED
+    assert sequence == 0

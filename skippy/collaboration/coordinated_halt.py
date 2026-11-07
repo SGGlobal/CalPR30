@@ -130,8 +130,13 @@ class CoordinatedHalt:
         Public API raises only HaltError for expected persistence failures.
         """
 
-        if not self.database_path.is_file():
-            raise HaltError("Authority database missing")
+        try:
+            if not self.database_path.is_file():
+                raise HaltError("Authority database missing")
+        except HaltError:
+            raise
+        except OSError as exc:
+            raise HaltError("HALT activation failed") from exc
 
         code = self._reason_code(reason)
         self._audit_best_effort("halt_requested", None, code)
@@ -198,6 +203,8 @@ class CoordinatedHalt:
         Open the existing authority database.
 
         Uses SQLite URI mode=rw or mode=ro so a missing file is never created.
+        If SQLite configuration (PRAGMA) fails after the connection is opened,
+        the connection is closed before the error propagates.
         Configuration failures propagate to the caller, which maps them to
         HaltError on the public activation path.
         """
@@ -209,9 +216,16 @@ class CoordinatedHalt:
         connection = sqlite3.connect(
             uri, uri=True, timeout=LOCK_TIMEOUT_SECONDS
         )
-        if not readonly:
-            connection.execute("PRAGMA synchronous=FULL")
-        return connection
+        try:
+            if not readonly:
+                connection.execute("PRAGMA synchronous=FULL")
+            return connection
+        except Exception:
+            try:
+                connection.close()
+            except Exception:
+                pass
+            raise
 
     def _read_validated(
         self, connection: sqlite3.Connection
