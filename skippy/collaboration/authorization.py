@@ -170,6 +170,8 @@ class AuthorizationPolicy:
             raise AuthorizationError("Database directory does not exist")
         self._init_schema()
         self._coordinated_guard = None
+        self._coordinated_enforcement_required = False
+        self._coordinated_guard_snapshot = None
 
     def _connect(self):
         return sqlite3.connect(self.database_path, timeout=5.0)
@@ -333,7 +335,19 @@ class AuthorizationPolicy:
             raise AuthorizationError("Invalid coordinated guard")
         if gate.policy is not self:
             raise AuthorizationError("Coordinated guard policy mismatch")
+        if gate.protocol is None:
+            raise AuthorizationError("Coordinated guard protocol mismatch")
         self._coordinated_guard = gate
+        self._coordinated_enforcement_required = True
+        self._coordinated_guard_snapshot = {
+            "policy": gate.policy,
+            "protocol": gate.protocol,
+            "policy_path": Path(gate.policy.database_path),
+            "protocol_path": Path(gate.protocol.database_path),
+            "coordinated_path": Path(gate.coordinated_path),
+            "absent_legacy_policy": gate.absent_legacy_policy,
+            "omitted_source_policy": gate.omitted_source_policy,
+        }
 
     @property
     def coordinated_guard(self):
@@ -348,16 +362,33 @@ class AuthorizationPolicy:
         Never exposes exception details. Never treats failure as permission.
         """
 
-        guard = self._coordinated_guard
-        if guard is None:
+        if not self._coordinated_enforcement_required:
             return None
+        guard = self._coordinated_guard
+        snapshot = self._coordinated_guard_snapshot
+        if guard is None or snapshot is None:
+            return "Coordinated guard rejected"
         try:
             from skippy.collaboration.coordinated_halt_gate import (
                 CoordinatedHaltGate,
                 GateResult,
             )
 
-            if not isinstance(guard, CoordinatedHaltGate) or guard.policy is not self:
+            if not isinstance(guard, CoordinatedHaltGate):
+                return "Coordinated guard rejected"
+            if guard.policy is not self or guard.policy is not snapshot["policy"]:
+                return "Coordinated guard rejected"
+            if guard.protocol is not snapshot["protocol"]:
+                return "Coordinated guard rejected"
+            if Path(guard.policy.database_path) != snapshot["policy_path"]:
+                return "Coordinated guard rejected"
+            if Path(guard.protocol.database_path) != snapshot["protocol_path"]:
+                return "Coordinated guard rejected"
+            if Path(guard.coordinated_path) != snapshot["coordinated_path"]:
+                return "Coordinated guard rejected"
+            if guard.absent_legacy_policy != snapshot["absent_legacy_policy"]:
+                return "Coordinated guard rejected"
+            if guard.omitted_source_policy != snapshot["omitted_source_policy"]:
                 return "Coordinated guard rejected"
             result = guard.check()
             if not isinstance(result, GateResult):

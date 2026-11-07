@@ -255,12 +255,15 @@ def test_unexpected_guard_exception_rejects_without_details(tmp_path):
     with pytest.raises(AuthorizationError, match="Invalid coordinated guard"):
         policy.require_coordinated_guard(_RaisingGate(policy))
 
-    fresh = AuthorizationPolicy(tmp_path / "fresh.db")
-    fresh._coordinated_guard = _RaisingGate(fresh)  # unsupported injection
+    bound_dir = tmp_path / "bound"
+    bound_dir.mkdir()
+    bound, _protocol, _coordinated, gate = _setup(bound_dir)
+    def boom():
+        raise RuntimeError("secret-token-should-not-leak")
+    gate.check = boom
     with pytest.raises(AuthorizationError, match="Coordinated guard rejected"):
-        fresh.submit(_request())
-    assert "secret-token" not in "Coordinated guard rejected"
-    assert fresh.stored_state("auth-1") is None
+        bound.submit(_request())
+    assert bound.stored_state("auth-1") is None
 
 
 def test_mismatched_component_configuration_rejected(tmp_path):
@@ -304,14 +307,13 @@ def test_malformed_or_contradictory_gate_result_rejects(tmp_path):
 
 
 def test_consume_and_decide_do_not_mutate_on_rejection(tmp_path):
-    policy, _protocol, _coordinated, _gate = _setup(tmp_path)
-    policy._coordinated_guard = None
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
+    coordinated = tmp_path / "coord.db"
+    _init_authority(coordinated)
     policy.submit(_request(state=AuthorizationState.APPROVED))
-    policy.require_coordinated_guard(
-        CoordinatedHaltGate(_gate_path(tmp_path), policy, CollaborationProtocol(tmp_path / "bridge.db"))
-    )
-    # Force coordinated HALTED after binding.
-    with sqlite3.connect(tmp_path / "coord.db") as connection:
+    policy.require_coordinated_guard(CoordinatedHaltGate(coordinated, policy, protocol))
+    with sqlite3.connect(coordinated) as connection:
         connection.execute(
             "UPDATE halt_state SET state = 'HALTED', sequence = 1"
         )
@@ -352,16 +354,14 @@ def test_default_behavior_unchanged(tmp_path):
 
 
 def test_administrative_halt_and_revoke_remain_available(tmp_path):
-    policy, _protocol, _coordinated, _gate = _setup(tmp_path, "HALTED")
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
+    coordinated = tmp_path / "coord.db"
+    _init_authority(coordinated, "HALTED", 1)
+    policy.submit(_request())
+    policy.require_coordinated_guard(CoordinatedHaltGate(coordinated, policy, protocol))
     policy.halt()
     assert policy.is_halted() is True
-    # Revoke remains a protective operation even when the guard would reject work.
-    policy._coordinated_guard = None
-    policy.submit(_request())
-    policy.require_coordinated_guard(
-        CoordinatedHaltGate(tmp_path / "coord.db", policy, CollaborationProtocol(tmp_path / "bridge2.db"))
-    )
-    # Coordinated is HALTED, but revoke is not a guarded work-acceptance path.
     decision = policy.revoke("auth-1")
     assert decision.execution_enabled is False
     assert policy.stored_state("auth-1") == "REVOKED"
@@ -384,3 +384,59 @@ def test_execution_disabled_throughout(tmp_path):
         ),
     ):
         assert decision.execution_enabled is False
+
+
+def test_unchanged_guard_allows_normal_operation(tmp_path):
+    policy, _protocol, _coordinated, _gate = _setup(tmp_path)
+    policy.submit(_request())
+    decision = _decide(policy)
+    assert decision.execution_enabled is False
+    assert policy.stored_state("auth-1") == "PENDING"
+
+
+def test_unexpected_guard_removal_rejects(tmp_path):
+    policy, _protocol, _coordinated, _gate = _setup(tmp_path)
+    policy._coordinated_guard = None  # unsupported loss after opt-in
+    with pytest.raises(AuthorizationError, match="Coordinated guard rejected"):
+        policy.submit(_request())
+    assert policy.stored_state("auth-1") is None
+    decision = _decide(policy)
+    assert decision.allowed is False
+    assert decision.execution_enabled is False
+
+
+def test_bound_protocol_replacement_rejects(tmp_path):
+    policy, protocol, coordinated, gate = _setup(tmp_path)
+    other = CollaborationProtocol(tmp_path / "other-bridge.db")
+    gate.protocol = other
+    with pytest.raises(AuthorizationError, match="Coordinated guard rejected"):
+        policy.submit(_request())
+    assert policy.stored_state("auth-1") is None
+    assert protocol.is_halted is False
+
+
+def test_coordinated_path_modification_rejects(tmp_path):
+    policy, _protocol, coordinated, gate = _setup(tmp_path)
+    gate.coordinated_path = tmp_path / "other-coord.db"
+    with pytest.raises(AuthorizationError, match="Coordinated guard rejected"):
+        policy.submit(_request())
+    assert policy.stored_state("auth-1") is None
+    assert coordinated.exists()
+
+
+def test_migration_setting_modification_rejects(tmp_path):
+    from skippy.collaboration.legacy_halt_migration import AbsentLegacyPolicy
+
+    policy, _protocol, _coordinated, gate = _setup(tmp_path)
+    gate.absent_legacy_policy = AbsentLegacyPolicy.ABSENT_LEGACY_IS_SAFE
+    with pytest.raises(AuthorizationError, match="Coordinated guard rejected"):
+        policy.submit(_request())
+    assert policy.stored_state("auth-1") is None
+
+
+def test_guard_configuration_mismatch_after_binding_rejects(tmp_path):
+    policy, _protocol, _coordinated, gate = _setup(tmp_path)
+    gate.policy = AuthorizationPolicy(tmp_path / "other.db")
+    with pytest.raises(AuthorizationError, match="Coordinated guard rejected"):
+        policy.submit(_request())
+    assert policy.stored_state("auth-1") is None
