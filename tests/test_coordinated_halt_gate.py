@@ -326,9 +326,11 @@ def test_default_lifecycle_unchanged_without_gate(tmp_path):
     env = _setup(tmp_path)
     default = AuthorizationLifecycle(env["verifier"], env["policy"], env["protocol"])
     result = default.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
-    assert result.accepted is True
+    assert result.accepted is False
+    assert result.reason == "Work admission rejected"
     assert result.execution_enabled is False
     assert default.coordinated_gate is None
+    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
 
 
 def test_gate_result_execution_disabled_cannot_be_overridden():
@@ -457,7 +459,8 @@ def test_default_construction_unchanged(tmp_path):
     lifecycle = AuthorizationLifecycle(env["verifier"], env["policy"], env["protocol"])
     assert lifecycle.coordinated_gate is None
     result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
-    assert result.accepted is True
+    assert result.accepted is False
+    assert result.reason == "Work admission rejected"
     assert result.execution_enabled is False
 
 

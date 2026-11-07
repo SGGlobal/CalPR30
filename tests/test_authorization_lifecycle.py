@@ -12,10 +12,14 @@ from skippy.collaboration.authorization import (
     AuthorizationRequest,
     AuthorizationState,
 )
+import sqlite3
+
 from skippy.collaboration.authorization_lifecycle import (
     AuthorizationLifecycle,
     LifecycleResult,
 )
+from skippy.collaboration.coordinated_halt import SUPPORTED_SCHEMA_VERSION
+from skippy.collaboration.coordinated_halt_gate import CoordinatedHaltGate
 from skippy.collaboration.chief_identity import (
     ChiefIdentityVerifier,
     canonical_payload,
@@ -74,7 +78,45 @@ def _setup(tmp_path):
         key_id="test-key",
     )
 
-    bridge = AuthorizationLifecycle(verifier, policy, protocol)
+    coordinated = tmp_path / "coord.db"
+    with sqlite3.connect(coordinated) as connection:
+        connection.execute(
+            "CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE halt_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                state TEXT NOT NULL CHECK (state IN ('NOT_HALTED', 'HALTED')),
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                updated_at TEXT NOT NULL,
+                reason TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE halt_events (
+                event_id TEXT PRIMARY KEY,
+                occurred_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                sequence INTEGER,
+                detail TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)",
+            (SUPPORTED_SCHEMA_VERSION,),
+        )
+        connection.execute(
+            """
+            INSERT INTO halt_state (singleton, state, sequence, updated_at, reason)
+            VALUES (1, 'NOT_HALTED', 0, '2026-01-01T00:00:00+00:00', 'test-init')
+            """
+        )
+    gate = CoordinatedHaltGate(coordinated, policy, protocol)
+    bridge = AuthorizationLifecycle(verifier, policy, protocol, coordinated_gate=gate)
     return bridge, private, challenge, policy, protocol, verifier
 
 
@@ -351,7 +393,8 @@ def test_policy_halt(tmp_path):
     policy.halt()
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
-    assert result.reason == "Authorization policy is halted"
+    assert result.accepted is False
+    assert "HALTED" in result.reason or "halted" in result.reason
     assert result.execution_enabled is False
 
 
@@ -360,7 +403,8 @@ def test_protocol_halt(tmp_path):
     protocol.halt()
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
-    assert result.reason == "Protocol is halted"
+    assert result.accepted is False
+    assert "HALTED" in result.reason or "halted" in result.reason
     assert result.execution_enabled is False
 
 
@@ -509,7 +553,7 @@ def test_rejection_audit_protocol_halt(tmp_path):
     bridge.evaluate(challenge, _sign(private, challenge))
 
     events = policy.events_for("auth-1")
-    assert any("Protocol is halted" in e for e in events)
+    assert any("halt" in e.lower() for e in events)
 
 
 def test_rejection_audit_policy_halt(tmp_path):
@@ -518,7 +562,7 @@ def test_rejection_audit_policy_halt(tmp_path):
     bridge.evaluate(challenge, _sign(private, challenge))
 
     events = policy.events_for("auth-1")
-    assert any("Authorization policy is halted" in e for e in events)
+    assert any("halt" in e.lower() for e in events)
 
 
 def test_rejection_audit_policy_scope(tmp_path):

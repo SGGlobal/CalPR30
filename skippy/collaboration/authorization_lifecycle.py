@@ -76,10 +76,11 @@ class AuthorizationLifecycle:
         self.verifier = verifier
         self.policy = policy
         self.protocol = protocol
-        # None preserves existing default behavior.
+        # Work evaluation requires this exact gate. None rejects admission.
         if coordinated_gate is not None:
             self._require_aligned_gate(coordinated_gate)
         self.coordinated_gate = coordinated_gate
+        self._admission_gate = coordinated_gate
 
     def evaluate(
         self,
@@ -125,12 +126,17 @@ class AuthorizationLifecycle:
                     False, f"Malformed field: {key}", False, None
                 )
 
-        # Opt-in only. Runs before challenge consumption and policy evaluation.
-        # Unexpected failures reject without consuming the challenge.
-        if self.coordinated_gate is not None:
-            rejection = self._evaluate_gate(auth_id)
-            if rejection is not None:
-                return rejection
+        # Work admission requires the originally bound gate. A missing,
+        # replaced, or failed gate rejects before challenge consumption.
+        if (
+            self._admission_gate is None
+            or self.coordinated_gate is not self._admission_gate
+        ):
+            self._audit(auth_id, "Work admission rejected")
+            return LifecycleResult(False, "Work admission rejected", False, None)
+        rejection = self._evaluate_gate(auth_id)
+        if rejection is not None:
+            return rejection
 
         if self.protocol.is_halted:
             self._audit(auth_id, "Protocol is halted")

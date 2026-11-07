@@ -471,6 +471,26 @@ class CollaborationProtocol:
         """Read-only view of the established guard, if any."""
         return self._coordinated_guard
 
+    @property
+    def coordinated_enforcement_required(self) -> bool:
+        """True after opt-in. Does not itself prove the guard is still valid."""
+        return self._coordinated_enforcement_required
+
+    def admit_work(self) -> None:
+        """
+        Require a valid, successfully evaluated coordinated guard.
+
+        A non-null guard object is not sufficient. Enforcement must still
+        be required, the original instance and configuration must match,
+        and the current evaluation must succeed. Raises ProtocolError.
+        Does not grant execution.
+        """
+
+        if not self._coordinated_enforcement_required:
+            raise ProtocolError("Work admission rejected")
+        if self._guard_rejection() is not None:
+            raise ProtocolError("Work admission rejected")
+
     def _guard_rejection(self) -> str | None:
         """
         Run the opt-in guard before any local write lock.
