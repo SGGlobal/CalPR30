@@ -487,3 +487,101 @@ def test_all_outcomes_report_execution_disabled(tmp_path):
     )
     assert rejected.accepted is False
     assert rejected.execution_enabled is False
+
+
+def test_allowed_result_reporting_halted_is_rejected(tmp_path):
+    env = _setup(tmp_path)
+    inconsistent = GateResult(True, "unsafe", "HALTED", True, False, False)
+    lifecycle = AuthorizationLifecycle(
+        env["verifier"],
+        env["policy"],
+        env["protocol"],
+        coordinated_gate=_BadResultGate(env["policy"], env["protocol"], inconsistent),
+    )
+    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is False
+    assert result.execution_enabled is False
+    assert result.reason == "Coordinated gate result invalid"
+    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
+
+
+def test_allowed_result_with_incomplete_migration_is_rejected(tmp_path):
+    env = _setup(tmp_path)
+    inconsistent = GateResult(True, "unsafe", "NOT_HALTED", False, False, False)
+    lifecycle = AuthorizationLifecycle(
+        env["verifier"],
+        env["policy"],
+        env["protocol"],
+        coordinated_gate=_BadResultGate(env["policy"], env["protocol"], inconsistent),
+    )
+    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is False
+    assert result.execution_enabled is False
+    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
+
+
+def test_allowed_result_reporting_legacy_halt_is_rejected(tmp_path):
+    env = _setup(tmp_path)
+    policy_halted = GateResult(True, "unsafe", "NOT_HALTED", True, True, False)
+    protocol_halted = GateResult(True, "unsafe", "NOT_HALTED", True, False, True)
+
+    for inconsistent in (policy_halted, protocol_halted):
+        lifecycle = AuthorizationLifecycle(
+            env["verifier"],
+            env["policy"],
+            env["protocol"],
+            coordinated_gate=_BadResultGate(env["policy"], env["protocol"], inconsistent),
+        )
+        result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+        assert result.accepted is False
+        assert result.execution_enabled is False
+        assert result.reason == "Coordinated gate result invalid"
+    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
+
+
+def test_correctly_formed_safe_result_is_accepted(tmp_path):
+    env = _setup(tmp_path)
+    safe = GateResult(
+        True,
+        "Safety conditions satisfied; execution disabled",
+        "NOT_HALTED",
+        True,
+        False,
+        False,
+    )
+    lifecycle = AuthorizationLifecycle(
+        env["verifier"],
+        env["policy"],
+        env["protocol"],
+        coordinated_gate=_BadResultGate(env["policy"], env["protocol"], safe),
+    )
+    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is True
+    assert result.identity_verified is True
+    assert result.execution_enabled is False
+    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "consumed"
+
+
+class _ExplosiveStatus(GateResult):
+    def __getattribute__(self, name):
+        if name == "coordinated_status":
+            raise RuntimeError("secret-validation-token")
+        return super().__getattribute__(name)
+
+
+def test_result_validation_exception_fails_closed(tmp_path):
+    env = _setup(tmp_path)
+    explosive = _ExplosiveStatus(True, "unsafe", "NOT_HALTED", True, False, False)
+    lifecycle = AuthorizationLifecycle(
+        env["verifier"],
+        env["policy"],
+        env["protocol"],
+        coordinated_gate=_BadResultGate(env["policy"], env["protocol"], explosive),
+    )
+    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    assert result.accepted is False
+    assert result.execution_enabled is False
+    assert result.reason == "Coordinated gate evaluation failed"
+    assert "secret-validation-token" not in result.reason
+    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
+    assert env["policy"].stored_state("auth-1") == "PENDING"

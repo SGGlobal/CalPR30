@@ -196,31 +196,64 @@ class AuthorizationLifecycle:
         if getattr(gate, "protocol", None) is not self.protocol:
             raise ValueError("Coordinated gate collaboration protocol mismatch")
 
-    def _gate_result_valid(self, gate) -> bool:
-        """Reject malformed results. Do not treat them as permission."""
+    def _inspect_gate_result(self, gate) -> tuple[bool, bool, str]:
+        """
+        Inspect a gate result once, inside the caller's exception boundary.
+
+        An allowed result must be internally consistent. Inconsistent
+        security metadata is never treated as permission.
+        Returns (valid, allowed, reason).
+        """
+
         from skippy.collaboration.coordinated_halt_gate import GateResult
 
         if not isinstance(gate, GateResult):
-            return False
-        if not isinstance(gate.allowed, bool):
-            return False
-        if gate.execution_enabled is not False:
-            return False
-        if not isinstance(gate.reason, str) or not gate.reason:
-            return False
-        return True
+            return False, False, "Coordinated gate result invalid"
+
+        allowed = gate.allowed
+        reason = gate.reason
+        status = gate.coordinated_status
+        migration_completed = gate.migration_completed
+        policy_halted = gate.legacy_policy_halted
+        protocol_halted = gate.legacy_protocol_halted
+        execution_enabled = gate.execution_enabled
+
+        if not isinstance(allowed, bool) or execution_enabled is not False:
+            return False, False, "Coordinated gate result invalid"
+        if not isinstance(reason, str) or not reason:
+            return False, False, "Coordinated gate result invalid"
+        if status is not None and not isinstance(status, str):
+            return False, False, "Coordinated gate result invalid"
+        if not isinstance(migration_completed, bool):
+            return False, False, "Coordinated gate result invalid"
+        if policy_halted is not None and not isinstance(policy_halted, bool):
+            return False, False, "Coordinated gate result invalid"
+        if protocol_halted is not None and not isinstance(protocol_halted, bool):
+            return False, False, "Coordinated gate result invalid"
+
+        if allowed:
+            if (
+                status != "NOT_HALTED"
+                or migration_completed is not True
+                or policy_halted is not False
+                or protocol_halted is not False
+            ):
+                return False, False, "Coordinated gate result invalid"
+        return True, allowed, reason
 
     def _evaluate_gate(self, auth_id: str) -> LifecycleResult | None:
         """
         Run the opt-in gate.
 
         Returns a rejection result, or None when the gate allows evaluation.
+        Result inspection stays inside this exception boundary.
         Never exposes exception details. Never consumes a challenge.
         """
 
         try:
             self._require_aligned_gate(self.coordinated_gate)
             gate = self.coordinated_gate.check()
+            valid, allowed, reason = self._inspect_gate_result(gate)
         except Exception:
             self._audit(auth_id, "Coordinated gate rejected: evaluation failed")
             return LifecycleResult(
@@ -230,12 +263,7 @@ class AuthorizationLifecycle:
                 None,
             )
 
-        if not self._gate_result_valid(gate) or not gate.allowed:
-            reason = (
-                gate.reason
-                if self._gate_result_valid(gate)
-                else "Coordinated gate result invalid"
-            )
+        if not valid or not allowed:
             self._audit(auth_id, f"Coordinated gate rejected: {reason}")
             return LifecycleResult(False, reason, False, None)
         return None
