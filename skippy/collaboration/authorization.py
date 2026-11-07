@@ -154,6 +154,14 @@ class AuthorizationPolicy:
 
     Execution is always disabled. This policy's HALT cannot be overridden.
     It does not automatically observe CollaborationProtocol HALT.
+
+    Opt-in coordinated guard:
+    require_coordinated_guard() may bind a CoordinatedHaltGate that
+    references this same policy instance. Once established, the guard
+    cannot be replaced through supported methods. Default construction
+    remains ungated. This is not system-wide enforcement and not a
+    production cutover. Administrative halt() and revoke() remain
+    available as protective operations.
     """
 
     def __init__(self, database_path: str | Path):
@@ -161,6 +169,9 @@ class AuthorizationPolicy:
         if not self.database_path.parent.is_dir():
             raise AuthorizationError("Database directory does not exist")
         self._init_schema()
+        self._coordinated_guard = None
+        self._coordinated_enforcement_required = False
+        self._coordinated_guard_snapshot = None
 
     def _connect(self):
         return sqlite3.connect(self.database_path, timeout=5.0)
@@ -307,6 +318,120 @@ class AuthorizationPolicy:
             ).fetchone()
         return bool(row and row[0] == "1")
 
+    def require_coordinated_guard(self, gate) -> None:
+        """
+        Bind an opt-in CoordinatedHaltGate to this policy instance.
+
+        The guard must reference this same policy. It cannot be removed
+        or replaced through this supported method. Default construction
+        remains ungated.
+        """
+
+        from skippy.collaboration.coordinated_halt_gate import CoordinatedHaltGate
+
+        if self._coordinated_guard is not None:
+            raise AuthorizationError("Coordinated guard cannot be replaced")
+        if not isinstance(gate, CoordinatedHaltGate):
+            raise AuthorizationError("Invalid coordinated guard")
+        if gate.policy is not self:
+            raise AuthorizationError("Coordinated guard policy mismatch")
+        if gate.protocol is None:
+            raise AuthorizationError("Coordinated guard protocol mismatch")
+        self._coordinated_guard = gate
+        self._coordinated_enforcement_required = True
+        self._coordinated_guard_snapshot = {
+            "guard": gate,
+            "policy": gate.policy,
+            "protocol": gate.protocol,
+            "policy_path": Path(gate.policy.database_path),
+            "protocol_path": Path(gate.protocol.database_path),
+            "coordinated_path": Path(gate.coordinated_path),
+            "absent_legacy_policy": gate.absent_legacy_policy,
+            "omitted_source_policy": gate.omitted_source_policy,
+        }
+
+    @property
+    def coordinated_guard(self):
+        """Read-only view of the established guard, if any."""
+        return self._coordinated_guard
+
+    def _guard_rejection(self) -> str | None:
+        """
+        Run the opt-in guard before any local write lock.
+
+        Returns a controlled rejection reason, or None when clear.
+        Never exposes exception details. Never treats failure as permission.
+        """
+
+        if not self._coordinated_enforcement_required:
+            return None
+        guard = self._coordinated_guard
+        snapshot = self._coordinated_guard_snapshot
+        if guard is None or snapshot is None:
+            return "Coordinated guard rejected"
+        try:
+            from skippy.collaboration.coordinated_halt_gate import (
+                CoordinatedHaltGate,
+                GateResult,
+            )
+
+            if not isinstance(guard, CoordinatedHaltGate):
+                return "Coordinated guard rejected"
+            if guard is not snapshot["guard"]:
+                return "Coordinated guard rejected"
+            if guard.policy is not self or guard.policy is not snapshot["policy"]:
+                return "Coordinated guard rejected"
+            if guard.protocol is not snapshot["protocol"]:
+                return "Coordinated guard rejected"
+            if Path(guard.policy.database_path) != snapshot["policy_path"]:
+                return "Coordinated guard rejected"
+            if Path(guard.protocol.database_path) != snapshot["protocol_path"]:
+                return "Coordinated guard rejected"
+            if Path(guard.coordinated_path) != snapshot["coordinated_path"]:
+                return "Coordinated guard rejected"
+            if guard.absent_legacy_policy != snapshot["absent_legacy_policy"]:
+                return "Coordinated guard rejected"
+            if guard.omitted_source_policy != snapshot["omitted_source_policy"]:
+                return "Coordinated guard rejected"
+            result = guard.check()
+            if not isinstance(result, GateResult):
+                return "Coordinated guard rejected"
+            if (
+                result.allowed is not True
+                or result.execution_enabled is not False
+                or result.coordinated_status != "NOT_HALTED"
+                or result.migration_completed is not True
+                or result.legacy_policy_halted is not False
+                or result.legacy_protocol_halted is not False
+            ):
+                return "Coordinated guard rejected"
+            return None
+        except Exception:
+            return "Coordinated guard rejected"
+
+    def _audit_guard_rejection(
+        self,
+        authorization_id: str | None,
+        action: str,
+        target: str,
+        reason: str,
+    ) -> None:
+        """Best-effort audit. Does not change authorization state."""
+        try:
+            with self._connect() as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                self._record(
+                    connection,
+                    authorization_id,
+                    action,
+                    target,
+                    None,
+                    "DENIED",
+                    reason,
+                )
+        except Exception:
+            return
+
     def halt(self) -> None:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -329,6 +454,13 @@ class AuthorizationPolicy:
             raise AuthorizationError(
                 "AI cannot manufacture an approved authorization"
             )
+
+        rejection = self._guard_rejection()
+        if rejection:
+            self._audit_guard_rejection(
+                request.authorization_id, request.action, request.repository, rejection
+            )
+            raise AuthorizationError(rejection)
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -397,6 +529,13 @@ class AuthorizationPolicy:
         """
 
         now = now or datetime.now(timezone.utc)
+
+        rejection = self._guard_rejection()
+        if rejection:
+            self._audit_guard_rejection(authorization_id, action, repository, rejection)
+            return AuthorizationDecision(
+                False, AuthorizationState.DENIED, rejection
+            )
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -594,6 +733,13 @@ class AuthorizationPolicy:
         """
 
         now = now or datetime.now(timezone.utc)
+
+        rejection = self._guard_rejection()
+        if rejection:
+            self._audit_guard_rejection(authorization_id, action, repository, rejection)
+            return AuthorizationDecision(
+                False, AuthorizationState.DENIED, rejection
+            )
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -807,6 +953,15 @@ class AuthorizationPolicy:
 
         now = now or datetime.now(timezone.utc)
         consumption_id = str(uuid.uuid4())
+
+        rejection = self._guard_rejection()
+        if rejection:
+            self._audit_guard_rejection(
+                authorization_id, "consume", "authorization", rejection
+            )
+            return AuthorizationDecision(
+                False, AuthorizationState.DENIED, rejection
+            )
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
