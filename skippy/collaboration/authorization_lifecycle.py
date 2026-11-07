@@ -18,8 +18,14 @@ HALT:
 The bridge fails closed if either AuthorizationPolicy or
 CollaborationProtocol reports HALT. There is no automatic recovery.
 A race remains possible between the two checks because they are separate
-databases. Coordinated HALT is a commissioning blocker. This bridge does
-not resolve that blocker.
+databases.
+
+Opt-in coordinated gate:
+An optional CoordinatedHaltGate may be supplied. When present, it runs
+before identity challenge consumption and policy evaluation. Default
+construction leaves the gate unset, so existing behavior is unchanged.
+The gate is not system-wide enforcement. Direct component entry points
+remain outside it. This is not a production cutover.
 """
 
 from __future__ import annotations
@@ -57,10 +63,13 @@ class AuthorizationLifecycle:
         verifier: ChiefIdentityVerifier,
         policy: AuthorizationPolicy,
         protocol: CollaborationProtocol,
+        coordinated_gate=None,
     ):
         self.verifier = verifier
         self.policy = policy
         self.protocol = protocol
+        # None preserves existing default behavior.
+        self.coordinated_gate = coordinated_gate
 
     def evaluate(
         self,
@@ -104,6 +113,19 @@ class AuthorizationLifecycle:
                 self._audit(auth_id, f"Malformed field: {key}")
                 return LifecycleResult(
                     False, f"Malformed field: {key}", False, None
+                )
+
+        # Opt-in only. Runs before challenge consumption and policy evaluation.
+        # A failed gate is never converted into permission to proceed.
+        if self.coordinated_gate is not None:
+            gate = self.coordinated_gate.check()
+            if not gate.allowed or gate.execution_enabled:
+                self._audit(auth_id, f"Coordinated gate rejected: {gate.reason}")
+                return LifecycleResult(
+                    False,
+                    gate.reason,
+                    False,
+                    None,
                 )
 
         if self.protocol.is_halted:
