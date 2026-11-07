@@ -82,6 +82,26 @@ def _sign(private, fields):
     return private.sign(canonical_payload(fields))
 
 
+def _submit(policy, authorization_id, **overrides):
+    values = {
+        "authorization_id": authorization_id,
+        "chief_identity": "chief-ref",
+        "requesting_participant": "chief",
+        "action": "merge_pull_request",
+        "action_digest": "digest-a",
+        "repository": "SGGlobal/QLA",
+        "project_id": "qla",
+        "task_id": "task-1",
+        "expected_sha": "a" * 40,
+        "environment": "local",
+        "created_at": _now() - timedelta(minutes=1),
+        "expires_at": _now() + timedelta(hours=1),
+        "state": AuthorizationState.PENDING,
+    }
+    values.update(overrides)
+    policy.submit(AuthorizationRequest(**values))
+
+
 def test_valid_synthetic_evidence(tmp_path):
     bridge, private, challenge, policy, _, _ = _setup(tmp_path)
     result = bridge.evaluate(challenge, _sign(private, challenge))
@@ -90,10 +110,11 @@ def test_valid_synthetic_evidence(tmp_path):
     assert result.identity_verified is True
     assert result.execution_enabled is False
     assert policy.stored_state("auth-1") == "PENDING"
+    assert "Synthetic evidence accepted" in policy.events_for("auth-1")
 
 
 def test_invalid_signature(tmp_path):
-    bridge, _, challenge, _, _, _ = _setup(tmp_path)
+    bridge, _, challenge, policy, _, _ = _setup(tmp_path)
     other, _ = _keypair()
 
     result = bridge.evaluate(challenge, _sign(other, challenge))
@@ -102,76 +123,164 @@ def test_invalid_signature(tmp_path):
 
 
 def test_incorrect_repository(tmp_path):
+    """Cryptographic scope rejection. Challenge is modified."""
     bridge, private, challenge, _, _, _ = _setup(tmp_path)
     challenge["repository"] = "other/repo"
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
     assert result.accepted is False
+    assert result.identity_verified is False
 
 
-def test_incorrect_action(tmp_path):
-    bridge, private, challenge, _, _, _ = _setup(tmp_path)
-    challenge["action"] = "deploy"
+def test_policy_repository_mismatch(tmp_path):
+    """Policy scope rejection. Challenge is unmodified."""
+    bridge, private, challenge, policy, _, verifier = _setup(tmp_path)
+    _submit(policy, "auth-repo", repository="other/repo")
+    challenge = verifier.issue_challenge(
+        authorization_id="auth-repo",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+    )
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
+    assert result.identity_verified is True
+    assert result.accepted is False
+    assert "repository" in result.reason
+
+
+def test_policy_action_mismatch(tmp_path):
+    bridge, private, challenge, policy, _, verifier = _setup(tmp_path)
+    _submit(policy, "auth-action", action="deploy")
+    challenge = verifier.issue_challenge(
+        authorization_id="auth-action",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+    )
+
+    result = bridge.evaluate(challenge, _sign(private, challenge))
+    assert result.identity_verified is True
+    assert result.accepted is False
+    assert "action" in result.reason
+
+
+def test_policy_digest_mismatch(tmp_path):
+    bridge, private, challenge, policy, _, verifier = _setup(tmp_path)
+    _submit(policy, "auth-digest", action_digest="other")
+    challenge = verifier.issue_challenge(
+        authorization_id="auth-digest",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+    )
+
+    result = bridge.evaluate(challenge, _sign(private, challenge))
+    assert result.identity_verified is True
     assert result.accepted is False
 
 
-def test_incorrect_digest(tmp_path):
-    bridge, private, challenge, _, _, _ = _setup(tmp_path)
-    challenge["action_digest"] = "other"
+def test_policy_environment_mismatch(tmp_path):
+    bridge, private, challenge, policy, _, verifier = _setup(tmp_path)
+    _submit(policy, "auth-env", environment="production")
+    challenge = verifier.issue_challenge(
+        authorization_id="auth-env",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+    )
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
+    assert result.identity_verified is True
     assert result.accepted is False
 
 
-def test_incorrect_environment(tmp_path):
-    bridge, private, challenge, _, _, _ = _setup(tmp_path)
-    challenge["environment"] = "production"
+def test_policy_task_mismatch(tmp_path):
+    bridge, private, challenge, policy, _, verifier = _setup(tmp_path)
+    _submit(policy, "auth-task", task_id="other")
+    challenge = verifier.issue_challenge(
+        authorization_id="auth-task",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+    )
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
+    assert result.identity_verified is True
     assert result.accepted is False
 
 
-def test_incorrect_task(tmp_path):
-    bridge, private, challenge, _, _, _ = _setup(tmp_path)
-    challenge["task_id"] = "other"
+def test_policy_sha_mismatch(tmp_path):
+    bridge, private, challenge, policy, _, verifier = _setup(tmp_path)
+    _submit(policy, "auth-sha", expected_sha="b" * 40)
+    challenge = verifier.issue_challenge(
+        authorization_id="auth-sha",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+    )
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
-    assert result.accepted is False
-
-
-def test_incorrect_sha(tmp_path):
-    bridge, private, challenge, _, _, _ = _setup(tmp_path)
-    challenge["expected_sha"] = "b" * 40
-
-    result = bridge.evaluate(challenge, _sign(private, challenge))
+    assert result.identity_verified is True
     assert result.accepted is False
 
 
 def test_expired_authorization(tmp_path):
-    bridge, private, challenge, policy, _, _ = _setup(tmp_path)
+    bridge, private, challenge, policy, _, verifier = _setup(tmp_path)
     created = _now() - timedelta(hours=2)
-    policy.submit(
-        AuthorizationRequest(
-            authorization_id="auth-expired",
-            chief_identity="chief-ref",
-            requesting_participant="chief",
-            action="merge_pull_request",
-            action_digest="digest-a",
-            repository="SGGlobal/QLA",
-            project_id="qla",
-            task_id="task-1",
-            expected_sha="a" * 40,
-            environment="local",
-            created_at=created,
-            expires_at=created + timedelta(minutes=30),
-        )
+    _submit(
+        policy,
+        "auth-expired",
+        created_at=created,
+        expires_at=created + timedelta(minutes=30),
     )
-    challenge["authorization_id"] = "auth-expired"
+    challenge = verifier.issue_challenge(
+        authorization_id="auth-expired",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+    )
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
     assert result.accepted is False
+    assert result.identity_verified is True
+    assert "expired" in result.reason.lower()
+    assert "Authorization expired" in policy.events_for("auth-expired")
 
 
 def test_revoked_authorization(tmp_path):
@@ -180,32 +289,28 @@ def test_revoked_authorization(tmp_path):
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
     assert result.accepted is False
+    assert result.identity_verified is True
     assert result.policy_state == "REVOKED"
 
 
 def test_consumed_authorization(tmp_path):
-    bridge, private, challenge, policy, _, _ = _setup(tmp_path)
-    policy.submit(
-        AuthorizationRequest(
-            authorization_id="auth-consumed",
-            chief_identity="chief-ref",
-            requesting_participant="chief",
-            action="merge_pull_request",
-            action_digest="digest-a",
-            repository="SGGlobal/QLA",
-            project_id="qla",
-            task_id="task-1",
-            expected_sha="a" * 40,
-            environment="local",
-            created_at=_now() - timedelta(minutes=1),
-            expires_at=_now() + timedelta(hours=1),
-            state=AuthorizationState.CONSUMED,
-        )
+    bridge, private, challenge, policy, _, verifier = _setup(tmp_path)
+    _submit(policy, "auth-consumed", state=AuthorizationState.CONSUMED)
+    challenge = verifier.issue_challenge(
+        authorization_id="auth-consumed",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
     )
-    challenge["authorization_id"] = "auth-consumed"
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
     assert result.accepted is False
+    assert result.identity_verified is True
 
 
 def test_replayed_challenge(tmp_path):
@@ -217,15 +322,28 @@ def test_replayed_challenge(tmp_path):
 
     assert first.accepted is True
     assert second.accepted is False
+    assert second.identity_verified is False
     assert second.execution_enabled is False
 
 
 def test_unknown_authorization(tmp_path):
-    bridge, private, challenge, _, _, _ = _setup(tmp_path)
-    challenge["authorization_id"] = "missing"
+    bridge, private, challenge, _, _, verifier = _setup(tmp_path)
+    challenge = verifier.issue_challenge(
+        authorization_id="missing",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+    )
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
     assert result.accepted is False
+    assert result.identity_verified is True
+    assert "Missing" in result.reason
 
 
 def test_policy_halt(tmp_path):
@@ -247,32 +365,33 @@ def test_protocol_halt(tmp_path):
 
 
 def test_impersonation(tmp_path):
-    bridge, private, challenge, policy, _, _ = _setup(tmp_path)
-    policy.submit(
-        AuthorizationRequest(
-            authorization_id="auth-ai",
-            chief_identity="jason",
-            requesting_participant="jason",
-            action="merge_pull_request",
-            action_digest="digest-a",
-            repository="SGGlobal/QLA",
-            project_id="qla",
-            task_id="task-1",
-            expected_sha="a" * 40,
-            environment="local",
-            created_at=_now() - timedelta(minutes=1),
-            expires_at=_now() + timedelta(hours=1),
-            state=AuthorizationState.PENDING,
-        )
+    bridge, private, challenge, policy, _, verifier = _setup(tmp_path)
+    _submit(
+        policy,
+        "auth-ai",
+        chief_identity="jason",
+        requesting_participant="jason",
     )
-    challenge["authorization_id"] = "auth-ai"
+    challenge = verifier.issue_challenge(
+        authorization_id="auth-ai",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+    )
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
     assert result.accepted is False
+    assert result.identity_verified is True
+    assert "impersonation" in result.reason.lower()
 
 
 def test_verification_succeeds_policy_fails(tmp_path):
-    bridge, private, challenge, policy, _, verifier = _setup(tmp_path)
+    bridge, private, challenge, policy, _, _ = _setup(tmp_path)
     policy.revoke("auth-1")
 
     result = bridge.evaluate(challenge, _sign(private, challenge))
@@ -284,15 +403,19 @@ def test_verification_succeeds_policy_fails(tmp_path):
 
 
 def test_concurrent_attempts(tmp_path):
-    bridge, private, challenge, _, _, _ = _setup(tmp_path)
+    bridge, private, challenge, policy, _, _ = _setup(tmp_path)
     signature = _sign(private, challenge)
 
     barrier = threading.Barrier(2)
     results = []
+    errors = []
 
     def worker():
-        barrier.wait(timeout=2)
-        results.append(bridge.evaluate(challenge, signature))
+        try:
+            barrier.wait(timeout=2)
+            results.append(bridge.evaluate(challenge, signature))
+        except Exception as exc:
+            errors.append(exc)
 
     threads = [threading.Thread(target=worker) for _ in range(2)]
     for thread in threads:
@@ -300,17 +423,25 @@ def test_concurrent_attempts(tmp_path):
     for thread in threads:
         thread.join(timeout=5)
 
+    assert errors == []
     assert all(not thread.is_alive() for thread in threads)
+    assert len(results) == 2
+
     accepted = [result for result in results if result.accepted]
-    assert len(accepted) <= 1
+    rejected = [result for result in results if not result.accepted]
+    assert len(accepted) == 1
+    assert len(rejected) == 1
     assert all(result.execution_enabled is False for result in results)
+    assert policy.stored_state("auth-1") == "PENDING"
 
 
 def test_persistent_audit(tmp_path):
     bridge, private, challenge, policy, _, _ = _setup(tmp_path)
     bridge.evaluate(challenge, _sign(private, challenge))
 
-    assert "Submitted" in policy.events_for("auth-1")
+    events = policy.events_for("auth-1")
+    assert "Submitted" in events
+    assert "Synthetic evidence accepted" in events
 
 
 def test_execution_disabled(tmp_path):
@@ -318,4 +449,13 @@ def test_execution_disabled(tmp_path):
     result = bridge.evaluate(challenge, _sign(private, challenge))
 
     assert isinstance(result, LifecycleResult)
+    assert result.execution_enabled is False
+
+
+def test_malformed_fields(tmp_path):
+    bridge, _, _, _, _, _ = _setup(tmp_path)
+    result = bridge.evaluate(None, None)
+
+    assert result.accepted is False
+    assert result.reason == "Malformed fields"
     assert result.execution_enabled is False

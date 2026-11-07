@@ -18,7 +18,8 @@ HALT:
 The bridge fails closed if either AuthorizationPolicy or
 CollaborationProtocol reports HALT. There is no automatic recovery.
 A race remains possible between the two checks because they are separate
-databases. Coordinated HALT is a commissioning blocker.
+databases. Coordinated HALT is a commissioning blocker. This bridge does
+not resolve that blocker.
 """
 
 from __future__ import annotations
@@ -63,7 +64,7 @@ class AuthorizationLifecycle:
 
     def evaluate(
         self,
-        fields: dict,
+        fields: dict | None,
         signature: bytes | None,
         now: datetime | None = None,
     ) -> LifecycleResult:
@@ -71,9 +72,13 @@ class AuthorizationLifecycle:
         Evaluate a signed challenge against the authorization policy.
 
         Always returns execution_enabled=False.
+        Malformed input fails closed without an uncontrolled exception.
         """
 
         now = now or datetime.now(timezone.utc)
+
+        if not isinstance(fields, dict):
+            return LifecycleResult(False, "Malformed fields", False, None)
 
         if self.protocol.is_halted:
             return LifecycleResult(
@@ -100,29 +105,26 @@ class AuthorizationLifecycle:
                 self.policy.stored_state(fields.get("authorization_id", "")),
             )
 
-        decision = self.policy.decide(
-            fields["authorization_id"],
-            action=fields["action"],
-            repository=fields["repository"],
-            project_id=fields["project_id"],
-            task_id=fields["task_id"],
-            action_digest=fields["action_digest"],
-            expected_sha=fields["expected_sha"],
-            environment=fields["environment"],
+        evidence = self.policy.evaluate_evidence(
+            fields.get("authorization_id", ""),
+            action=fields.get("action", ""),
+            repository=fields.get("repository", ""),
+            project_id=fields.get("project_id", ""),
+            task_id=fields.get("task_id", ""),
+            action_digest=fields.get("action_digest", ""),
+            expected_sha=fields.get("expected_sha"),
+            environment=fields.get("environment", ""),
             now=now,
         )
 
-        if decision.state is not AuthorizationState.PENDING:
+        if evidence.state is not AuthorizationState.PENDING:
             return LifecycleResult(
                 False,
-                f"Policy rejected: {decision.reason}",
+                f"Policy rejected: {evidence.reason}",
                 True,
-                decision.state.value,
+                evidence.state.value,
             )
 
-        # A matching pending request with a valid synthetic signature is
-        # evidence only. It does not transition the authorization and does
-        # not enable execution.
         return LifecycleResult(
             True,
             "Synthetic evidence accepted; execution disabled",
