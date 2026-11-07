@@ -23,6 +23,7 @@ from skippy.collaboration.legacy_halt_migration import (
     AbsentLegacyPolicy,
     LegacyHaltMigration,
     MigrationError,
+    OmittedSourcePolicy,
 )
 from skippy.collaboration.protocol import CollaborationProtocol
 
@@ -93,12 +94,22 @@ def _migrate(
     policy: Path | None,
     protocol: Path | None,
     absent: AbsentLegacyPolicy = AbsentLegacyPolicy.ABSENT_LEGACY_IS_UNSAFE,
+    omitted: OmittedSourcePolicy | None = None,
 ):
+    # Existing scenarios that pass None opt in. Dedicated tests cover the
+    # default fail-closed omission policy by constructing the helper directly.
+    if omitted is None:
+        omitted = (
+            OmittedSourcePolicy.OMITTED_SOURCE_IS_AUTHORIZED
+            if policy is None or protocol is None
+            else OmittedSourcePolicy.OMITTED_SOURCE_IS_UNSAFE
+        )
     helper = LegacyHaltMigration(
         coordinated,
         policy,
         protocol,
         absent_legacy_policy=absent,
+        omitted_source_policy=omitted,
     )
     return helper.migrate()
 
@@ -440,6 +451,7 @@ def test_no_protected_execution_capability(tmp_path):
         None,
         None,
         absent_legacy_policy=AbsentLegacyPolicy.ABSENT_LEGACY_IS_SAFE,
+        omitted_source_policy=OmittedSourcePolicy.OMITTED_SOURCE_IS_AUTHORIZED,
     )
     result = helper.migrate()
     assert helper.execution_enabled is False
@@ -455,4 +467,145 @@ def test_invalid_absent_policy_rejected(tmp_path):
             None,
             None,
             absent_legacy_policy="whatever",  # type: ignore[arg-type]
+            omitted_source_policy=OmittedSourcePolicy.OMITTED_SOURCE_IS_AUTHORIZED,
+        )
+
+
+def test_omitted_source_is_unsafe_by_default(tmp_path):
+    """Omitted legacy paths cannot silently bypass fail-closed policy."""
+    coordinated = tmp_path / "coord.db"
+    policy_db = tmp_path / "policy.db"
+    _init_authority(coordinated)
+    _legacy_policy(policy_db, halted=False)
+
+    with pytest.raises(MigrationError, match="omitted without explicit authorization"):
+        LegacyHaltMigration(coordinated, policy_db, None).migrate()
+
+    status, sequence = CoordinatedHalt(coordinated).read_status()
+    assert status is HaltStatus.NOT_HALTED
+    assert sequence == 0
+
+
+def test_omitted_source_explicitly_authorized(tmp_path):
+    coordinated = tmp_path / "coord.db"
+    policy_db = tmp_path / "policy.db"
+    _init_authority(coordinated)
+    _legacy_policy(policy_db, halted=True)
+
+    result = LegacyHaltMigration(
+        coordinated,
+        policy_db,
+        None,
+        omitted_source_policy=OmittedSourcePolicy.OMITTED_SOURCE_IS_AUTHORIZED,
+    ).migrate()
+
+    assert result.execution_enabled is False
+    assert result.collaboration_protocol_halted is None
+    assert result.authorization_policy_halted is True
+    status, sequence = CoordinatedHalt(coordinated).read_status()
+    assert status is HaltStatus.HALTED
+    assert sequence == 1
+    assert AuthorizationPolicy(policy_db).is_halted() is True
+
+
+def test_both_sources_omitted_requires_authorization(tmp_path):
+    coordinated = tmp_path / "coord.db"
+    _init_authority(coordinated)
+
+    with pytest.raises(MigrationError, match="omitted without explicit authorization"):
+        LegacyHaltMigration(coordinated, None, None).migrate()
+
+    status, sequence = CoordinatedHalt(coordinated).read_status()
+    assert status is HaltStatus.NOT_HALTED
+    assert sequence == 0
+
+
+def test_directory_path_is_not_treated_as_absent(tmp_path):
+    coordinated = tmp_path / "coord.db"
+    policy_dir = tmp_path / "policy-dir"
+    _init_authority(coordinated)
+    policy_dir.mkdir()
+
+    with pytest.raises(MigrationError, match="not a database file"):
+        LegacyHaltMigration(
+            coordinated,
+            policy_dir,
+            None,
+            absent_legacy_policy=AbsentLegacyPolicy.ABSENT_LEGACY_IS_SAFE,
+            omitted_source_policy=OmittedSourcePolicy.OMITTED_SOURCE_IS_AUTHORIZED,
+        ).migrate()
+
+    status, sequence = CoordinatedHalt(coordinated).read_status()
+    assert status is HaltStatus.NOT_HALTED
+    assert sequence == 0
+
+
+def test_dangling_symlink_is_not_treated_as_absent(tmp_path):
+    coordinated = tmp_path / "coord.db"
+    dangling = tmp_path / "dangling.db"
+    _init_authority(coordinated)
+    dangling.symlink_to(tmp_path / "does-not-exist.db")
+
+    with pytest.raises(MigrationError, match="not a database file"):
+        LegacyHaltMigration(
+            coordinated,
+            dangling,
+            None,
+            absent_legacy_policy=AbsentLegacyPolicy.ABSENT_LEGACY_IS_SAFE,
+            omitted_source_policy=OmittedSourcePolicy.OMITTED_SOURCE_IS_AUTHORIZED,
+        ).migrate()
+
+    status, sequence = CoordinatedHalt(coordinated).read_status()
+    assert status is HaltStatus.NOT_HALTED
+    assert sequence == 0
+
+
+def test_genuinely_missing_file_still_honors_absence_policy(tmp_path):
+    coordinated = tmp_path / "coord.db"
+    missing = tmp_path / "missing.db"
+    _init_authority(coordinated)
+
+    result = LegacyHaltMigration(
+        coordinated,
+        missing,
+        None,
+        absent_legacy_policy=AbsentLegacyPolicy.ABSENT_LEGACY_IS_SAFE,
+        omitted_source_policy=OmittedSourcePolicy.OMITTED_SOURCE_IS_AUTHORIZED,
+    ).migrate()
+
+    assert result.authorization_policy_halted is False
+    assert result.activation_attempted is False
+    status, sequence = CoordinatedHalt(coordinated).read_status()
+    assert status is HaltStatus.NOT_HALTED
+    assert sequence == 0
+
+
+def test_partial_failure_preserves_legacy_halt_and_does_not_activate(tmp_path):
+    """
+    AuthorizationPolicy HALTED + CollaborationProtocol unreadable +
+    CoordinatedHalt NOT_HALTED fails closed without activation.
+    """
+    coordinated = tmp_path / "coord.db"
+    policy_db = tmp_path / "policy.db"
+    protocol_db = tmp_path / "protocol.db"
+    _init_authority(coordinated)
+    _legacy_policy(policy_db, halted=True)
+    protocol_db.write_bytes(b"not a database")
+
+    with pytest.raises(MigrationError, match="unreadable"):
+        LegacyHaltMigration(coordinated, policy_db, protocol_db).migrate()
+
+    status, sequence = CoordinatedHalt(coordinated).read_status()
+    assert status is HaltStatus.NOT_HALTED
+    assert sequence == 0
+    assert AuthorizationPolicy(policy_db).is_halted() is True
+
+
+def test_invalid_omitted_policy_rejected(tmp_path):
+    with pytest.raises(MigrationError, match="Invalid omitted-source policy"):
+        LegacyHaltMigration(
+            tmp_path / "coord.db",
+            None,
+            None,
+            omitted_source_policy="nope",  # type: ignore[arg-type]
         )
