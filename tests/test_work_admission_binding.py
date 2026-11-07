@@ -371,16 +371,23 @@ def test_fabricated_gate_cannot_authorize_lifecycle(tmp_path):
 
 
 def test_unbound_policy_rejects_lifecycle(tmp_path):
+    """Aligned genuine gate, protocol bound, policy not opted in."""
     env = _lifecycle(tmp_path)
-    other = AuthorizationPolicy(tmp_path / "fresh-auth.db")
-    protocol = CollaborationProtocol(tmp_path / "fresh-bridge.db")
-    _init_authority(tmp_path / "fresh-coord.db")
-    gate = CoordinatedHaltGate(tmp_path / "fresh-coord.db", other, protocol)
-    protocol.require_coordinated_guard(gate)
-    with pytest.raises(ValueError, match="policy mismatch"):
-        AuthorizationLifecycle(
-            env["verifier"], env["policy"], protocol, coordinated_gate=gate
-        )
+    env["policy"]._coordinated_guard = None
+    env["policy"]._coordinated_enforcement_required = False
+    assert env["gate"].policy is env["policy"]
+    assert env["gate"].protocol is env["protocol"]
+    assert env["protocol"].coordinated_guard is env["gate"]
+    assert env["policy"].coordinated_enforcement_required is False
+
+    result = env["lifecycle"].evaluate(
+        env["challenge"], _sign(env["private"], env["challenge"])
+    )
+    assert result.accepted is False
+    assert result.reason == "Work admission rejected"
+    assert result.execution_enabled is False
+    assert _status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
+    assert env["policy"].stored_state("auth-1") == "PENDING"
 
 
 def test_unbound_protocol_rejects_lifecycle(tmp_path):
@@ -454,3 +461,74 @@ def test_lifecycle_halted_and_unknown_reject(tmp_path):
     assert result.accepted is False
     assert result.execution_enabled is False
     assert _status(unknown["verifier"], unknown["challenge"]["challenge_id"]) == "open"
+
+
+class _ExplosiveStatus(GateResult):
+    def __getattribute__(self, name):
+        if name == "coordinated_status":
+            raise RuntimeError("secret-validation-token")
+        return super().__getattribute__(name)
+
+
+def test_inspect_allowed_halted_is_invalid(tmp_path):
+    lifecycle = _lifecycle(tmp_path)["lifecycle"]
+    valid, allowed, reason = lifecycle._inspect_gate_result(
+        GateResult(True, "unsafe", "HALTED", True, False, False)
+    )
+    assert valid is False
+    assert allowed is False
+    assert reason == "Coordinated gate result invalid"
+
+
+def test_inspect_incomplete_migration_is_invalid(tmp_path):
+    lifecycle = _lifecycle(tmp_path)["lifecycle"]
+    valid, allowed, reason = lifecycle._inspect_gate_result(
+        GateResult(True, "unsafe", "NOT_HALTED", False, False, False)
+    )
+    assert valid is False
+    assert allowed is False
+    assert reason == "Coordinated gate result invalid"
+
+
+def test_inspect_legacy_halt_is_invalid(tmp_path):
+    lifecycle = _lifecycle(tmp_path)["lifecycle"]
+    for result in (
+        GateResult(True, "unsafe", "NOT_HALTED", True, True, False),
+        GateResult(True, "unsafe", "NOT_HALTED", True, False, True),
+    ):
+        valid, allowed, reason = lifecycle._inspect_gate_result(result)
+        assert valid is False
+        assert allowed is False
+        assert reason == "Coordinated gate result invalid"
+
+
+def test_inspect_malformed_result_type_is_invalid(tmp_path):
+    lifecycle = _lifecycle(tmp_path)["lifecycle"]
+    valid, allowed, reason = lifecycle._inspect_gate_result({"allowed": True})
+    assert valid is False
+    assert allowed is False
+    assert reason == "Coordinated gate result invalid"
+
+
+def test_inspect_exception_propagates_for_boundary(tmp_path):
+    lifecycle = _lifecycle(tmp_path)["lifecycle"]
+    explosive = _ExplosiveStatus(True, "unsafe", "NOT_HALTED", True, False, False)
+    with pytest.raises(RuntimeError, match="secret-validation-token"):
+        lifecycle._inspect_gate_result(explosive)
+
+
+def test_inspect_correctly_formed_safe_result(tmp_path):
+    lifecycle = _lifecycle(tmp_path)["lifecycle"]
+    valid, allowed, reason = lifecycle._inspect_gate_result(
+        GateResult(
+            True,
+            "Safety conditions satisfied; execution disabled",
+            "NOT_HALTED",
+            True,
+            False,
+            False,
+        )
+    )
+    assert valid is True
+    assert allowed is True
+    assert reason == "Safety conditions satisfied; execution disabled"
