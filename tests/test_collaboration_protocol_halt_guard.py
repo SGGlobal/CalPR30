@@ -239,11 +239,17 @@ def test_malformed_or_inconsistent_result_rejects(tmp_path):
 def test_original_guard_identity_enforced(tmp_path):
     policy, protocol, coordinated, original = _setup(tmp_path)
     replacement = CoordinatedHaltGate(coordinated, policy, protocol)
+    assert replacement is not original
+    assert protocol._coordinated_guard_snapshot["guard"] is original
     protocol._coordinated_guard = replacement
     with pytest.raises(ProtocolError, match="Coordinated guard rejected"):
         protocol.accept(_message())
+    assert protocol._coordinated_guard_snapshot["guard"] is original
+    assert protocol.coordinated_guard is replacement
     assert protocol.get_state("T1") is None
-    assert protocol.coordinated_guard is not original or True
+    with sqlite3.connect(protocol.database_path) as connection:
+        count = connection.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
+    assert count == 0
 
 
 def test_guard_removal_after_opt_in_rejects(tmp_path):
@@ -323,16 +329,27 @@ def test_default_ungated_behavior(tmp_path):
 
 
 def test_restart_requires_rebind(tmp_path):
-    _policy, protocol, coordinated, _gate = _setup(tmp_path)
+    policy, protocol, coordinated, _gate = _setup(tmp_path)
     protocol.accept(_message())
     reopened = CollaborationProtocol(protocol.database_path)
     assert reopened.coordinated_guard is None
     assert reopened.get_state("T1").value == "ASSIGNED"
+    with sqlite3.connect(coordinated) as connection:
+        connection.execute(
+            "UPDATE halt_state SET state = 'HALTED', sequence = 1"
+        )
     reopened.require_coordinated_guard(
-        CoordinatedHaltGate(coordinated, AuthorizationPolicy(tmp_path / "auth.db"), reopened)
+        CoordinatedHaltGate(coordinated, policy, reopened)
     )
-    with pytest.raises(ProtocolError):
-        reopened.accept(_message(task_id="T1", key="key-2"))
+    with pytest.raises(ProtocolError, match="Coordinated guard rejected"):
+        reopened.accept(_message(task_id="T2", key="key-2"))
+    assert reopened.get_state("T1").value == "ASSIGNED"
+    assert reopened.get_state("T2") is None
+    with sqlite3.connect(reopened.database_path) as connection:
+        count = connection.execute(
+            "SELECT COUNT(*) FROM messages WHERE task_id = 'T2'"
+        ).fetchone()[0]
+    assert count == 0
 
 
 def test_execution_disabled_throughout(tmp_path):
@@ -342,3 +359,39 @@ def test_execution_disabled_throughout(tmp_path):
     protocol.accept(_message())
     outbound = protocol.track_outbound("T1")
     assert outbound.status == "PENDING"
+
+
+def test_halt_semantics_are_distinct(tmp_path):
+    """Message HALT, administrative halt, and coordinated HALT are not equivalent."""
+    _policy, protocol, coordinated, _gate = _setup(tmp_path)
+    assert protocol.accept(_message()) is True
+    assert protocol.accept(_message(task_id="T2", key="key-2")) is True
+
+    # MessageType.HALT is a task-level protective transition only.
+    assert protocol.accept(_message(message_type=MessageType.HALT, key="halt-1")) is True
+    assert protocol.get_state("T1").value == "HALTED"
+    assert protocol.get_state("T2").value == "ASSIGNED"
+    assert protocol.is_halted is False
+    status, _sequence = CoordinatedHalt(coordinated).read_status()
+    assert status is HaltStatus.NOT_HALTED
+
+    # Administrative halt sets the legacy protocol flag, not coordinated state.
+    protocol.halt()
+    assert protocol.is_halted is True
+    status, _sequence = CoordinatedHalt(coordinated).read_status()
+    assert status is HaltStatus.NOT_HALTED
+
+    # Protective HALT message remains available after administrative halt.
+    assert protocol.accept(_message(task_id="T2", message_type=MessageType.HALT, key="halt-2")) is True
+    assert protocol.get_state("T2").value == "HALTED"
+
+    # Ordinary work is still blocked.
+    with pytest.raises(ProtocolError, match="Coordinated guard rejected"):
+        protocol.accept(_message(task_id="T3", key="key-3"))
+    assert protocol.get_state("T3") is None
+
+    # Coordinated activation is a separate durable authority transition.
+    # Migration during the rejected call above may already have activated it.
+    status, sequence = CoordinatedHalt(coordinated).read_status()
+    assert status is HaltStatus.HALTED
+    assert sequence >= 1

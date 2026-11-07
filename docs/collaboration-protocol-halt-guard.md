@@ -29,6 +29,17 @@ Guarded operations require `allowed is True`, coordinated `NOT_HALTED`, complete
 
 Checks run before local write locks to avoid holding a protocol write lock across multi-database migration. There is no cross-database atomicity. A HALT after a successful check and before the local transaction is a documented race.
 
+
+## HALT semantics are not equivalent
+
+These three operations are distinct and must not be described as interchangeable:
+
+- `MessageType.HALT` is a task-level protective state transition. It changes that task to `HALTED`. It does not set the legacy protocol control flag and does not activate the coordinated authority.
+- `CollaborationProtocol.halt()` is the administrative legacy HALT. It sets the protocol control flag. It remains available when the coordinated authority is unavailable. It does not by itself activate `CoordinatedHalt`.
+- `CoordinatedHalt.activate_halt()` is the durable coordinated authority transition. It uses the coordinated reason-code allowlist and is a separate database.
+
+A protective `MessageType.HALT` remains processable when ordinary work is blocked. No HALT-related exception becomes a pathway for accepting ordinary work. This checkpoint does not change global HALT propagation.
+
 ## Remaining limitations
 
 - Not system-wide enforcement.
