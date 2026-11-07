@@ -440,3 +440,44 @@ def test_guard_configuration_mismatch_after_binding_rejects(tmp_path):
     with pytest.raises(AuthorizationError, match="Coordinated guard rejected"):
         policy.submit(_request())
     assert policy.stored_state("auth-1") is None
+
+
+def test_identical_replacement_guard_is_rejected(tmp_path):
+    policy, protocol, coordinated, original = _setup(tmp_path)
+    replacement = CoordinatedHaltGate(coordinated, policy, protocol)
+    assert replacement is not original
+    policy._coordinated_guard = replacement  # unsupported identical-config swap
+    with pytest.raises(AuthorizationError, match="Coordinated guard rejected"):
+        policy.submit(_request())
+    assert policy.stored_state("auth-1") is None
+    decision = _decide(policy)
+    consumed = policy.consume("auth-1")
+    assert decision.execution_enabled is False
+    assert consumed.execution_enabled is False
+    assert consumed.allowed is False
+    assert policy.stored_state("auth-1") is None
+
+
+def test_original_guard_identity_permits_normal_evaluation(tmp_path):
+    policy, _protocol, _coordinated, gate = _setup(tmp_path)
+    assert policy.coordinated_guard is gate
+    policy.submit(_request())
+    decision = _decide(policy)
+    assert decision.execution_enabled is False
+    assert policy.stored_state("auth-1") == "PENDING"
+
+
+def test_identity_rejection_preserves_administrative_paths(tmp_path):
+    policy = AuthorizationPolicy(tmp_path / "auth.db")
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
+    coordinated = tmp_path / "coord.db"
+    _init_authority(coordinated)
+    policy.submit(_request())
+    gate = CoordinatedHaltGate(coordinated, policy, protocol)
+    policy.require_coordinated_guard(gate)
+    policy._coordinated_guard = CoordinatedHaltGate(coordinated, policy, protocol)
+    policy.halt()
+    decision = policy.revoke("auth-1")
+    assert policy.is_halted() is True
+    assert decision.execution_enabled is False
+    assert policy.stored_state("auth-1") == "REVOKED"

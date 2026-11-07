@@ -19,7 +19,7 @@ Ungated instances are not coordinated-protected.
 
 ## Opt-in mechanism
 
-`AuthorizationPolicy.require_coordinated_guard(gate)` binds a `CoordinatedHaltGate` that must reference the same policy instance. Binding records that coordinated enforcement is required and snapshots the policy, protocol, database locations, coordinated authority path, and migration policy settings. Once required, a missing, replaced, or inconsistent guard fails closed. Supported methods cannot disable the guard. Default construction remains ungated. This does not claim protection against arbitrary modification of the entire Python process.
+`AuthorizationPolicy.require_coordinated_guard(gate)` binds a `CoordinatedHaltGate` that must reference the same policy instance. Binding records that coordinated enforcement is required, retains the original guard instance identity, and snapshots the policy, protocol, database locations, coordinated authority path, and migration policy settings. A replacement with identical configuration is rejected. Once required, a missing, replaced, or inconsistent guard fails closed. Supported methods cannot disable the guard. Default construction remains ungated. This does not claim protection against arbitrary modification of the entire Python process.
 
 The guard is invoked before any local policy write lock. It performs migration itself, requires coordinated `NOT_HALTED`, completed migration, and no legacy HALT. Failed, malformed, contradictory, or exceptional results reject. Exception details are not exposed. A successful result does not grant protected execution.
 

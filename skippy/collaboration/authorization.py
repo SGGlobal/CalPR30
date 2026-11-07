@@ -340,6 +340,7 @@ class AuthorizationPolicy:
         self._coordinated_guard = gate
         self._coordinated_enforcement_required = True
         self._coordinated_guard_snapshot = {
+            "guard": gate,
             "policy": gate.policy,
             "protocol": gate.protocol,
             "policy_path": Path(gate.policy.database_path),
@@ -375,6 +376,8 @@ class AuthorizationPolicy:
             )
 
             if not isinstance(guard, CoordinatedHaltGate):
+                return "Coordinated guard rejected"
+            if guard is not snapshot["guard"]:
                 return "Coordinated guard rejected"
             if guard.policy is not self or guard.policy is not snapshot["policy"]:
                 return "Coordinated guard rejected"
