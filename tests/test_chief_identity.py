@@ -142,10 +142,22 @@ def test_modified_expires_at(tmp_path):
 
 
 def test_expired_registry_despite_altered_payload(tmp_path):
+    """
+    Fixed reference time.
+
+    Issued 4 minutes before reference. Original expiration 3 minutes
+    before reference. Modified signed expiration 2 minutes after reference.
+    The modified payload stays within the 15-minute maximum lifetime.
+    """
+
     private, public = _keypair()
     verifier = ChiefIdentityVerifier(tmp_path / "id.db")
     verifier.register_public_key("test-key", public)
-    past = _now() - timedelta(minutes=10)
+
+    reference = datetime(2026, 11, 6, 18, 0, tzinfo=timezone.utc)
+    issued = reference - timedelta(minutes=4)
+    original_expires = reference - timedelta(minutes=3)
+
     fields = verifier.issue_challenge(
         authorization_id="auth-1",
         action="merge_pull_request",
@@ -156,13 +168,60 @@ def test_expired_registry_despite_altered_payload(tmp_path):
         task_id="task-1",
         expected_sha="a" * 40,
         key_id="test-key",
-        now=past,
+        now=issued,
+        lifetime=original_expires - issued,
+    )
+
+    fields["expires_at"] = (reference + timedelta(minutes=2)).isoformat()
+    canonical_payload(fields)
+    signature = _sign(private, fields)
+
+    result = verifier.verify(fields, signature, now=reference)
+
+    assert result.reason == "Challenge expired"
+    assert result.execution_enabled is False
+
+    # Rejected attempt does not consume the challenge.
+    second = verifier.verify(fields, signature, now=reference)
+    assert second.reason == "Challenge expired"
+
+
+def test_unchanged_expired_challenge(tmp_path):
+    private, public = _keypair()
+    verifier = ChiefIdentityVerifier(tmp_path / "id.db")
+    verifier.register_public_key("test-key", public)
+
+    reference = datetime(2026, 11, 6, 18, 0, tzinfo=timezone.utc)
+    issued = reference - timedelta(minutes=4)
+
+    fields = verifier.issue_challenge(
+        authorization_id="auth-1",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+        now=issued,
         lifetime=timedelta(minutes=1),
     )
-    fields["expires_at"] = (_now() + timedelta(minutes=5)).isoformat()
+
+    result = verifier.verify(fields, _sign(private, fields), now=reference)
+    assert result.reason == "Challenge expired"
+    assert result.execution_enabled is False
+
+
+def test_modified_nonce_rejected(tmp_path):
+    private, public = _keypair()
+    verifier = ChiefIdentityVerifier(tmp_path / "id.db")
+    fields = _prepare(verifier, private, public)
+    fields["nonce"] = "n" * 16
 
     result = verifier.verify(fields, _sign(private, fields))
-    assert result.reason == "Challenge expired"
+    assert result.reason == "Scope mismatch: nonce"
+    assert result.execution_enabled is False
 
 
 def test_scope_mismatch_repository(tmp_path):
