@@ -25,7 +25,7 @@ It does not modify the protected execution architecture.
 1. Check CollaborationProtocol HALT. Fail closed if set.
 2. Check AuthorizationPolicy HALT. Fail closed if set.
 3. Verify the signed challenge against the trusted challenge registry.
-4. Evaluate the authorization policy for the same scope.
+4. Evaluate the authorization policy for the same scope via the non-executing `evaluate_evidence` path (PENDING records only; no state transition).
 5. Return an immutable result. Do not transition the authorization.
 6. Do not enable execution.
 
