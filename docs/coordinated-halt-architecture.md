@@ -108,11 +108,15 @@ CREATE TABLE IF NOT EXISTS halt_events (
 );
 ```
 
-### Explicit initialized states
-- On first open of a new database the facade inserts:
-  - `schema_meta`: `schema_version = '1'`
-  - `halt_state`: `state = 'NOT_HALTED'`, `sequence = 0`, `updated_at = now`, `reason = 'initialized'`
-- Missing control record after schema creation → UNKNOWN → fail closed.
+### Explicit initialized states and safe initialization
+- **Ordinary startup must never recreate a missing HALT database as NOT_HALTED.**
+- If `coordinated_halt.db` is missing, corrupted, unreadable, or lacks a valid control record on normal component startup → status = UNKNOWN → fail closed. The facade does not create or initialize the file.
+- **Explicit authorized bootstrap** is a separate, one-time, operator-invoked operation (not part of normal component constructors or startup). Bootstrap may create the database and insert the initial `NOT_HALTED` row only when:
+  - no prior authority file exists,
+  - the operator supplies an explicit bootstrap flag or confirmation, and
+  - the operation is performed outside the normal request path.
+- After a successful bootstrap the file exists and normal startup only opens and reads it.
+- Missing control record after a previously valid database, unrecognized state value, or schema version mismatch → UNKNOWN → fail closed.
 - Any state value other than `'NOT_HALTED'` or `'HALTED'` → UNKNOWN → fail closed.
 
 ### Schema versioning
@@ -134,9 +138,11 @@ CREATE TABLE IF NOT EXISTS halt_events (
 - Timeout on lock acquisition is finite (recommended 5 s, matching existing component timeouts); timeout → fail closed.
 
 ### Startup initialization
-- Constructor opens the database, creates schema if absent, inserts the initial `NOT_HALTED` row if the table is empty, and verifies schema version.
-- Failure to initialize → the object is unusable; any subsequent `require_not_halted()` fails closed.
+- Normal constructor / startup opens an existing database only. It verifies schema version and reads the control record under a transaction.
+- It does **not** create the database or insert an initial `NOT_HALTED` row.
+- Missing file, unreadable file, missing control record, or any initialization failure → the object is unusable; `require_not_halted()` fails closed.
 - Existing components that are given a CoordinatedHalt instance must not fall back to local-only HALT checks once the coordinated path is commissioned.
+- Authorized bootstrap (separate entry point) is the only path that may create the initial `NOT_HALTED` authority.
 
 ### Idempotent HALT requests
 - Calling `activate_halt()` when already `HALTED` succeeds and returns the existing sequence.
@@ -241,6 +247,7 @@ class CoordinatedHalt:
 
 ### Guarantees that cannot be achieved across separate databases
 - There is no distributed transaction spanning `coordinated_halt.db`, `policy.db`, and `protocol.db`.
+- A shared HALT check does **not** make transactions across these separate databases atomic.
 - A component can observe NOT_HALTED, then a HALT can commit, then the component can still commit a local acceptance that was already in flight.
 - Challenge consumption in the identity database and policy evaluation remain non-atomic with each other and with the HALT flag.
 - A shared HALT flag alone does **not** eliminate concurrency races for in-flight local work.
@@ -272,10 +279,22 @@ Before any external side effect (GitHub write, Railway deploy, IFTTT, trading, H
    - An audit event `legacy_halt_discovered` or `migration_complete` has been written.
 7. No automatic recovery: migration never clears a HALT. A failed migration leaves the system failed closed.
 
+### Legacy process cutover
+Before the coordinated authority is declared authoritative, all legacy-only processes must be stopped or isolated so they can no longer accept work.
+
+Cutover sequence:
+1. Drain or stop every process that reads only its original local HALT flag (AuthorizationPolicy or CollaborationProtocol independent stores).
+2. Confirm no such process remains able to accept or evaluate work.
+3. Perform the migration read of legacy stores and activate the coordinated store if any legacy HALT is present.
+4. Deploy only processes that require a CoordinatedHalt instance and call `require_not_halted()` before accepting work.
+5. Declare the coordinated authority authoritative only after steps 1–4 succeed.
+
+A new HALT must not be bypassable by older processes that still read only their original databases. Therefore coordinated HALT is not treated as the sole authority until the cutover is complete. During the cutover window any mixed-version detection or inability to reach the coordinated store fails closed.
+
 ### Routing of existing entry points
 - `AuthorizationPolicy.halt()` → calls `coordinated.activate_halt(reason="policy_halt")` then writes its local audit event. Local flag may also be set for backward compatibility during migration, but readers must prefer the coordinated flag.
 - `CollaborationProtocol.halt()` → same pattern.
-- After migration, `is_halted` / `require_not_halted` on both components consult only the coordinated authority.
+- After cutover and migration, `is_halted` / `require_not_halted` on both components consult only the coordinated authority.
 
 ---
 
@@ -283,7 +302,7 @@ Before any external side effect (GitHub write, Railway deploy, IFTTT, trading, H
 
 | # | Condition | Expected behavior | execution_enabled |
 |---|-----------|-------------------|-------------------|
-| 1 | Shared database unavailable (missing file, permission, disk error) | Status = UNKNOWN; `require_not_halted()` raises; evaluation rejected | False |
+| 1 | Shared database unavailable (missing file, permission, disk error) | Status = UNKNOWN; ordinary startup does **not** recreate as NOT_HALTED; `require_not_halted()` raises; evaluation rejected | False |
 | 2 | SQLite lock timeout | Status = UNKNOWN; fail closed | False |
 | 3 | Corrupted database | Status = UNKNOWN; fail closed; no automatic repair that could clear HALT | False |
 | 4 | Missing control record | Status = UNKNOWN; fail closed | False |
@@ -293,7 +312,7 @@ Before any external side effect (GitHub write, Railway deploy, IFTTT, trading, H
 | 8 | Concurrent HALT requests | One increments sequence; others observe HALTED and succeed (idempotent) | False |
 | 9 | Partial migration | Fail closed; coordinated store HALTED or UNKNOWN; no bypass | False |
 | 10 | Stale HALT observation | Next `require_not_halted()` or re-check inside local transaction sees current state; in-flight local work may still complete (see concurrency limitations) | False |
-| 11 | Audit-write failure | Primary HALT commit is not rolled back; auxiliary audit failure is logged best-effort and does not erase the HALT | False |
+| 11 | Audit-write failure (secondary) | Mandatory HALT state remains committed; secondary audit failure is ignored and never reverses the HALT | False |
 | 12 | Component initialized without coordinated authority | Fail closed; no local-only fallback once migration has started | False |
 
 Every case in which operational safety cannot be established fails closed.
@@ -302,9 +321,10 @@ Every case in which operational safety cannot be established fails closed.
 
 ## 8. Audit semantics (Task 6)
 
-### Safety-critical vs best-effort
-- **Safety-critical:** the `halt_state` row and its sequence in the coordinated database. A failed write here means the HALT is not activated.
-- **Best-effort secondary:** rows in `halt_events` and any lifecycle audit events written to the policy database. Failure of these must not roll back a committed HALT.
+### Safety-critical vs best-effort (audit transaction semantics)
+- **Mandatory / safety-critical:** the `halt_state` row update (state + sequence) in the coordinated database. This write is the sole determinant of whether HALT is durably activated. It commits in its own transaction (or is committed before any secondary audit). A failure here means the HALT is not activated.
+- **Best-effort secondary:** rows in `halt_events` and any lifecycle audit events written to the policy database. These are written after the HALT state transaction has committed, or in a separate transaction whose failure is caught and ignored.
+- A secondary audit failure must **never** reverse, roll back, or erase a committed HALT. Implementation must not place secondary audit writes in the same transaction as the `halt_state` update if a failure of the audit write could cause the HALT state change to roll back.
 
 ### Required audit events (best-effort unless noted)
 - `halt_requested` — activation attempted.
@@ -320,6 +340,22 @@ Every case in which operational safety cannot be established fails closed.
 - A failed auxiliary audit write must not erase a durably committed HALT.
 - Audit records must not store signatures, private keys, or sensitive payloads.
 - Audit is not claimed to be tamper-proof.
+
+---
+
+## 8.1 Lifecycle audit failure (current verified behavior)
+
+In the current verified code (`AuthorizationLifecycle._audit`):
+- The call to `policy.record_lifecycle_audit()` is wrapped in a bare `except Exception: pass`.
+- If auxiliary lifecycle audit persistence fails for any reason (disk full, lock, constraint, etc.), the exception is swallowed.
+- The evaluation decision is unchanged: the method still returns the `LifecycleResult` that was already determined.
+- A failed auxiliary lifecycle audit does not enable execution and does not alter `execution_enabled` (always `False`).
+
+Distinction:
+- `LifecycleResult.accepted=True` with `policy_state=PENDING` means synthetic evidence matched a PENDING authorization record. It does **not** grant execution permission, does not transition the authorization to APPROVED, and does not authorize any protected action.
+- Execution permission remains disabled. Accepting synthetic evidence and granting execution permission are distinct; only the former can occur in the current offline bridge, and only with `execution_enabled=False`.
+
+This behavior is preserved: auxiliary audit failure must not change the fail-closed evaluation outcome.
 
 ---
 
@@ -368,6 +404,8 @@ This checkpoint performs none of the above.
 ## 11. Commissioning blockers (remaining)
 
 - Coordinated HALT is not yet implemented; independent flags remain.
+- Ordinary startup must not recreate a missing authority as NOT_HALTED (authorized bootstrap is separate).
+- Legacy-only processes must be stopped or isolated before coordinated HALT is authoritative.
 - Cross-database atomicity is not guaranteed.
 - No execution fence exists for external side effects.
 - Real Chief enrollment and approval capture are not implemented.
