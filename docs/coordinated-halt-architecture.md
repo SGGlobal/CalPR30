@@ -1,4 +1,6 @@
-# SKIPPY AI Collaboration Bridge — Coordinated HALT Architecture (Step 69E.3B.1A)
+# SKIPPY AI Collaboration Bridge — Coordinated HALT Architecture (Step 69E.3B.1B.1)
+
+**Latest completed architecture checkpoint:** 69E.3B.1B.1 (this document).
 
 **Status:** Architecture-only. Documentation checkpoint.  
 **No production code changes in this commit.**  
@@ -111,10 +113,10 @@ CREATE TABLE IF NOT EXISTS halt_events (
 ### Explicit initialized states and safe initialization
 - **Ordinary startup must never recreate a missing HALT database as NOT_HALTED.**
 - If `coordinated_halt.db` is missing, corrupted, unreadable, or lacks a valid control record on normal component startup → status = UNKNOWN → fail closed. The facade does not create or initialize the file.
-- **Explicit authorized bootstrap** is a separate, one-time, operator-invoked operation (not part of normal component constructors or startup). Bootstrap may create the database and insert the initial `NOT_HALTED` row only when:
-  - no prior authority file exists,
-  - the operator supplies an explicit bootstrap flag or confirmation, and
-  - the operation is performed outside the normal request path.
+- **Explicit authorized bootstrap** is a separate, one-time, operator-invoked operation (not part of normal component constructors or startup). An absent `coordinated_halt.db` is insufficient proof of a fresh installation.
+- Bootstrap may create the database and insert the initial `NOT_HALTED` row only when independently verified first-installation conditions are met (for example: explicit operator confirmation that this is the first installation, no prior authority file was expected, and the operation is performed outside the normal request path with an explicit bootstrap flag).
+- Normal startup must open an existing database without implicitly creating it.
+- An unexpectedly missing authority remains UNKNOWN and fails closed.
 - After a successful bootstrap the file exists and normal startup only opens and reads it.
 - Missing control record after a previously valid database, unrecognized state value, or schema version mismatch → UNKNOWN → fail closed.
 - Any state value other than `'NOT_HALTED'` or `'HALTED'` → UNKNOWN → fail closed.
@@ -133,8 +135,10 @@ CREATE TABLE IF NOT EXISTS halt_events (
 
 ### Transaction requirements
 - Every read of status and every activation uses `BEGIN IMMEDIATE`.
-- Activation updates `halt_state` and inserts a `halt_events` row in the same transaction.
-- The facade reports the HALT as durably activated only after the transaction commits successfully.
+- Activation updates only the mandatory `halt_state` row (state + sequence) inside its transaction and commits that transaction independently.
+- Optional `halt_events` rows (including any `halt_durably_activated` record) are best-effort and are written after the mandatory transaction has committed, or in a separate transaction whose failure is ignored.
+- The facade reports the HALT as durably activated only after the mandatory `halt_state` transaction commits successfully.
+- A secondary audit failure must never roll back an already committed HALT.
 - Timeout on lock acquisition is finite (recommended 5 s, matching existing component timeouts); timeout → fail closed.
 
 ### Startup initialization
@@ -150,8 +154,9 @@ CREATE TABLE IF NOT EXISTS halt_events (
 - An audit event of type `duplicate_halt_request` may be written (best-effort).
 
 ### Durable commit confirmation
-- `activate_halt()` returns only after the `BEGIN IMMEDIATE` … `COMMIT` succeeds.
-- If the process crashes before commit, the HALT is not activated (see failure matrix).
+- `activate_halt()` returns only after the mandatory `halt_state` transaction (`BEGIN IMMEDIATE` … `COMMIT`) succeeds.
+- Optional audit inserts are not required for this return.
+- If the process crashes before the mandatory commit, the HALT is not activated (see failure matrix).
 - Callers must treat the return of `activate_halt()` as the linearization point for “HALT is durably active.”
 
 ### Restart behavior
@@ -233,7 +238,7 @@ class CoordinatedHalt:
 
 ### Linearization points
 - **HALT activation linearization point:** successful commit of the `activate_halt()` transaction in the shared control database.
-- **Protected local transition linearization point:** the moment a component has both (a) observed NOT_HALTED via `require_not_halted()` and (b) begun its own local `BEGIN IMMEDIATE` transaction that will accept or evaluate work. The local transaction must re-check the coordinated flag (or have been started only after a fresh check) before committing any local acceptance.
+- **Protected local transition linearization point:** a local `BEGIN IMMEDIATE` on the component’s own database is independent of the shared control database. A fresh `require_not_halted()` call is only a point-in-time observation against the control database. It does not join the local transaction into one atomic operation with the HALT read. Already-started local operations may still race with a subsequent HALT activation.
 
 ### SQLite locking on the shared control database
 - `BEGIN IMMEDIATE` on the control database serializes writers.
@@ -242,8 +247,11 @@ class CoordinatedHalt:
 - This gives a clear happens-before relationship for the HALT flag itself.
 
 ### Guarantees that can be achieved for local database operations
-- Within a single component’s own database, a local `BEGIN IMMEDIATE` can make the local acceptance atomic with a re-check of the coordinated flag if the re-check is performed inside that transaction (by opening a second connection to the control database or by using a shared connection carefully).
-- Restart safety: a committed HALT is visible to every subsequent process.
+- Within a single component’s own database, a local `BEGIN IMMEDIATE` provides atomicity only for that database’s own writes. It does not automatically form one atomic operation with a read of the separate shared HALT database.
+- Separate databases retain independent transaction boundaries.
+- A fresh HALT check is a point-in-time observation. Already-started local operations may race with HALT activation.
+- Restart safety: a committed HALT is visible to every subsequent process that successfully reads the control database.
+- Execution fencing remains a commissioning blocker before any external side effects can be commissioned.
 
 ### Guarantees that cannot be achieved across separate databases
 - There is no distributed transaction spanning `coordinated_halt.db`, `policy.db`, and `protocol.db`.
@@ -328,7 +336,7 @@ Every case in which operational safety cannot be established fails closed.
 
 ### Required audit events (best-effort unless noted)
 - `halt_requested` — activation attempted.
-- `halt_durably_activated` — written in the same transaction as the state change (safety-critical companion).
+- `halt_durably_activated` — best-effort secondary record written after the mandatory `halt_state` commit (or in a separate transaction). It is not a required same-transaction companion of the state update. Failure to write it does not reverse the committed HALT.
 - `duplicate_halt_request` — already HALTED.
 - `halt_read_failure` — status mapped to UNKNOWN.
 - `halt_evaluation_rejection` — a component rejected work because of HALT or UNKNOWN.
@@ -382,7 +390,7 @@ Tests are specified here; they are **not implemented** in this checkpoint.
 | No automatic recovery | No API or path clears HALT |
 | No execution capability | Every result has `execution_enabled=False` |
 | Oversized authorization identifier (PR #12 coverage) | Rejected before any DB query; `execution_enabled=False` |
-| Lifecycle audit persistence failure | Evaluation still fails closed; HALT (if any) not erased |
+| Lifecycle audit persistence failure | Auxiliary audit exception does not change the result: successful synthetic evidence may remain accepted; rejected evidence remains rejected; `execution_enabled` remains False; no APPROVED transition occurs |
 
 ---
 
