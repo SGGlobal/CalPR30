@@ -1,125 +1,391 @@
-# SKIPPY AI Collaboration Bridge — Coordinated HALT Architecture (Step 69E.3B.1)
+# SKIPPY AI Collaboration Bridge — Coordinated HALT Architecture (Step 69E.3B.1A)
 
-**Status:** Architecture-only. No production HALT changes in this checkpoint.  
-**execution_enabled remains False.**  
-**No real Chief enrollment, no GitHub writes, no trading, no protected execution.**
+**Status:** Architecture-only. Documentation checkpoint.  
+**No production code changes in this commit.**  
+**execution_enabled remains False on every path.**  
+**No automatic HALT reset. No real Chief enrollment. No protected execution.**
 
-## 1. Current independent HALT interfaces
+Verified integration baseline: 470 tests passed.  
+Preferred direction (accepted by Skyppy): injected `CoordinatedHalt` facade over a single SQLite control database.
 
-### AuthorizationPolicy (`skippy/collaboration/authorization.py`)
-- Persistent flag in its own SQLite database: table `authorization_control`, key `'halted'`, value `'1'`.
-- Methods:
-  - `halt()` — writes the flag inside a transaction (`BEGIN IMMEDIATE`) and records an audit event.
-  - `is_halted()` — reads the flag.
-- Checked inside `decide()` and `evaluate_evidence()` (both open their own `BEGIN IMMEDIATE` transaction, read the flag first, fail closed with `AuthorizationDecision(allowed=False, state=DENIED, reason="System is halted")`, `execution_enabled=False`).
-- Does **not** observe CollaborationProtocol HALT.
-- No automatic resume.
+Existing verified behavior is clearly separated from proposed behavior below.
 
-### CollaborationProtocol (`skippy/collaboration/protocol.py`)
-- Persistent flag in its own SQLite database: table `control`, key `'halted'`, value `'1'`.
-- Methods:
-  - `halt()` — writes the flag inside `BEGIN IMMEDIATE`.
-  - `is_halted` (property) — refreshes from SQLite on every read (`_refresh_halt`).
-- Checked inside `accept()` and outbound request paths (read inside the acceptance transaction so a second process cannot accept new work after another process has halted).
-- Raises `ProtocolError` when halted (except for an explicit HALT message).
-- Does **not** observe AuthorizationPolicy HALT.
-- No automatic resume.
+---
 
-### ChiefIdentityVerifier (`skippy/collaboration/chief_identity.py`)
-- No HALT flag or control table.
-- Challenge registry and trusted-key tables only.
-- Verification is independent of any HALT state.
+## 1. Threat model
 
-### AuthorizationLifecycle (`skippy/collaboration/authorization_lifecycle.py`)
-- Bridge only. Checks **both** independent flags sequentially:
-  1. `protocol.is_halted`
-  2. `policy.is_halted()`
-- Fails closed (returns `LifecycleResult(accepted=False, execution_enabled=False)`) if either is set.
-- Records a non-mutating lifecycle audit.
-- **Race window:** the two checks are separate database connections. A HALT written to one component between the two reads is not atomic across components.
-- Does not write either HALT flag.
+### Assets to protect
+- Consequential actions (GitHub writes, deployments, trading, credential changes, autonomous execution).
+- Authorization state transitions that could be interpreted as approval.
+- Challenge consumption that could be used to claim evidence.
+- Audit integrity of HALT events.
 
-## 2. SQLite persistence and transaction boundaries
+### Adversaries / failure modes considered
+- Compromised or buggy component that continues after HALT is requested.
+- Multiple processes or restarts that observe a stale local flag.
+- Mixed-version processes during migration.
+- Database unavailability, corruption, lock timeout, or crash.
+- Audit-write failure that must not erase a committed HALT.
+- Operator error or partial migration that leaves legacy and coordinated stores inconsistent.
 
-| Component              | Database          | Control table              | Transaction style                  | Atomic with other components? |
-|------------------------|-------------------|----------------------------|------------------------------------|-------------------------------|
-| AuthorizationPolicy    | policy.db         | authorization_control      | BEGIN IMMEDIATE on decide/evaluate | No                            |
-| CollaborationProtocol  | protocol.db       | control                    | BEGIN IMMEDIATE on accept/halt     | No                            |
-| ChiefIdentityVerifier  | identity.db       | (none)                     | BEGIN IMMEDIATE on verify/issue    | No                            |
+### Security goals
+- A HALT, once durably activated, cannot be bypassed by independently operating collaboration, identity, or authorization components.
+- UNKNOWN or unreadable HALT state fails closed.
+- No method may grant execution permission.
+- No automatic recovery or resume.
 
-All three databases are separate files. There is no shared transaction, no two-phase commit, and no cross-database trigger.
+### Non-goals (this architecture)
+- Real Chief enrollment or biometric/hardware confirmation.
+- Enabling any protected execution path.
+- Tamper-proof or append-only external audit log (best-effort secondary audit only).
+- Cross-database atomicity between primary component databases.
+- Automatic cancellation of already-started external side effects (future execution fencing required before any external side effects are commissioned).
 
-## 3. Failure behavior today
+---
 
-- Each component fails closed on **its own** HALT only.
-- Lifecycle fails closed if **either** reports HALT, but the checks are not atomic.
-- A process that only talks to AuthorizationPolicy (or only to CollaborationProtocol) can still proceed if the other component is halted.
-- Restarting a process reloads the flag from SQLite (persistent), but there is no coordinated view.
-- No automatic recovery or resume path exists in any component.
+## 2. Recommended architecture
 
-## 4. Design goal for coordinated HALT
-
-A HALT must be impossible to bypass by independently operating collaboration, identity, or authorization components.
-
-Required properties (to be implemented in a later, separately reviewed milestone):
-
-1. **Single source of truth** for the emergency HALT flag, persisted and readable by every component that can accept work or evaluate evidence.
-2. **Fail-closed on any HALT** — if the coordinated flag is set, AuthorizationPolicy.decide/evaluate_evidence, CollaborationProtocol.accept/outbound, and AuthorizationLifecycle.evaluate must all reject new work.
-3. **No bypass path** — a component must not be able to accept or evaluate work solely because its local flag is clear.
-4. **Persistence across restarts** and across process boundaries.
-5. **Audit** — every HALT set, clear (when eventually allowed), and rejection caused by HALT is recorded. Audit must not store secrets.
-6. **execution_enabled remains False** in all results. HALT never enables execution.
-7. **No automatic resume.** Clearing HALT is an explicit, separately authorized Chief action (future milestone).
-8. **Commissioning blocker remains** until the coordinated path is implemented, tested, and reviewed.
-
-## 5. Proposed architecture (not implemented)
+**Injected CoordinatedHalt facade over a single authoritative SQLite control database.**
 
 ```
-                    +---------------------------+
-                    |  CoordinatedHaltStore     |
-                    |  (single SQLite file or   |
-                    |   shared control table)   |
-                    |  key='halted' value='1'   |
-                    +-------------+-------------+
-                                  |
-          +-----------------------+-----------------------+
-          |                       |                       |
-   AuthorizationPolicy    CollaborationProtocol   AuthorizationLifecycle
-   (reads coordinated)    (reads coordinated)     (reads coordinated)
-          |                       |                       |
-   local audit only       local audit only        non-mutating audit
+                    +-----------------------------------+
+                    |  CoordinatedHalt                  |
+                    |  (owns single control.db)         |
+                    |  schema_version, halt_state,      |
+                    |  monotonic sequence, timestamps   |
+                    +----------------+------------------+
+                                     |
+          +--------------------------+--------------------------+
+          |                          |                          |
+   AuthorizationPolicy       CollaborationProtocol      AuthorizationLifecycle
+   (injected reader)         (injected reader)          (injected reader)
+          |                          |                          |
+   existing local DB         existing local DB          non-mutating audit
+   (auth requests)           (tasks, messages)          (policy events)
 ```
 
-Options (to be decided in a later implementation checkpoint):
+- Primary data stays in the existing per-component SQLite files.
+- The HALT source of truth is exclusively the shared control database.
+- Components receive a `CoordinatedHalt` instance at construction (or a narrow reader interface).
+- Legacy `AuthorizationPolicy.halt()` and `CollaborationProtocol.halt()` become thin adapters that call `activate_halt()` on the coordinated authority and then update their local audit only.
+- ChiefIdentityVerifier continues to have no HALT flag of its own; any future verification path that could accept work must consult the coordinated authority (via the lifecycle bridge or an explicit check).
 
-- **A. Shared control database** — one small SQLite file that all three components open for the HALT flag only. Existing per-component databases remain for their primary data.
-- **B. HALT service / facade** — a thin CoordinatedHalt object injected into Policy, Protocol, and Lifecycle. It owns the single database connection for the flag.
-- **C. Dual-write with verification** — each component writes its own flag **and** a shared flag; readers require the shared flag to be clear. Higher complexity; only if shared file is unacceptable.
-
-Preferred direction for the next milestone: **B (injected facade over a single control database)** so that existing component constructors change minimally and the HALT source of truth is explicit.
-
-## 6. Methods that currently read or modify HALT independently
-
-| Method                          | Component             | Reads own flag | Writes own flag | Observes other flag |
-|---------------------------------|-----------------------|----------------|-----------------|---------------------|
-| AuthorizationPolicy.halt        | Policy                | —              | Yes             | No                  |
-| AuthorizationPolicy.is_halted   | Policy                | Yes            | —               | No                  |
-| AuthorizationPolicy.decide      | Policy                | Yes            | —               | No                  |
-| AuthorizationPolicy.evaluate_evidence | Policy          | Yes            | —               | No                  |
-| CollaborationProtocol.halt      | Protocol              | —              | Yes             | No                  |
-| CollaborationProtocol.is_halted | Protocol              | Yes            | —               | No                  |
-| CollaborationProtocol.accept    | Protocol              | Yes            | —               | No                  |
-| AuthorizationLifecycle.evaluate | Lifecycle             | Both (seq.)    | —               | Both (race window)  |
-| ChiefIdentityVerifier.*         | Identity              | No             | No              | No                  |
-
-## 7. Constraints preserved
-
-- This checkpoint contains **no production code changes**.
+Existing verified behavior (unchanged in this checkpoint):
+- Each component currently maintains an independent persistent flag in its own database.
+- Lifecycle checks both flags sequentially (race window).
 - `execution_enabled=False` everywhere.
-- Separate databases for primary data remain.
-- Terminal states, challenge single-use, and existing fail-closed paths are unchanged.
-- Coordinated HALT is still a commissioning blocker until implemented.
+- No automatic resume.
 
-## 8. Next milestone (out of scope for 69E.3B.1)
+---
 
-Implement the chosen coordinated HALT store, inject it, update the three components to consult it, add regression tests that prove a HALT set through any entry point is observed by all others, and re-confirm the 470-test baseline.
+## 3. Persistent HALT store (Task 1)
+
+### Authoritative database
+Single file: `coordinated_halt.db` (path supplied at construction; directory must exist).
+
+### Schema (proposed)
+
+```sql
+CREATE TABLE IF NOT EXISTS schema_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS halt_state (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+    state     TEXT NOT NULL CHECK (state IN ('NOT_HALTED', 'HALTED')),
+    sequence  INTEGER NOT NULL CHECK (sequence >= 0),
+    updated_at TEXT NOT NULL,
+    reason    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS halt_events (
+    event_id   TEXT PRIMARY KEY,
+    occurred_at TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    sequence   INTEGER,
+    detail     TEXT NOT NULL
+);
+```
+
+### Explicit initialized states
+- On first open of a new database the facade inserts:
+  - `schema_meta`: `schema_version = '1'`
+  - `halt_state`: `state = 'NOT_HALTED'`, `sequence = 0`, `updated_at = now`, `reason = 'initialized'`
+- Missing control record after schema creation → UNKNOWN → fail closed.
+- Any state value other than `'NOT_HALTED'` or `'HALTED'` → UNKNOWN → fail closed.
+
+### Schema versioning
+- `schema_meta.schema_version` is an integer string.
+- Readers refuse to operate if the version is higher than the code understands (fail closed).
+- Additive migrations only; no automatic data-destroying upgrades.
+- Version is checked inside the same transaction as the HALT read/write.
+
+### Monotonic HALT transitions
+- Allowed transition: `NOT_HALTED` → `HALTED` (sequence increments by 1).
+- Forbidden in this architecture: `HALTED` → `NOT_HALTED` (no clearing method exists).
+- Duplicate activation while already `HALTED` is a no-op that still returns success after confirming the committed state; sequence is not incremented.
+- Sequence is strictly monotonic and only increases on a successful activation.
+
+### Transaction requirements
+- Every read of status and every activation uses `BEGIN IMMEDIATE`.
+- Activation updates `halt_state` and inserts a `halt_events` row in the same transaction.
+- The facade reports the HALT as durably activated only after the transaction commits successfully.
+- Timeout on lock acquisition is finite (recommended 5 s, matching existing component timeouts); timeout → fail closed.
+
+### Startup initialization
+- Constructor opens the database, creates schema if absent, inserts the initial `NOT_HALTED` row if the table is empty, and verifies schema version.
+- Failure to initialize → the object is unusable; any subsequent `require_not_halted()` fails closed.
+- Existing components that are given a CoordinatedHalt instance must not fall back to local-only HALT checks once the coordinated path is commissioned.
+
+### Idempotent HALT requests
+- Calling `activate_halt()` when already `HALTED` succeeds and returns the existing sequence.
+- No error is raised for duplicates.
+- An audit event of type `duplicate_halt_request` may be written (best-effort).
+
+### Durable commit confirmation
+- `activate_halt()` returns only after the `BEGIN IMMEDIATE` … `COMMIT` succeeds.
+- If the process crashes before commit, the HALT is not activated (see failure matrix).
+- Callers must treat the return of `activate_halt()` as the linearization point for “HALT is durably active.”
+
+### Restart behavior
+- On reopen the facade reads the committed `halt_state` row.
+- A previously committed `HALTED` remains `HALTED`.
+- There is no in-memory cache that can override the database; every `read_status()` / `require_not_halted()` re-reads under a transaction.
+
+### Invalid-state handling
+- Missing row, unrecognized state value, schema version mismatch, or any SQLite error during the read → status = UNKNOWN.
+- UNKNOWN fails closed (`require_not_halted()` raises; evaluation returns rejected with `execution_enabled=False`).
+
+### Multi-process access
+- SQLite WAL mode is recommended for the control database (better concurrent readers).
+- Writers use `BEGIN IMMEDIATE` so only one activation can proceed at a time.
+- Multiple processes may call `activate_halt()` concurrently; exactly one will increment the sequence; others observe the already-committed HALTED state and return success.
+- Readers never block writers indefinitely; lock timeout fails closed.
+
+### NOT_HALTED vs UNKNOWN
+- `NOT_HALTED`: control record present, state exactly `'NOT_HALTED'`, schema version understood, read succeeded.
+- `UNKNOWN`: any failure to establish the above (missing file, corruption, lock timeout, missing row, bad value, version mismatch).
+- UNKNOWN must fail closed. It is never treated as NOT_HALTED.
+
+---
+
+## 4. HALT API (Task 2)
+
+Proposed class: `CoordinatedHalt`
+
+```python
+class HaltStatus(str, Enum):
+    NOT_HALTED = "NOT_HALTED"
+    HALTED = "HALTED"
+    UNKNOWN = "UNKNOWN"
+
+class HaltError(RuntimeError):
+    """Raised when HALT state cannot be established as clear."""
+
+class CoordinatedHalt:
+    def __init__(self, database_path: str | Path) -> None: ...
+
+    def activate_halt(self, reason: str) -> int:
+        """
+        Durably activate HALT.
+        Returns the sequence number after the transaction commits.
+        Idempotent if already HALTED.
+        Raises HaltError if the write cannot be committed.
+        Never grants execution permission.
+        """
+
+    def read_status(self) -> tuple[HaltStatus, int | None]:
+        """
+        Returns (status, sequence).
+        sequence is None when status is UNKNOWN.
+        Never raises for ordinary read failures; maps them to UNKNOWN.
+        """
+
+    def require_not_halted(self) -> None:
+        """
+        Raises HaltError if status is not exactly NOT_HALTED.
+        Used at the start of any protected evaluation or acceptance path.
+        """
+```
+
+### Persistence and failure semantics
+- `activate_halt()` is durable only after commit. A return value means the HALT is committed.
+- `read_status()` is a point-in-time observation under a short transaction.
+- `require_not_halted()` is the enforcement point; it must be called inside the same logical operation that would otherwise accept work, ideally under the component’s own transaction when practical, but always against the shared control database.
+- No method returns or sets `execution_enabled=True`.
+- Clearing HALT is not part of this API.
+
+---
+
+## 5. Concurrency control (Task 3)
+
+### Sequence that must be addressed
+1. Component A reads NOT_HALTED.
+2. Process B calls `activate_halt()` and commits.
+3. Component A continues and performs a local state transition or evaluation.
+
+### Linearization points
+- **HALT activation linearization point:** successful commit of the `activate_halt()` transaction in the shared control database.
+- **Protected local transition linearization point:** the moment a component has both (a) observed NOT_HALTED via `require_not_halted()` and (b) begun its own local `BEGIN IMMEDIATE` transaction that will accept or evaluate work. The local transaction must re-check the coordinated flag (or have been started only after a fresh check) before committing any local acceptance.
+
+### SQLite locking on the shared control database
+- `BEGIN IMMEDIATE` on the control database serializes writers.
+- A reader using `BEGIN DEFERRED` or a short `BEGIN IMMEDIATE` sees a consistent snapshot.
+- Lock timeout is finite; failure → UNKNOWN → fail closed.
+- This gives a clear happens-before relationship for the HALT flag itself.
+
+### Guarantees that can be achieved for local database operations
+- Within a single component’s own database, a local `BEGIN IMMEDIATE` can make the local acceptance atomic with a re-check of the coordinated flag if the re-check is performed inside that transaction (by opening a second connection to the control database or by using a shared connection carefully).
+- Restart safety: a committed HALT is visible to every subsequent process.
+
+### Guarantees that cannot be achieved across separate databases
+- There is no distributed transaction spanning `coordinated_halt.db`, `policy.db`, and `protocol.db`.
+- A component can observe NOT_HALTED, then a HALT can commit, then the component can still commit a local acceptance that was already in flight.
+- Challenge consumption in the identity database and policy evaluation remain non-atomic with each other and with the HALT flag.
+- A shared HALT flag alone does **not** eliminate concurrency races for in-flight local work.
+
+### Future execution fencing
+Before any external side effect (GitHub write, Railway deploy, IFTTT, trading, Hermes action) can be commissioned:
+- An execution fence must be able to cancel or refuse the side effect even after local acceptance.
+- The fence must re-check the coordinated HALT flag at the last possible moment before the external call.
+- Local acceptance must be reversible or must not imply external permission.
+- This architecture does not provide that fence; it only provides the durable HALT signal that the fence would consult.
+
+---
+
+## 6. Legacy migration (Task 4)
+
+### Existing stores
+- AuthorizationPolicy: `authorization_control` key `'halted'` value `'1'`.
+- CollaborationProtocol: `control` key `'halted'` value `'1'`.
+
+### Migration sequence (proposed)
+1. On first startup with a CoordinatedHalt instance, the facade (or a one-time migration helper) opens both legacy databases in read-only mode if they exist.
+2. If either legacy store contains a committed HALT (`value = '1'`), the coordinated store is activated (`NOT_HALTED` → `HALTED`) if it is not already HALTED. This preserves existing HALT records.
+3. If a legacy database exists but cannot be read (corruption, permission, lock timeout), migration fails closed: the coordinated store is set to HALTED (or left UNKNOWN, which also fails closed) and an audit event `migration_failure` is recorded. No component is allowed to proceed as NOT_HALTED.
+4. Mixed-version processes: a process still using only the legacy flag must be treated as unsafe. Deployment order must ensure that no process accepts work without consulting the coordinated authority once migration has begun. A process that cannot obtain a CoordinatedHalt instance fails closed.
+5. After successful migration the legacy flags are left in place (not cleared) so that any straggler process that still checks them will also see HALT. They are never used as the source of truth again.
+6. Migration completion criteria:
+   - Coordinated store exists, schema version understood, and state is either NOT_HALTED (only if no legacy HALT was found) or HALTED.
+   - Both legacy databases have been successfully read or confirmed absent.
+   - An audit event `legacy_halt_discovered` or `migration_complete` has been written.
+7. No automatic recovery: migration never clears a HALT. A failed migration leaves the system failed closed.
+
+### Routing of existing entry points
+- `AuthorizationPolicy.halt()` → calls `coordinated.activate_halt(reason="policy_halt")` then writes its local audit event. Local flag may also be set for backward compatibility during migration, but readers must prefer the coordinated flag.
+- `CollaborationProtocol.halt()` → same pattern.
+- After migration, `is_halted` / `require_not_halted` on both components consult only the coordinated authority.
+
+---
+
+## 7. Failure-handling matrix (Task 5)
+
+| # | Condition | Expected behavior | execution_enabled |
+|---|-----------|-------------------|-------------------|
+| 1 | Shared database unavailable (missing file, permission, disk error) | Status = UNKNOWN; `require_not_halted()` raises; evaluation rejected | False |
+| 2 | SQLite lock timeout | Status = UNKNOWN; fail closed | False |
+| 3 | Corrupted database | Status = UNKNOWN; fail closed; no automatic repair that could clear HALT | False |
+| 4 | Missing control record | Status = UNKNOWN; fail closed | False |
+| 5 | Unknown stored state | Status = UNKNOWN; fail closed | False |
+| 6 | Process crash before HALT commit | HALT not activated; next reader sees previous committed state | False |
+| 7 | Process crash after HALT commit | HALT remains active on restart | False |
+| 8 | Concurrent HALT requests | One increments sequence; others observe HALTED and succeed (idempotent) | False |
+| 9 | Partial migration | Fail closed; coordinated store HALTED or UNKNOWN; no bypass | False |
+| 10 | Stale HALT observation | Next `require_not_halted()` or re-check inside local transaction sees current state; in-flight local work may still complete (see concurrency limitations) | False |
+| 11 | Audit-write failure | Primary HALT commit is not rolled back; auxiliary audit failure is logged best-effort and does not erase the HALT | False |
+| 12 | Component initialized without coordinated authority | Fail closed; no local-only fallback once migration has started | False |
+
+Every case in which operational safety cannot be established fails closed.
+
+---
+
+## 8. Audit semantics (Task 6)
+
+### Safety-critical vs best-effort
+- **Safety-critical:** the `halt_state` row and its sequence in the coordinated database. A failed write here means the HALT is not activated.
+- **Best-effort secondary:** rows in `halt_events` and any lifecycle audit events written to the policy database. Failure of these must not roll back a committed HALT.
+
+### Required audit events (best-effort unless noted)
+- `halt_requested` — activation attempted.
+- `halt_durably_activated` — written in the same transaction as the state change (safety-critical companion).
+- `duplicate_halt_request` — already HALTED.
+- `halt_read_failure` — status mapped to UNKNOWN.
+- `halt_evaluation_rejection` — a component rejected work because of HALT or UNKNOWN.
+- `legacy_halt_discovered` — migration found a legacy HALT.
+- `migration_failure` — legacy state could not be determined.
+- `coordination_failure` — component could not reach the coordinated authority.
+
+### Rules
+- A failed auxiliary audit write must not erase a durably committed HALT.
+- Audit records must not store signatures, private keys, or sensitive payloads.
+- Audit is not claimed to be tamper-proof.
+
+---
+
+## 9. Regression-test plan (Task 7)
+
+Tests are specified here; they are **not implemented** in this checkpoint.
+
+| Scenario | Expected result |
+|----------|-----------------|
+| Normal offline synthetic evaluation | Accepted or rejected per existing rules; `execution_enabled=False`; HALT remains NOT_HALTED |
+| Coordinated HALT activation | `activate_halt()` returns sequence; subsequent `read_status()` is HALTED; evaluation rejected |
+| HALT through AuthorizationPolicy.halt() | Coordinated store becomes HALTED; policy and protocol both observe it |
+| HALT through CollaborationProtocol.halt() | Same |
+| HALT persistence across restart | New process sees HALTED |
+| Concurrent HALT and evaluation | At least one evaluation may race; after HALT commit all new evaluations rejected; no execution enabled |
+| Multiple simultaneous HALT requests | All succeed; sequence increments at most once |
+| Multiple process instances | All observe the same committed state |
+| Missing or corrupted control database | UNKNOWN; fail closed |
+| Database lock contention | Timeout → UNKNOWN → fail closed |
+| Legacy HALT preservation | Existing legacy HALT causes coordinated HALTED |
+| Partial migration failure | Fail closed; no bypass |
+| Audit persistence | Events survive restart |
+| Audit-write failure | HALT remains committed |
+| No automatic recovery | No API or path clears HALT |
+| No execution capability | Every result has `execution_enabled=False` |
+| Oversized authorization identifier (PR #12 coverage) | Rejected before any DB query; `execution_enabled=False` |
+| Lifecycle audit persistence failure | Evaluation still fails closed; HALT (if any) not erased |
+
+---
+
+## 10. Implementation sequence (future milestones)
+
+1. Introduce `CoordinatedHalt` with the schema and API above (unit-tested in isolation).
+2. Add migration helper that reads legacy flags and activates coordinated HALT if needed.
+3. Inject `CoordinatedHalt` into AuthorizationPolicy, CollaborationProtocol, and AuthorizationLifecycle.
+4. Route existing `halt()` methods to `activate_halt()`.
+5. Replace independent flag checks with `require_not_halted()` / `read_status()`.
+6. Add the regression tests listed above.
+7. Confirm full suite still passes (baseline 470 + new tests).
+8. Only after review: consider execution fencing for any future external side-effect path.
+
+This checkpoint performs none of the above.
+
+---
+
+## 11. Commissioning blockers (remaining)
+
+- Coordinated HALT is not yet implemented; independent flags remain.
+- Cross-database atomicity is not guaranteed.
+- No execution fence exists for external side effects.
+- Real Chief enrollment and approval capture are not implemented.
+- `execution_enabled=False` remains mandatory.
+- No automatic HALT reset will ever be added without a separate, explicit Chief-authorized milestone.
+- Hermes has no execution privilege.
+- Synthetic keys must not authorize real operations.
+
+---
+
+## 12. Separation of verified vs proposed
+
+| Aspect | Verified today (a7e091f) | Proposed (this architecture) |
+|--------|--------------------------|------------------------------|
+| HALT storage | Two independent SQLite flags | Single coordinated control database |
+| Lifecycle check | Sequential reads of both flags (race) | Single `require_not_halted()` |
+| Identity HALT | None | Consults coordinated authority via bridge |
+| Clearing HALT | None | Still none |
+| execution_enabled | Always False | Always False |
+| Production code | Unchanged in this commit | Unchanged in this commit |
+
