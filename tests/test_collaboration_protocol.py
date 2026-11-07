@@ -439,3 +439,49 @@ def test_message_bound_enforced(tmp_path):
                 recipient="bridge",
             )
         )
+
+
+def test_halt_filesystem_error_converted_to_halterror(tmp_path, monkeypatch):
+    """Unexpected filesystem errors during HALT activation become HaltError."""
+    from skippy.collaboration.protocol import HaltError
+
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
+
+    def failing_connect():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(protocol, "_connect", failing_connect)
+
+    with pytest.raises(HaltError, match="HALT activation failed"):
+        protocol.halt()
+
+
+def test_sqlite_config_failure_closes_connection(tmp_path, monkeypatch):
+    """Database connections are closed when SQLite configuration fails."""
+    closed = []
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, *args, **kwargs):
+            raise sqlite3.OperationalError("injected schema failure")
+
+        def close(self):
+            closed.append(True)
+
+    def fake_connect(*args, **kwargs):
+        return FakeConnection()
+
+    monkeypatch.setattr(
+        "skippy.collaboration.protocol.sqlite3.connect",
+        fake_connect,
+    )
+
+    with pytest.raises(sqlite3.OperationalError):
+        CollaborationProtocol(tmp_path / "bridge.db")
+
+    assert closed == [True]

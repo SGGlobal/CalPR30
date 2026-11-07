@@ -41,6 +41,10 @@ class AuthorizationError(ValueError):
     """Raised when an authorization decision fails closed."""
 
 
+class HaltError(AuthorizationError):
+    """Raised when HALT activation fails due to filesystem or database issues."""
+
+
 class AuthorizationState(str, Enum):
     PENDING = "PENDING"
     APPROVED = "APPROVED"
@@ -166,50 +170,55 @@ class AuthorizationPolicy:
         return sqlite3.connect(self.database_path, timeout=5.0)
 
     def _init_schema(self):
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS authorization_requests (
-                    authorization_id TEXT PRIMARY KEY,
-                    chief_identity TEXT NOT NULL,
-                    requesting_participant TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    action_digest TEXT NOT NULL,
-                    repository TEXT NOT NULL,
-                    project_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    expected_sha TEXT,
-                    environment TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    consumption_id TEXT,
-                    evidence_ref TEXT
+        """Create schema. Connections are always closed, even on failure."""
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS authorization_requests (
+                        authorization_id TEXT PRIMARY KEY,
+                        chief_identity TEXT NOT NULL,
+                        requesting_participant TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        action_digest TEXT NOT NULL,
+                        repository TEXT NOT NULL,
+                        project_id TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        expected_sha TEXT,
+                        environment TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        state TEXT NOT NULL,
+                        consumption_id TEXT,
+                        evidence_ref TEXT
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS authorization_events (
-                    event_id TEXT PRIMARY KEY,
-                    authorization_id TEXT,
-                    occurred_at TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    target TEXT NOT NULL,
-                    previous_state TEXT,
-                    new_state TEXT NOT NULL,
-                    reason TEXT NOT NULL
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS authorization_events (
+                        event_id TEXT PRIMARY KEY,
+                        authorization_id TEXT,
+                        occurred_at TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        target TEXT NOT NULL,
+                        previous_state TEXT,
+                        new_state TEXT NOT NULL,
+                        reason TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS authorization_control (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS authorization_control (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
+        finally:
+            connection.close()
 
     def _record(
         self,
@@ -308,18 +317,26 @@ class AuthorizationPolicy:
         return bool(row and row[0] == "1")
 
     def halt(self) -> None:
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """
-                INSERT INTO authorization_control (key, value)
-                VALUES ('halted', '1')
-                ON CONFLICT(key) DO UPDATE SET value = '1'
-                """
-            )
-            self._record(
-                connection, None, "halt", "system", None, "HALTED", "Chief halt"
-            )
+        connection = None
+        try:
+            connection = self._connect()
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO authorization_control (key, value)
+                    VALUES ('halted', '1')
+                    ON CONFLICT(key) DO UPDATE SET value = '1'
+                    """
+                )
+                self._record(
+                    connection, None, "halt", "system", None, "HALTED", "Chief halt"
+                )
+        except (OSError, sqlite3.Error) as exc:
+            raise HaltError(f"HALT activation failed: {exc}") from exc
+        finally:
+            if connection is not None:
+                connection.close()
 
     def submit(self, request: AuthorizationRequest) -> None:
         if (

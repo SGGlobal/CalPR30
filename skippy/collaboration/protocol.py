@@ -45,6 +45,10 @@ class ProtocolError(ValueError):
     """Raised when a message or transition is invalid."""
 
 
+class HaltError(ProtocolError):
+    """Raised when HALT activation fails due to filesystem or database issues."""
+
+
 class TaskState(str, Enum):
     ASSIGNED = "ASSIGNED"
     ACKNOWLEDGED = "ACKNOWLEDGED"
@@ -348,76 +352,81 @@ class CollaborationProtocol:
         return sqlite3.connect(self.database_path, timeout=5.0)
 
     def _init_schema(self):
-        with self._connect() as connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS messages (
-                    message_id TEXT PRIMARY KEY,
-                    idempotency_key TEXT NOT NULL UNIQUE,
-                    correlation_id TEXT NOT NULL,
-                    project_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    sender TEXT NOT NULL,
-                    recipient TEXT NOT NULL,
-                    message_type TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    authorization_status TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    parent_message_id TEXT,
-                    protocol_version TEXT NOT NULL,
-                    envelope_identity TEXT NOT NULL,
-                    operation_identity TEXT NOT NULL
+        """Create schema. Connections are always closed, even on failure."""
+        connection = self._connect()
+        try:
+            with connection:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS messages (
+                        message_id TEXT PRIMARY KEY,
+                        idempotency_key TEXT NOT NULL UNIQUE,
+                        correlation_id TEXT NOT NULL,
+                        project_id TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        sender TEXT NOT NULL,
+                        recipient TEXT NOT NULL,
+                        message_type TEXT NOT NULL,
+                        timestamp TEXT NOT NULL,
+                        authorization_status TEXT NOT NULL,
+                        payload_json TEXT NOT NULL,
+                        parent_message_id TEXT,
+                        protocol_version TEXT NOT NULL,
+                        envelope_identity TEXT NOT NULL,
+                        operation_identity TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS acknowledgments (
-                    message_id TEXT PRIMARY KEY
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS acknowledgments (
+                        message_id TEXT PRIMARY KEY
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS task_states (
-                    task_id TEXT PRIMARY KEY,
-                    state TEXT NOT NULL,
-                    message_count INTEGER NOT NULL
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS task_states (
+                        task_id TEXT PRIMARY KEY,
+                        state TEXT NOT NULL,
+                        message_count INTEGER NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS outbound_requests (
-                    request_id TEXT PRIMARY KEY,
-                    task_id TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    attempts INTEGER NOT NULL
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS outbound_requests (
+                        request_id TEXT PRIMARY KEY,
+                        task_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        attempts INTEGER NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS control (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS control (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    )
+                    """
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS approvals (
-                    approval_id TEXT PRIMARY KEY,
-                    chief_identity TEXT NOT NULL,
-                    action TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    issued_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL,
-                    consumed_at TEXT
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS approvals (
+                        approval_id TEXT PRIMARY KEY,
+                        chief_identity TEXT NOT NULL,
+                        action TEXT NOT NULL,
+                        task_id TEXT NOT NULL,
+                        issued_at TEXT NOT NULL,
+                        expires_at TEXT NOT NULL,
+                        consumed_at TEXT
+                    )
+                    """
                 )
-                """
-            )
+        finally:
+            connection.close()
 
     def _refresh_halt(self) -> bool:
         with self._connect() as connection:
@@ -433,16 +442,24 @@ class CollaborationProtocol:
 
     def halt(self) -> None:
         """Global HALT. Survives reopen. No automatic resumption."""
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                """
-                INSERT INTO control (key, value)
-                VALUES ('halted', '1')
-                ON CONFLICT(key) DO UPDATE SET value = '1'
-                """
-            )
-        self._halted = True
+        connection = None
+        try:
+            connection = self._connect()
+            with connection:
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    """
+                    INSERT INTO control (key, value)
+                    VALUES ('halted', '1')
+                    ON CONFLICT(key) DO UPDATE SET value = '1'
+                    """
+                )
+            self._halted = True
+        except (OSError, sqlite3.Error) as exc:
+            raise HaltError(f"HALT activation failed: {exc}") from exc
+        finally:
+            if connection is not None:
+                connection.close()
 
     def get_state(self, task_id: str) -> TaskState | None:
         with self._connect() as connection:
