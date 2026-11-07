@@ -37,7 +37,7 @@ execution_enabled remains False. No method grants protected execution.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
@@ -93,13 +93,19 @@ class MigrationError(RuntimeError):
 
 @dataclass(frozen=True)
 class MigrationResult:
-    """Non-sensitive outcome of a migration attempt. execution_enabled is always False."""
+    """
+    Non-sensitive outcome of a migration attempt.
+
+    execution_enabled is not a constructor argument. It is fixed False
+    and cannot be overridden during normal construction. The frozen
+    dataclass also prevents later assignment.
+    """
 
     coordinated_status: str
     authorization_policy_halted: bool | None
     collaboration_protocol_halted: bool | None
     activation_attempted: bool
-    execution_enabled: bool = False
+    execution_enabled: bool = field(default=False, init=False)
 
 
 class LegacyHaltMigration:

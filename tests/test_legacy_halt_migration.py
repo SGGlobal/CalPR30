@@ -23,6 +23,7 @@ from skippy.collaboration.legacy_halt_migration import (
     AbsentLegacyPolicy,
     LegacyHaltMigration,
     MigrationError,
+    MigrationResult,
     OmittedSourcePolicy,
 )
 from skippy.collaboration.protocol import CollaborationProtocol
@@ -609,3 +610,52 @@ def test_invalid_omitted_policy_rejected(tmp_path):
             None,
             omitted_source_policy="nope",  # type: ignore[arg-type]
         )
+
+
+def test_migration_result_execution_disabled_cannot_be_overridden():
+    """Callers cannot construct a MigrationResult with execution enabled."""
+    result = MigrationResult(
+        coordinated_status="NOT_HALTED",
+        authorization_policy_halted=False,
+        collaboration_protocol_halted=False,
+        activation_attempted=False,
+    )
+    assert result.execution_enabled is False
+
+    with pytest.raises(TypeError):
+        MigrationResult(
+            coordinated_status="NOT_HALTED",
+            authorization_policy_halted=False,
+            collaboration_protocol_halted=False,
+            activation_attempted=False,
+            execution_enabled=True,
+        )
+
+    with pytest.raises(Exception):
+        result.execution_enabled = True
+    assert result.execution_enabled is False
+
+
+def test_normal_migration_result_always_execution_disabled(tmp_path):
+    coordinated = tmp_path / "coord.db"
+    policy_db = tmp_path / "policy.db"
+    protocol_db = tmp_path / "protocol.db"
+    _init_authority(coordinated)
+    _legacy_policy(policy_db, halted=False)
+    _legacy_protocol(protocol_db, halted=False)
+
+    result = _migrate(coordinated, policy_db, protocol_db)
+    assert isinstance(result, MigrationResult)
+    assert result.execution_enabled is False
+    assert result.activation_attempted is False
+    assert result.coordinated_status == HaltStatus.NOT_HALTED.value
+
+    # Existing HALT preservation and activation behavior remain intact.
+    _legacy_policy(policy_db, halted=True)
+    halted = _migrate(coordinated, policy_db, protocol_db)
+    assert halted.execution_enabled is False
+    assert halted.activation_attempted is True
+    status, sequence = CoordinatedHalt(coordinated).read_status()
+    assert status is HaltStatus.HALTED
+    assert sequence == 1
+    assert AuthorizationPolicy(policy_db).is_halted() is True
