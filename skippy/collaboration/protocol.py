@@ -343,6 +343,9 @@ class CollaborationProtocol:
 
         self._init_schema()
         self._refresh_halt()
+        self._coordinated_guard = None
+        self._coordinated_enforcement_required = False
+        self._coordinated_guard_snapshot = None
 
     def _connect(self):
         return sqlite3.connect(self.database_path, timeout=5.0)
@@ -431,6 +434,98 @@ class CollaborationProtocol:
     def is_halted(self) -> bool:
         return self._refresh_halt()
 
+    def require_coordinated_guard(self, gate) -> None:
+        """
+        Bind an opt-in CoordinatedHaltGate to this protocol instance.
+
+        The guard must reference this same protocol. It cannot be removed
+        or replaced through this supported method. Default construction
+        remains ungated. This is not a production cutover.
+        """
+
+        from skippy.collaboration.coordinated_halt_gate import CoordinatedHaltGate
+
+        if self._coordinated_guard is not None or self._coordinated_enforcement_required:
+            raise ProtocolError("Coordinated guard cannot be replaced")
+        if not isinstance(gate, CoordinatedHaltGate):
+            raise ProtocolError("Invalid coordinated guard")
+        if gate.protocol is not self:
+            raise ProtocolError("Coordinated guard protocol mismatch")
+        if gate.policy is None:
+            raise ProtocolError("Coordinated guard policy mismatch")
+        self._coordinated_guard = gate
+        self._coordinated_enforcement_required = True
+        self._coordinated_guard_snapshot = {
+            "guard": gate,
+            "policy": gate.policy,
+            "protocol": gate.protocol,
+            "policy_path": Path(gate.policy.database_path),
+            "protocol_path": Path(gate.protocol.database_path),
+            "coordinated_path": Path(gate.coordinated_path),
+            "absent_legacy_policy": gate.absent_legacy_policy,
+            "omitted_source_policy": gate.omitted_source_policy,
+        }
+
+    @property
+    def coordinated_guard(self):
+        """Read-only view of the established guard, if any."""
+        return self._coordinated_guard
+
+    def _guard_rejection(self) -> str | None:
+        """
+        Run the opt-in guard before any local write lock.
+
+        Returns a controlled rejection reason, or None when clear.
+        Never exposes exception details. Never treats failure as permission.
+        A missing guard after opt-in does not return to ungated operation.
+        """
+
+        if not self._coordinated_enforcement_required:
+            return None
+        guard = self._coordinated_guard
+        snapshot = self._coordinated_guard_snapshot
+        if guard is None or snapshot is None:
+            return "Coordinated guard rejected"
+        try:
+            from skippy.collaboration.coordinated_halt_gate import (
+                CoordinatedHaltGate,
+                GateResult,
+            )
+
+            if not isinstance(guard, CoordinatedHaltGate):
+                return "Coordinated guard rejected"
+            if guard is not snapshot["guard"]:
+                return "Coordinated guard rejected"
+            if guard.protocol is not self or guard.protocol is not snapshot["protocol"]:
+                return "Coordinated guard rejected"
+            if guard.policy is not snapshot["policy"]:
+                return "Coordinated guard rejected"
+            if Path(guard.policy.database_path) != snapshot["policy_path"]:
+                return "Coordinated guard rejected"
+            if Path(guard.protocol.database_path) != snapshot["protocol_path"]:
+                return "Coordinated guard rejected"
+            if Path(guard.coordinated_path) != snapshot["coordinated_path"]:
+                return "Coordinated guard rejected"
+            if guard.absent_legacy_policy != snapshot["absent_legacy_policy"]:
+                return "Coordinated guard rejected"
+            if guard.omitted_source_policy != snapshot["omitted_source_policy"]:
+                return "Coordinated guard rejected"
+            result = guard.check()
+            if not isinstance(result, GateResult):
+                return "Coordinated guard rejected"
+            if (
+                result.allowed is not True
+                or result.execution_enabled is not False
+                or result.coordinated_status != "NOT_HALTED"
+                or result.migration_completed is not True
+                or result.legacy_policy_halted is not False
+                or result.legacy_protocol_halted is not False
+            ):
+                return "Coordinated guard rejected"
+            return None
+        except Exception:
+            return "Coordinated guard rejected"
+
     def halt(self) -> None:
         """Global HALT. Survives reopen. No automatic resumption."""
         with self._connect() as connection:
@@ -469,6 +564,12 @@ class CollaborationProtocol:
 
         if now - message.timestamp > self.message_ttl:
             raise ProtocolError("Message expired")
+
+        # Protective HALT remains available. Ordinary work is gated.
+        if message.message_type is not MessageType.HALT:
+            rejection = self._guard_rejection()
+            if rejection:
+                raise ProtocolError(rejection)
 
         envelope = message.envelope_identity()
         operation = message.operation_identity()
@@ -640,6 +741,10 @@ class CollaborationProtocol:
         if not approval.chief_identity:
             raise ProtocolError("Approval requires an identity string")
 
+        rejection = self._guard_rejection()
+        if rejection:
+            raise ProtocolError(rejection)
+
         with self._connect() as connection:
             existing = connection.execute(
                 "SELECT 1 FROM approvals WHERE approval_id = ?",
@@ -677,6 +782,10 @@ class CollaborationProtocol:
         This does not authorize real actions.
         """
         now = now or datetime.now(timezone.utc)
+
+        rejection = self._guard_rejection()
+        if rejection:
+            raise ProtocolError(rejection)
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -730,6 +839,10 @@ class CollaborationProtocol:
     ) -> OutboundRequest:
         if status not in {"PENDING", "CONFIRMED", "UNCERTAIN", "FAILED"}:
             raise ProtocolError("Invalid outbound status")
+
+        rejection = self._guard_rejection()
+        if rejection:
+            raise ProtocolError(rejection)
 
         request = OutboundRequest(
             request_id=str(uuid.uuid4()),
