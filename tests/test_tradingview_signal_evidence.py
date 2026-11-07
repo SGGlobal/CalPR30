@@ -306,15 +306,17 @@ def test_schema_migration_failure_fails_closed(tmp_path):
         AtomicSignalRegistry(tmp_path / "missing_dir" / "broken.db")
 
 
-def test_sqlite_migration_failure_preserves_historical_records(tmp_path):
+def test_sqlite_migration_failure_preserves_historical_records(tmp_path, monkeypatch):
     """
-    Cause a real SQLite ALTER TABLE failure on an existing database
+    Cause a controlled SQLite ALTER TABLE failure on an existing database
     that already contains historical records.
 
-    The database file is made read-only after the legacy schema and
-    data are written, so the additive migration cannot proceed.
+    A portable injection forces the additive migration to raise
+    sqlite3.OperationalError. Historical records and schema must remain
+    unchanged. This does not rely on file-system permission bits, which
+    are not effective when the process has elevated privileges.
     """
-    database = tmp_path / "readonly-legacy.db"
+    database = tmp_path / "legacy-migration-fail.db"
 
     old_time = "2026-01-01T00:00:00+00:00"
 
@@ -348,31 +350,54 @@ def test_sqlite_migration_failure_preserves_historical_records(tmp_path):
             (LEGACY_FINGERPRINT, old_time),
         )
 
-    # Make the file read-only so ALTER TABLE fails.
-    os.chmod(database, 0o444)
+    original_connect = sqlite3.connect
 
-    try:
-        with pytest.raises(AtomicRegistryError):
-            AtomicSignalRegistry(database)
+    class _FailingConnection:
+        """Thin proxy that raises on ALTER TABLE while delegating everything else."""
 
-        # Historical records must be unchanged.
-        with sqlite3.connect(database) as connection:
-            row = connection.execute(
-                "SELECT first_seen FROM signals WHERE fingerprint = ?",
-                (LEGACY_FINGERPRINT,),
-            ).fetchone()
+        def __init__(self, real):
+            self._real = real
 
-            columns = {
-                col[1]
-                for col in connection.execute("PRAGMA table_info(signals)")
-            }
+        def execute(self, sql, *args, **kwargs):
+            if isinstance(sql, str) and "ALTER TABLE" in sql.upper():
+                raise sqlite3.OperationalError("forced migration failure for test")
+            return self._real.execute(sql, *args, **kwargs)
 
-        assert row == (old_time,)
-        assert "evidence_json" not in columns
+        def __enter__(self):
+            self._real.__enter__()
+            return self
 
-    finally:
-        # Restore writability so the temporary file can be cleaned up.
-        os.chmod(database, 0o644)
+        def __exit__(self, *exc):
+            return self._real.__exit__(*exc)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    def failing_connect(path, *args, **kwargs):
+        return _FailingConnection(original_connect(path, *args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", failing_connect)
+
+    with pytest.raises(AtomicRegistryError):
+        AtomicSignalRegistry(database)
+
+    # Restore real connect for verification.
+    monkeypatch.undo()
+
+    # Historical records must be unchanged.
+    with sqlite3.connect(database) as connection:
+        row = connection.execute(
+            "SELECT first_seen FROM signals WHERE fingerprint = ?",
+            (LEGACY_FINGERPRINT,),
+        ).fetchone()
+
+        columns = {
+            col[1]
+            for col in connection.execute("PRAGMA table_info(signals)")
+        }
+
+    assert row == (old_time,)
+    assert "evidence_json" not in columns
 
 
 def test_legacy_fingerprint_only_registration_still_works(tmp_path):

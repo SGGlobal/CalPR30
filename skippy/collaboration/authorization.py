@@ -252,6 +252,39 @@ class AuthorizationPolicy:
             ).fetchall()
         return [row[0] for row in rows]
 
+    def record_lifecycle_audit(
+        self,
+        authorization_id: str | None,
+        reason: str,
+        *,
+        action: str = "lifecycle_evaluation",
+        target: str = "authorization",
+    ) -> None:
+        """
+        Narrowly scoped, non-mutating audit for lifecycle evaluation outcomes.
+
+        Does not change authorization state.
+        Does not store signatures, private keys, or sensitive payloads.
+        Uses parameterized queries. Persists across restarts.
+        Not claimed to be tamper-proof.
+        """
+        if authorization_id is not None and not isinstance(authorization_id, str):
+            authorization_id = None
+        if not isinstance(reason, str) or not reason:
+            reason = "Unspecified lifecycle outcome"
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._record(
+                connection,
+                authorization_id,
+                action,
+                target,
+                None,
+                "AUDITED",
+                reason,
+            )
+
     def stored_state(self, authorization_id: str) -> str | None:
         with self._connect() as connection:
             row = connection.execute(
@@ -536,6 +569,187 @@ class AuthorizationPolicy:
                 execution_enabled=False,
             )
 
+    def evaluate_evidence(
+        self,
+        authorization_id: str,
+        *,
+        action: str,
+        repository: str,
+        project_id: str,
+        task_id: str,
+        action_digest: str,
+        expected_sha: str | None,
+        environment: str,
+        now: datetime | None = None,
+    ) -> AuthorizationDecision:
+        """
+        Non-executing evaluation of PENDING authorization evidence.
+
+        Reads the trusted stored record inside a transaction.
+        Requires state == PENDING.
+        Validates exact scope match.
+        Does not transition the state.
+        Always returns execution_enabled=False.
+        Honors HALT. Rejects terminal states, unknowns, and impersonation.
+        """
+
+        now = now or datetime.now(timezone.utc)
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+
+            halt_row = connection.execute(
+                "SELECT value FROM authorization_control WHERE key = 'halted'"
+            ).fetchone()
+            if halt_row and halt_row[0] == "1":
+                self._record(
+                    connection, authorization_id, action, repository,
+                    None, "DENIED", "System is halted",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "System is halted"
+                )
+
+            row = connection.execute(
+                """
+                SELECT chief_identity, requesting_participant, action,
+                       action_digest, repository, project_id, task_id,
+                       expected_sha, environment, expires_at, state,
+                       consumption_id
+                FROM authorization_requests
+                WHERE authorization_id = ?
+                """,
+                (authorization_id,),
+            ).fetchone()
+
+            if row is None:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    None, "DENIED", "Missing authorization",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Missing authorization"
+                )
+
+            (
+                chief_identity,
+                participant,
+                stored_action,
+                stored_digest,
+                stored_repo,
+                stored_project,
+                stored_task,
+                stored_sha,
+                stored_environment,
+                expires_at,
+                state,
+                consumption_id,
+            ) = row
+
+            if participant in AI_PARTICIPANTS and chief_identity == participant:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "AI impersonation of Chief",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "AI impersonation of Chief"
+                )
+
+            if state != AuthorizationState.PENDING.value:
+                reason = f"Authorization is not PENDING (state={state})"
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, state, reason,
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState(state), reason
+                )
+
+            if consumption_id:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "CONSUMED", "Authorization already consumed",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.CONSUMED, "Authorization already consumed"
+                )
+
+            expires = datetime.fromisoformat(expires_at)
+            if now >= expires:
+                if state not in TERMINAL_STATES:
+                    connection.execute(
+                        "UPDATE authorization_requests SET state = ? WHERE authorization_id = ?",
+                        (AuthorizationState.EXPIRED.value, authorization_id),
+                    )
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "EXPIRED", "Authorization expired",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.EXPIRED, "Authorization expired"
+                )
+
+            if stored_action != action:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Incorrect action",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Incorrect action"
+                )
+            if stored_repo != repository:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Incorrect repository",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Incorrect repository"
+                )
+            if stored_project != project_id or stored_task != task_id:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Incorrect task or project",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Incorrect task or project"
+                )
+            if stored_digest != action_digest:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Action parameters do not match",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Action parameters do not match"
+                )
+            if stored_sha != expected_sha:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Commit SHA does not match",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Commit SHA does not match"
+                )
+            if stored_environment != environment:
+                self._record(
+                    connection, authorization_id, action, repository,
+                    state, "DENIED", "Incorrect environment",
+                )
+                return AuthorizationDecision(
+                    False, AuthorizationState.DENIED, "Incorrect environment"
+                )
+
+            # Matching PENDING evidence. Do not transition state.
+            self._record(
+                connection, authorization_id, action, repository,
+                state, state, "Synthetic evidence accepted",
+            )
+            return AuthorizationDecision(
+                False,
+                AuthorizationState.PENDING,
+                "Synthetic evidence accepted",
+                execution_enabled=False,
+            )
+
     def revoke(self, authorization_id: str) -> AuthorizationDecision:
         """
         Revoke a non-terminal authorization.
@@ -637,14 +851,7 @@ class AuthorizationPolicy:
                 return AuthorizationDecision(
                     False, AuthorizationState.REVOKED, "Authorization revoked"
                 )
-            if state == AuthorizationState.DENIED.value:
-                self._record(
-                    connection, authorization_id, "consume", "authorization",
-                    state, "DENIED", "Authorization denied",
-                )
-                return AuthorizationDecision(
-                    False, AuthorizationState.DENIED, "Authorization denied"
-                )
+
             if state == AuthorizationState.CONSUMED.value or existing_consumption:
                 self._record(
                     connection, authorization_id, "consume", "authorization",
@@ -653,13 +860,14 @@ class AuthorizationPolicy:
                 return AuthorizationDecision(
                     False, AuthorizationState.CONSUMED, "Authorization already consumed"
                 )
-            if state == AuthorizationState.EXPIRED.value:
+
+            if state == AuthorizationState.DENIED.value:
                 self._record(
                     connection, authorization_id, "consume", "authorization",
-                    state, "EXPIRED", "Authorization expired",
+                    state, "DENIED", "Authorization denied",
                 )
                 return AuthorizationDecision(
-                    False, AuthorizationState.EXPIRED, "Authorization expired"
+                    False, AuthorizationState.DENIED, "Authorization denied"
                 )
 
             expires = datetime.fromisoformat(expires_at)
