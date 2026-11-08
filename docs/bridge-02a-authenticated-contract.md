@@ -69,3 +69,19 @@ execution_enabled remains False. External transport remains disabled. No cross-d
 - HALT remains derived from the required authoritative callback. Review source_verified remains synthetic fixture evidence only.
 
 execution_enabled remains False. External transport remains disabled. No cross-database atomicity is claimed.
+
+## BRIDGE-02A.6 ledger↔receipt reconciliation
+- Deterministic reconciliation runs on startup and before every admission.
+- Ledger events are compared against accepted receipts. Any mismatch, unreadable store, or missing receipt database with a nonempty ledger fails closed and requires manual reconciliation.
+- The adapter never silently recreates a clean state over existing ledger evidence.
+- Fail-stop remains effective. If recording fail-stop itself fails, the next admission still reconciles against the ledger and refuses.
+- Fault-injection tests cover missing receipt database after a successful ledger commit, and restart with divergent state.
+
+### Commissioning blockers (unchanged)
+- payload_digest is an integrity checksum, not actor authentication.
+- trusted_fixture is a test-only harness.
+- Review source_verified is synthetic fixture evidence only.
+- HALT callback is a synthetic check, not proven authoritative global HALT wiring.
+- No cross-database atomicity is claimed.
+
+execution_enabled remains False. External transport remains disabled.

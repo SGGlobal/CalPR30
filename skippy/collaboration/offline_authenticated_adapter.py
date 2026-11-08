@@ -70,6 +70,54 @@ class OfflineAuthenticatedAdapter:
         self._halt_check = halt_check
         self._lock = threading.Lock()
         self._init_receipts()
+        # Deterministic reconciliation on startup
+        self._reconcile()
+
+    def _reconcile(self) -> None:
+        """
+        Compare ledger events against accepted receipts.
+
+        Any mismatch, unreadable store, or missing receipt DB with a
+        nonempty ledger fails closed and requires manual reconciliation.
+        Never silently recreate a clean state over existing ledger evidence.
+        """
+        try:
+            with self.ledger._connect() as ledger_conn:
+                ledger_events = ledger_conn.execute(
+                    "SELECT message_id FROM events ORDER BY revision"
+                ).fetchall()
+            ledger_ids = {r[0] for r in ledger_events if r[0]}
+        except Exception as exc:
+            raise OfflineAdapterError(f"Ledger unreadable during reconciliation: {exc}") from exc
+
+        try:
+            with sqlite3.connect(self.database_path) as connection:
+                receipt_rows = connection.execute(
+                    "SELECT message_id FROM audit_receipts WHERE outcome = 'accepted'"
+                ).fetchall()
+            receipt_ids = {r[0] for r in receipt_rows}
+        except Exception as exc:
+            if ledger_ids:
+                raise OfflineAdapterError(
+                    f"Receipt store unreadable and ledger is nonempty: {exc}"
+                ) from exc
+            return  # both empty is acceptable for a fresh start
+
+        # Ledger events without corresponding accepted receipts
+        unmatched = ledger_ids - receipt_ids
+        if unmatched:
+            # Persistent fail-stop
+            try:
+                with sqlite3.connect(self.database_path) as connection:
+                    connection.execute(
+                        "UPDATE fail_stop SET stopped = 1, reason = ? WHERE singleton = 1",
+                        (f"Reconciliation mismatch: {sorted(unmatched)}",),
+                    )
+            except Exception:
+                pass
+            raise OfflineAdapterError(
+                f"Ledger/receipt mismatch requires manual reconciliation: {sorted(unmatched)}"
+            )
 
     def _init_receipts(self):
         with sqlite3.connect(self.database_path) as connection:
@@ -240,6 +288,9 @@ class OfflineAuthenticatedAdapter:
         now = now or datetime.now(timezone.utc)
 
         with self._lock:
+            # Reconciliation gate before any admission
+            self._reconcile()
+
             # Persistent fail-stop gate and exclusive admission
             with sqlite3.connect(self.database_path) as connection:
                 connection.execute("BEGIN IMMEDIATE")

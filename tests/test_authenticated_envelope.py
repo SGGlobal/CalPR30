@@ -301,3 +301,43 @@ def test_rollback_does_not_persist_accepted_on_failure(tmp_path, monkeypatch):
             "SELECT outcome FROM audit_receipts WHERE outcome = 'accepted'"
         ).fetchall()
     assert len(rows) == 0
+
+
+def test_reconciliation_detects_missing_receipt(tmp_path):
+    """Startup reconciliation fails closed when receipt DB is missing but ledger is nonempty."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    env = _envelope()
+    adapter.accept(env, now=_now())
+
+    # Simulate crash: remove the receipts database while leaving the ledger
+    receipts.unlink()
+
+    # New instance must fail closed on reconciliation
+    with pytest.raises(OfflineAdapterError, match="unreadable|mismatch|reconciliation"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )
+
+
+def test_reconciliation_blocks_subsequent_admission(tmp_path):
+    """After mismatch, subsequent admission is blocked even after restart."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    env = _envelope()
+    adapter.accept(env, now=_now())
+
+    # Remove receipts DB to simulate divergence
+    receipts.unlink()
+
+    # Reconciliation fails
+    with pytest.raises(OfflineAdapterError):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )
