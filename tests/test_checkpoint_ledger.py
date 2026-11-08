@@ -116,7 +116,7 @@ def test_ci_evidence_must_match_reviewed_sha(tmp_path):
         task_id="t",
         checkpoint_id="c1",
         actor="skippy",
-        payload={"sha": "abc123"},
+        payload={"sha": "abc123", "source_verified": True},
         expected_revision=1,
     )
     # Incomplete evidence
@@ -421,7 +421,7 @@ def test_new_sha_invalidates_prior_ci(tmp_path):
         task_id="t",
         checkpoint_id="c1",
         actor="skippy",
-        payload={"sha": "abc"},
+        payload={"sha": "abc", "source_verified": True},
         expected_revision=1,
     )
     ledger.record_event(
@@ -583,3 +583,163 @@ def test_legal_progression_to_merged(tmp_path):
     assert status.pr_authorized is True
     assert status.merge_authorized is True
     assert status.ci_verified is True
+
+
+def test_both_identifiers_must_match_same_event(tmp_path):
+    """BRIDGE-01C Task 1: both identifiers verified before duplicate no-op."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    ledger.record_event(
+        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"sha": "abc"},
+        message_id="msg-a",
+        idempotency_key="idem-a",
+        expected_revision=0,
+    )
+    ledger.record_event(
+        event_type=EventType.REVIEW_RECORDED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="skippy",
+        payload={"sha": "abc"},
+        message_id="msg-b",
+        idempotency_key="idem-b",
+        expected_revision=1,
+    )
+    # Mix first message_id with second idempotency_key
+    with pytest.raises(LedgerError, match="Conflicting"):
+        ledger.record_event(
+            event_type=EventType.IMPLEMENTATION_SUBMITTED,
+            project_id="p",
+            task_id="t",
+            checkpoint_id="c1",
+            actor="jason",
+            payload={"sha": "abc"},
+            message_id="msg-a",
+            idempotency_key="idem-b",
+            expected_revision=2,
+        )
+    # Exact duplicate of first event remains no-op
+    rev = ledger.record_event(
+        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"sha": "abc"},
+        message_id="msg-a",
+        idempotency_key="idem-a",
+        expected_revision=2,
+    )
+    assert rev == 2  # unchanged
+
+
+def test_ci_requires_source_verified_review(tmp_path):
+    """BRIDGE-01C Task 2: CI bound to explicitly source-verified current SHA."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    ledger.record_event(
+        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"sha": "abc"},
+        expected_revision=0,
+    )
+    # Review without source_verified
+    ledger.record_event(
+        event_type=EventType.REVIEW_RECORDED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="skippy",
+        payload={"sha": "abc"},  # no source_verified
+        expected_revision=1,
+    )
+    with pytest.raises(LedgerError, match="explicitly source-verified"):
+        ledger.record_event(
+            event_type=EventType.CI_VERIFICATION_RECORDED,
+            project_id="p",
+            task_id="t",
+            checkpoint_id="c1",
+            actor="ci",
+            payload={
+                "sha": "abc",
+                "workflow_run_id": "run-1",
+                "conclusion": "success",
+                "tests": 641,
+            },
+            expected_revision=2,
+        )
+
+    # Now record a source-verified review
+    ledger.record_event(
+        event_type=EventType.REVIEW_RECORDED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="skippy",
+        payload={"sha": "abc", "source_verified": True},
+        expected_revision=2,
+    )
+    # Matching CI succeeds
+    ledger.record_event(
+        event_type=EventType.CI_VERIFICATION_RECORDED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="ci",
+        payload={
+            "sha": "abc",
+            "workflow_run_id": "run-1",
+            "conclusion": "success",
+            "tests": 641,
+        },
+        expected_revision=3,
+    )
+    status = ledger.status("p", "t")
+    assert status.ci_verified is True
+    assert status.ci_sha == "abc"
+
+    # New correction changes SHA
+    ledger.record_event(
+        event_type=EventType.CORRECTION_REQUESTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="skippy",
+        payload={"findings": "update"},
+        expected_revision=4,
+    )
+    ledger.record_event(
+        event_type=EventType.CORRECTION_SUBMITTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"sha": "def999"},
+        expected_revision=5,
+    )
+    # Old CI SHA rejected for new revision
+    with pytest.raises(LedgerError, match="Reviewed SHA does not match|does not match verified current source"):
+        ledger.record_event(
+            event_type=EventType.CI_VERIFICATION_RECORDED,
+            project_id="p",
+            task_id="t",
+            checkpoint_id="c1",
+            actor="ci",
+            payload={
+                "sha": "abc",  # old SHA
+                "workflow_run_id": "run-2",
+                "conclusion": "success",
+                "tests": 650,
+            },
+            expected_revision=6,
+        )
+    status = ledger.status("p", "t")
+    assert status.current_sha == "def999"
+    assert status.ci_verified is False

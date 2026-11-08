@@ -45,3 +45,11 @@ See `skippy/collaboration/checkpoint_ledger.py` and `tests/test_checkpoint_ledge
 
 ## Offline authenticity limitation
 The ledger records supplied evidence. It cannot independently establish external sender authenticity, live provider delivery, or that a submitted CI run actually occurred on GitHub. Those require a future separately reviewed adapter.
+
+## BRIDGE-01C targeted integrity
+- When both message ID and idempotency key are supplied, both identities are verified and must resolve to the same event before an identical-duplicate no-op is returned. Mixed identifiers are rejected.
+- CI verification requires an explicitly source-verified review of the current implementation SHA. Both the reviewed SHA and the CI SHA must match the current implementation. A review without source verification cannot establish CI-verified status. After a new SHA, prior CI evidence is rejected.
+- CI_PENDING remains in the status enum as a reserved state but is not automatically entered; it may be reached only by a future explicit controlled transition. Supplied authorization and CI evidence are records, not independently authenticated external facts.
+
+## Offline authenticity limitation (reaffirmed)
+The ledger records supplied evidence. It cannot independently establish external sender authenticity or that a submitted CI run actually occurred.

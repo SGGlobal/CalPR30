@@ -307,16 +307,19 @@ class CheckpointLedger:
             current_rev = self._current_revision(connection)
 
             # Exact duplicate redelivery → no-op (complete envelope identity)
+            msg_match = None
+            idemp_match = None
+
             if message_id:
                 existing = connection.execute(
                     """
-                    SELECT payload, event_type, project_id, task_id, checkpoint_id, actor
+                    SELECT payload, event_type, project_id, task_id, checkpoint_id, actor, idempotency_key
                     FROM events WHERE message_id = ?
                     """,
                     (message_id,),
                 ).fetchone()
                 if existing:
-                    ex_payload, ex_type, ex_proj, ex_task, ex_cp, ex_actor = existing
+                    ex_payload, ex_type, ex_proj, ex_task, ex_cp, ex_actor, ex_idemp = existing
                     if (
                         ex_payload == payload_json
                         and ex_type == event_type.value
@@ -325,19 +328,20 @@ class CheckpointLedger:
                         and ex_cp == checkpoint_id
                         and ex_actor == actor
                     ):
-                        return current_rev  # identical redelivery
-                    raise LedgerError("Conflicting reuse of message_id")
+                        msg_match = existing
+                    else:
+                        raise LedgerError("Conflicting reuse of message_id")
 
             if idempotency_key:
                 existing = connection.execute(
                     """
-                    SELECT payload, event_type, project_id, task_id, checkpoint_id, actor
+                    SELECT payload, event_type, project_id, task_id, checkpoint_id, actor, message_id
                     FROM events WHERE idempotency_key = ?
                     """,
                     (idempotency_key,),
                 ).fetchone()
                 if existing:
-                    ex_payload, ex_type, ex_proj, ex_task, ex_cp, ex_actor = existing
+                    ex_payload, ex_type, ex_proj, ex_task, ex_cp, ex_actor, ex_msg = existing
                     if (
                         ex_payload == payload_json
                         and ex_type == event_type.value
@@ -346,13 +350,25 @@ class CheckpointLedger:
                         and ex_cp == checkpoint_id
                         and ex_actor == actor
                     ):
-                        return current_rev
-                    raise LedgerError("Conflicting reuse of idempotency_key")
+                        idemp_match = existing
+                    else:
+                        raise LedgerError("Conflicting reuse of idempotency_key")
 
-            # If both supplied, both must agree (already checked individually)
+            # When both are supplied, both must resolve to the same event
             if message_id and idempotency_key:
-                # Additional cross-check already covered by individual exact-match
-                pass
+                if msg_match is None and idemp_match is None:
+                    pass  # new event
+                elif msg_match is None or idemp_match is None:
+                    raise LedgerError("Conflicting identity: message_id and idempotency_key do not match the same event")
+                else:
+                    # Cross-check that the stored pair matches the supplied pair
+                    if msg_match[6] != idempotency_key or idemp_match[6] != message_id:
+                        raise LedgerError("Conflicting identity: message_id and idempotency_key pair mismatch")
+                    return current_rev  # exact duplicate of both identifiers
+
+            # Single-identifier exact match is a no-op
+            if msg_match is not None or idemp_match is not None:
+                return current_rev
 
             if expected_revision is not None and expected_revision != current_rev:
                 raise LedgerError("Stale or concurrent revision rejected")
@@ -397,13 +413,29 @@ class CheckpointLedger:
             if event_type == EventType.CI_VERIFICATION_RECORDED:
                 if last_reviewed is None:
                     raise LedgerError("CI verification requires prior source review")
+                # Require explicit source verification of the current SHA
+                review_row = connection.execute(
+                    """
+                    SELECT payload FROM events
+                    WHERE project_id = ? AND task_id = ? AND event_type = 'REVIEW_RECORDED'
+                    ORDER BY revision DESC LIMIT 1
+                    """,
+                    (project_id, task_id),
+                ).fetchone()
+                if not review_row:
+                    raise LedgerError("CI verification requires prior source review")
+                review_payload = json.loads(review_row[0])
+                if review_payload.get("source_verified") is not True:
+                    raise LedgerError("CI verification requires explicitly source-verified review")
+                if review_payload.get("sha") != current_sha:
+                    raise LedgerError("Reviewed SHA does not match current implementation")
                 required = {"sha", "workflow_run_id", "conclusion", "tests"}
                 if not required.issubset(payload.keys()):
                     raise LedgerError("CI evidence incomplete")
                 if payload.get("conclusion") != "success":
                     raise LedgerError("CI conclusion not success")
-                if payload.get("sha") != last_reviewed:
-                    raise LedgerError("CI evidence SHA does not match reviewed checkpoint")
+                if payload.get("sha") != current_sha or payload.get("sha") != last_reviewed:
+                    raise LedgerError("CI evidence SHA does not match verified current source")
 
             # New SHA invalidates prior CI (handled by projection; explicit check on new impl)
             if event_type in {EventType.IMPLEMENTATION_SUBMITTED, EventType.CORRECTION_SUBMITTED}:
