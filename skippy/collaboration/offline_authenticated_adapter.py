@@ -165,6 +165,35 @@ class OfflineAuthenticatedAdapter:
                 (stream_key, next_seq),
             )
 
+    def _record_receipt_in(
+        self,
+        connection,
+        envelope: AuthenticatedEnvelope,
+        outcome: str,
+        reason: str | None,
+        now: datetime,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO audit_receipts (
+                message_id, idempotency_key, project_id, task_id,
+                checkpoint_id, assignment_id, sender, outcome, reason, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                envelope.message_id,
+                envelope.idempotency_key,
+                envelope.project_id,
+                envelope.task_id,
+                envelope.checkpoint_id,
+                envelope.assignment_id,
+                envelope.sender,
+                outcome,
+                reason,
+                now.isoformat(),
+            ),
+        )
+
     def _record_receipt(
         self,
         envelope: AuthenticatedEnvelope,
@@ -211,7 +240,7 @@ class OfflineAuthenticatedAdapter:
         now = now or datetime.now(timezone.utc)
 
         with self._lock:
-            # Persistent fail-stop gate
+            # Persistent fail-stop gate and exclusive admission
             with sqlite3.connect(self.database_path) as connection:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
@@ -220,41 +249,139 @@ class OfflineAuthenticatedAdapter:
                 if row and row[0]:
                     raise OfflineAdapterError(f"Fail-stop active: {row[1]}")
 
-            # Authoritative HALT check
-            try:
-                if self._halt_check():
-                    self._record_receipt(envelope, "rejected", "HALTED", now)
-                    raise OfflineAdapterError("HALTED: envelope rejected")
-            except OfflineAdapterError:
-                raise
-            except Exception as exc:
-                self._record_receipt(envelope, "uncertain", f"HALT check failed: {exc}", now)
-                raise OfflineAdapterError(f"HALT check failed: {exc}") from exc
+                # Authoritative HALT check
+                try:
+                    if self._halt_check():
+                        self._record_receipt_in(connection, envelope, "rejected", "HALTED", now)
+                        connection.commit()
+                        raise OfflineAdapterError("HALTED: envelope rejected")
+                except OfflineAdapterError:
+                    raise
+                except Exception as exc:
+                    self._record_receipt_in(connection, envelope, "uncertain", f"HALT check failed: {exc}", now)
+                    connection.commit()
+                    raise OfflineAdapterError(f"HALT check failed: {exc}") from exc
 
-            # Assignment requires trusted fixture dependency
-            try:
-                payload_type = envelope.payload.get("type")
-            except EnvelopeError as exc:
-                self._record_receipt(envelope, "rejected", str(exc), now)
-                raise OfflineAdapterError(str(exc)) from exc
+                # Assignment requires trusted fixture dependency
+                try:
+                    payload_type = envelope.payload.get("type")
+                except EnvelopeError as exc:
+                    self._record_receipt_in(connection, envelope, "rejected", str(exc), now)
+                    connection.commit()
+                    raise OfflineAdapterError(str(exc)) from exc
 
-            if payload_type == "assignment" and not self._trusted_fixture:
-                self._record_receipt(envelope, "rejected", "Assignment requires trusted fixture", now)
-                raise OfflineAdapterError("Assignment requires trusted fixture dependency")
+                if payload_type == "assignment" and not self._trusted_fixture:
+                    self._record_receipt_in(connection, envelope, "rejected", "Assignment requires trusted fixture", now)
+                    connection.commit()
+                    raise OfflineAdapterError("Assignment requires trusted fixture dependency")
 
-            # Assignment identity consistency
-            with sqlite3.connect(self.database_path) as connection:
+                # Assignment identity consistency
                 prior = connection.execute(
                     "SELECT assignment_id FROM assignment_identity WHERE project_id = ? AND task_id = ?",
                     (envelope.project_id, envelope.task_id),
                 ).fetchone()
                 if prior and prior[0] != envelope.assignment_id:
-                    self._record_receipt(envelope, "rejected", "Assignment identity mismatch", now)
+                    self._record_receipt_in(connection, envelope, "rejected", "Assignment identity mismatch", now)
+                    connection.commit()
                     raise OfflineAdapterError("Assignment identity mismatch")
 
-            stream_key = f"{envelope.project_id}:{envelope.task_id}"
-            expected_seq = self._expected_sequence(stream_key)
-            seen_msg, seen_idem = self._seen_ids()
+                stream_key = f"{envelope.project_id}:{envelope.task_id}"
+                seq_row = connection.execute(
+                    "SELECT next_sequence FROM sequence_state WHERE stream_key = ?",
+                    (stream_key,),
+                ).fetchone()
+                expected_seq = seq_row[0] if seq_row else 1
+
+                seen_rows = connection.execute(
+                    "SELECT message_id, idempotency_key FROM audit_receipts WHERE outcome = 'accepted'"
+                ).fetchall()
+                seen_msg = {r[0] for r in seen_rows}
+                seen_idem = {r[1] for r in seen_rows}
+
+                try:
+                    event_type_name = validate_envelope(
+                        envelope,
+                        now=now,
+                        seen_message_ids=seen_msg,
+                        seen_idempotency_keys=seen_idem,
+                        expected_sequence=expected_seq,
+                    )
+                except EnvelopeError as exc:
+                    self._record_receipt_in(connection, envelope, "rejected", str(exc), now)
+                    connection.commit()
+                    raise OfflineAdapterError(str(exc)) from exc
+
+                # Build ledger payload preserving SHA evidence
+                ledger_payload = {
+                    "assignment_id": envelope.assignment_id,
+                    "synthetic": True,
+                    "schema_version": envelope.schema_version,
+                    "digest": envelope.payload_digest,
+                    "type": payload_type,
+                }
+                if "sha" in envelope.payload:
+                    ledger_payload["sha"] = envelope.payload["sha"]
+                if "source_verified" in envelope.payload:
+                    ledger_payload["source_verified"] = envelope.payload["source_verified"]
+                if "findings" in envelope.payload:
+                    ledger_payload["findings"] = envelope.payload["findings"]
+
+                # Derive actual ledger revision
+                with self.ledger._connect() as ledger_conn:
+                    current_rev = self.ledger._current_revision(ledger_conn)
+
+                try:
+                    self.ledger.record_event(
+                        event_type=EventType[event_type_name],
+                        project_id=envelope.project_id,
+                        task_id=envelope.task_id,
+                        checkpoint_id=envelope.checkpoint_id,
+                        actor=envelope.sender,
+                        payload=ledger_payload,
+                        message_id=envelope.message_id,
+                        idempotency_key=envelope.idempotency_key,
+                        expected_revision=current_rev,
+                        now=now,
+                    )
+                except LedgerError as exc:
+                    self._record_receipt_in(connection, envelope, "uncertain", str(exc), now)
+                    connection.commit()
+                    raise OfflineAdapterError(f"Ledger rejection: {exc}") from exc
+
+                # Atomic receipt + sequence + assignment identity
+                try:
+                    self._record_receipt_in(connection, envelope, "accepted", None, now)
+                    connection.execute(
+                        """
+                        INSERT INTO sequence_state (stream_key, next_sequence)
+                        VALUES (?, ?)
+                        ON CONFLICT(stream_key) DO UPDATE SET next_sequence = excluded.next_sequence
+                        WHERE next_sequence = ?
+                        """,
+                        (stream_key, expected_seq + 1, expected_seq),
+                    )
+                    if payload_type == "assignment":
+                        connection.execute(
+                            """
+                            INSERT INTO assignment_identity
+                            (project_id, task_id, assignment_id) VALUES (?, ?, ?)
+                            """,
+                            (envelope.project_id, envelope.task_id, envelope.assignment_id),
+                        )
+                    connection.commit()
+                except Exception as exc:
+                    # Persistent fail-stop
+                    try:
+                        connection.execute(
+                            "UPDATE fail_stop SET stopped = 1, reason = ? WHERE singleton = 1",
+                            (f"Partial write: {exc}",),
+                        )
+                        connection.commit()
+                    except Exception:
+                        pass  # fail-stop itself failed; next admission will reconcile
+                    raise OfflineAdapterError(f"Partial write: {exc}") from exc
+
+            return "accepted"
 
             try:
                 event_type_name = validate_envelope(

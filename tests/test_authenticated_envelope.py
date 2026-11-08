@@ -208,3 +208,37 @@ def test_invalid_sha_format_rejected():
     )
     with pytest.raises(EnvelopeError, match="Invalid"):
         validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set(), expected_sequence=1)
+
+
+def test_fail_stop_persists_across_restart(tmp_path):
+    """Fail-stop state survives restart and blocks subsequent admission."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    # Manually set fail-stop
+    import sqlite3
+    with sqlite3.connect(receipts) as c:
+        c.execute("UPDATE fail_stop SET stopped = 1, reason = 'test' WHERE singleton = 1")
+    # New instance sees the fail-stop
+    adapter2 = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    env = _envelope()
+    with pytest.raises(OfflineAdapterError, match="Fail-stop"):
+        adapter2.accept(env, now=_now())
+
+
+def test_concurrent_instances_serialize(tmp_path):
+    """Two instances sharing the same DB cannot both accept the same sequence."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    a1 = OfflineAuthenticatedAdapter(ledger, receipts, trusted_fixture=True, halt_check=lambda: False)
+    a2 = OfflineAuthenticatedAdapter(ledger, receipts, trusted_fixture=True, halt_check=lambda: False)
+    env1 = _envelope(message_id="msg-a", idempotency_key="idem-a")
+    env2 = _envelope(message_id="msg-b", idempotency_key="idem-b")
+    a1.accept(env1, now=_now())
+    # Second instance must see advanced sequence and reject sequence=1
+    with pytest.raises(OfflineAdapterError, match="Sequence"):
+        a2.accept(env2, now=_now())

@@ -51,3 +51,12 @@ See `skippy/collaboration/authenticated_envelope.py`, `offline_authenticated_ada
 - trusted_fixture remains a test-only harness dependency. It is a commissioning blocker for production use and is never treated as verified Chief authorization.
 
 execution_enabled remains False. External transport remains disabled.
+
+## BRIDGE-02A.4 transaction consistency
+- Admission uses a single exclusive SQLite transaction (BEGIN IMMEDIATE) spanning fail-stop check, HALT check, validation, receipt, sequence advance, and assignment identity. Related state changes commit atomically.
+- Fail-stop state is durable and checked on every admission, including after restart. Subsequent calls are blocked until manual reconciliation.
+- Concurrent adapter instances sharing the same receipts database are serialized by the exclusive transaction. Conflicting sequence admission is rejected.
+- HALT is derived from the required authoritative callback. Missing or failed HALT checks are fail-closed.
+- Review source_verified remains synthetic fixture evidence only. It is a commissioning blocker and is never treated as independently verified authorization.
+
+execution_enabled remains False. External transport remains disabled. No cross-database atomicity is claimed.
