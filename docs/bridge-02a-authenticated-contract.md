@@ -60,3 +60,12 @@ execution_enabled remains False. External transport remains disabled.
 - Review source_verified remains synthetic fixture evidence only. It is a commissioning blocker and is never treated as independently verified authorization.
 
 execution_enabled remains False. External transport remains disabled. No cross-database atomicity is claimed.
+
+## BRIDGE-02A.5 rollback and concurrency
+- Partial-write failures now roll back the transaction before recording fail-stop. An accepted receipt is never persisted when a later step fails.
+- Fail-stop remains durable and is checked on every admission, including after restart.
+- Simultaneous multi-thread tests verify that independent adapter instances sharing the same database produce exactly one acceptance.
+- Dead duplicate implementation code after the successful return path has been removed.
+- HALT remains derived from the required authoritative callback. Review source_verified remains synthetic fixture evidence only.
+
+execution_enabled remains False. External transport remains disabled. No cross-database atomicity is claimed.

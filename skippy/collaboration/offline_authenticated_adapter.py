@@ -370,7 +370,11 @@ class OfflineAuthenticatedAdapter:
                         )
                     connection.commit()
                 except Exception as exc:
-                    # Persistent fail-stop
+                    # Rollback the failed transaction first, then record fail-stop
+                    try:
+                        connection.rollback()
+                    except Exception:
+                        pass
                     try:
                         connection.execute(
                             "UPDATE fail_stop SET stopped = 1, reason = ? WHERE singleton = 1",
@@ -380,77 +384,5 @@ class OfflineAuthenticatedAdapter:
                     except Exception:
                         pass  # fail-stop itself failed; next admission will reconcile
                     raise OfflineAdapterError(f"Partial write: {exc}") from exc
-
-            return "accepted"
-
-            try:
-                event_type_name = validate_envelope(
-                    envelope,
-                    now=now,
-                    seen_message_ids=seen_msg,
-                    seen_idempotency_keys=seen_idem,
-                    expected_sequence=expected_seq,
-                )
-            except EnvelopeError as exc:
-                self._record_receipt(envelope, "rejected", str(exc), now)
-                raise OfflineAdapterError(str(exc)) from exc
-
-            # Build ledger payload preserving SHA evidence
-            ledger_payload = {
-                "assignment_id": envelope.assignment_id,
-                "synthetic": True,
-                "schema_version": envelope.schema_version,
-                "digest": envelope.payload_digest,
-                "type": payload_type,
-            }
-            if "sha" in envelope.payload:
-                ledger_payload["sha"] = envelope.payload["sha"]
-            if "source_verified" in envelope.payload:
-                ledger_payload["source_verified"] = envelope.payload["source_verified"]
-            if "findings" in envelope.payload:
-                ledger_payload["findings"] = envelope.payload["findings"]
-
-            # Derive actual ledger revision
-            with self.ledger._connect() as connection:
-                current_rev = self.ledger._current_revision(connection)
-
-            try:
-                self.ledger.record_event(
-                    event_type=EventType[event_type_name],
-                    project_id=envelope.project_id,
-                    task_id=envelope.task_id,
-                    checkpoint_id=envelope.checkpoint_id,
-                    actor=envelope.sender,
-                    payload=ledger_payload,
-                    message_id=envelope.message_id,
-                    idempotency_key=envelope.idempotency_key,
-                    expected_revision=current_rev,
-                    now=now,
-                )
-            except LedgerError as exc:
-                self._record_receipt(envelope, "uncertain", str(exc), now)
-                raise OfflineAdapterError(f"Ledger rejection: {exc}") from exc
-
-            try:
-                self._record_receipt(envelope, "accepted", None, now)
-                self._advance_sequence(stream_key, expected_seq + 1)
-                # Record assignment identity on first assignment
-                if payload_type == "assignment":
-                    with sqlite3.connect(self.database_path) as connection:
-                        connection.execute(
-                            """
-                            INSERT OR IGNORE INTO assignment_identity
-                            (project_id, task_id, assignment_id) VALUES (?, ?, ?)
-                            """,
-                            (envelope.project_id, envelope.task_id, envelope.assignment_id),
-                        )
-            except Exception as exc:
-                # Ledger succeeded but receipt/sequence failed — persistent fail-stop
-                with sqlite3.connect(self.database_path) as connection:
-                    connection.execute(
-                        "UPDATE fail_stop SET stopped = 1, reason = ? WHERE singleton = 1",
-                        (f"Partial write: {exc}",),
-                    )
-                raise OfflineAdapterError(f"Partial write: ledger accepted but receipt failed: {exc}") from exc
 
             return "accepted"

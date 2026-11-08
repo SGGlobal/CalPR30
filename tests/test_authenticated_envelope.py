@@ -242,3 +242,62 @@ def test_concurrent_instances_serialize(tmp_path):
     # Second instance must see advanced sequence and reject sequence=1
     with pytest.raises(OfflineAdapterError, match="Sequence"):
         a2.accept(env2, now=_now())
+
+
+def test_simultaneous_concurrent_instances(tmp_path):
+    """Two threads on independent instances cannot both accept the same sequence."""
+    import threading
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    results = []
+    errors = []
+
+    def attempt(msg_id, idem):
+        try:
+            adapter = OfflineAuthenticatedAdapter(
+                ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+            )
+            env = _envelope(message_id=msg_id, idempotency_key=idem)
+            adapter.accept(env, now=_now())
+            results.append(msg_id)
+        except Exception as exc:
+            errors.append(str(exc))
+
+    t1 = threading.Thread(target=attempt, args=("msg-t1", "idem-t1"))
+    t2 = threading.Thread(target=attempt, args=("msg-t2", "idem-t2"))
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+    # Exactly one should succeed
+    assert len(results) == 1
+    assert len(errors) == 1
+    assert "Sequence" in errors[0] or "Replay" in errors[0] or "Fail-stop" in errors[0]
+
+
+def test_rollback_does_not_persist_accepted_on_failure(tmp_path, monkeypatch):
+    """Partial failure rolls back and does not leave an accepted receipt."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    # Force sequence advance to fail after receipt insert
+    original = adapter._record_receipt_in
+
+    def failing_receipt(connection, envelope, outcome, reason, now):
+        if outcome == "accepted":
+            raise RuntimeError("simulated receipt failure")
+        return original(connection, envelope, outcome, reason, now)
+
+    monkeypatch.setattr(adapter, "_record_receipt_in", failing_receipt)
+    env = _envelope()
+    with pytest.raises(OfflineAdapterError, match="Partial write"):
+        adapter.accept(env, now=_now())
+    # No accepted receipt should exist
+    import sqlite3
+    with sqlite3.connect(receipts) as c:
+        rows = c.execute(
+            "SELECT outcome FROM audit_receipts WHERE outcome = 'accepted'"
+        ).fetchall()
+    assert len(rows) == 0
