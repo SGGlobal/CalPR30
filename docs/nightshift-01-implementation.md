@@ -99,3 +99,8 @@ Orchestrator and ledger calls are synchronous. A timeout check occurs before eac
 - Default elapsed-time source is `time.monotonic()`. Injectable monotonic clock remains available for deterministic tests. Wall-clock changes cannot bypass the timeout.
 - Assignment identity includes objective and correction settings. Identical redelivery returns the existing report without dispatch. Conflicting reuse of an assignment ID fails closed and preserves the original report.
 - Completion requires matching task ID, COMPLETE status, absence of HALT, and expected synthetic review evidence before recording source verification. Partial persistence is reported as UNCERTAIN, distinct from a clean pre-admission refusal. No automatic continuation.
+
+## Remaining requirement completions
+- Before recording SOURCE_VERIFIED, the runner requires matching task ID, COMPLETE status, approved review outcome, empty unacknowledged collection, no HALT, and correction-count consistency. Incomplete or contradictory results are marked UNCERTAIN.
+- Partial persistence (ledger or protocol operation has started) is reported as UNCERTAIN, distinct from a clean pre-admission refusal. Original evidence is preserved. No automatic continuation.
+- Refused reports persist the original objective and correction settings. Identical redelivery after restart returns the original report. Conflicting redelivery is rejected.

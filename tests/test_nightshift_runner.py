@@ -182,7 +182,7 @@ def test_step_budget_exhausted(tmp_path):
         checkpoint_id="cp-budget",
         objective="budget",
     )
-    assert report.outcome == "fail-closed"
+    assert report.outcome == "uncertain"
     assert "Step budget" in (report.refusal_reason or "")
 
 
@@ -198,7 +198,7 @@ def test_timeout_exceeded(tmp_path):
         checkpoint_id="cp-timeout",
         objective="timeout",
     )
-    assert report.outcome == "fail-closed"
+    assert report.outcome == "uncertain"
     assert "Timeout" in (report.refusal_reason or "")
 
 
@@ -317,7 +317,7 @@ def test_monotonic_timeout(tmp_path):
         checkpoint_id="cp-mono",
         objective="mono",
     )
-    assert report.outcome == "fail-closed"
+    assert report.outcome == "uncertain"
     assert "Timeout" in (report.refusal_reason or "")
 
 
@@ -340,7 +340,7 @@ def test_wall_clock_change_cannot_bypass_timeout(tmp_path):
         checkpoint_id="cp-wall",
         objective="wall",
     )
-    assert report.outcome == "fail-closed"
+    assert report.outcome == "uncertain"
     assert "Timeout" in (report.refusal_reason or "")
 
 
@@ -367,3 +367,44 @@ def test_conflicting_objective_rejected(tmp_path):
     reconstructed = reopened.report("ns-obj")
     assert reconstructed.objective == "original"
     assert reconstructed.outcome == original.outcome
+
+
+def test_refused_report_preserves_identity(tmp_path):
+    """Refused reports persist objective; identical redelivery after restart preserves it."""
+    protocol = CollaborationProtocol(tmp_path / "bridge.db")
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    runner = NightshiftRunner(protocol, ledger, gate=None)
+    original = runner.run(
+        assignment_id="ns-refuse-id",
+        project_id="QLA",
+        task_id="nightshift-refuse-id",
+        checkpoint_id="cp-refuse-id",
+        objective="original-objective",
+        force_inadequate=True,
+    )
+    assert original.outcome == "fail-closed"
+    assert original.objective == "original-objective"
+    assert original.force_inadequate is True
+
+    # Restart and identical redelivery
+    reopened = NightshiftRunner(protocol, ledger, gate=None)
+    redelivery = reopened.run(
+        assignment_id="ns-refuse-id",
+        project_id="QLA",
+        task_id="nightshift-refuse-id",
+        checkpoint_id="cp-refuse-id",
+        objective="original-objective",
+        force_inadequate=True,
+    )
+    assert redelivery.outcome == original.outcome
+    assert redelivery.objective == original.objective
+
+    # Conflicting redelivery rejected
+    with pytest.raises(Exception, match="Conflicting"):
+        reopened.run(
+            assignment_id="ns-refuse-id",
+            project_id="QLA",
+            task_id="nightshift-refuse-id",
+            checkpoint_id="cp-refuse-id",
+            objective="different-objective",
+        )

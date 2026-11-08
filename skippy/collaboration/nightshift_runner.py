@@ -234,23 +234,7 @@ class NightshiftRunner:
         Returns a durable report. Does not retry, self-heal, or enable
         execution. Fail-closed on any prerequisite or transition failure.
         """
-        if self._started:
-            report = self._refuse(assignment_id, project_id, task_id, checkpoint_id, "Duplicate runner instance")
-            self._persist_report(report)
-            return report
-
-        refusal = self._check_prerequisites()
-        if refusal:
-            report = self._refuse(assignment_id, project_id, task_id, checkpoint_id, refusal)
-            self._persist_report(report)
-            return report
-
-        self._started = True
-        self._start_time = self._now()
-        self._mono_start = self._mono()
-        now = self._now()
-
-        # Assignment identity integrity: check existing report before dispatch
+        # Assignment identity integrity: check existing report before any work
         existing = self.report(assignment_id)
         if existing is not None:
             if (
@@ -264,6 +248,22 @@ class NightshiftRunner:
                 return existing
             # Conflicting reuse
             raise NightshiftError("Conflicting reuse of assignment ID")
+
+        if self._started:
+            report = self._refuse(assignment_id, project_id, task_id, checkpoint_id, "Duplicate runner instance", objective=objective, force_inadequate=force_inadequate)
+            self._persist_report(report)
+            return report
+
+        refusal = self._check_prerequisites()
+        if refusal:
+            report = self._refuse(assignment_id, project_id, task_id, checkpoint_id, refusal, objective=objective, force_inadequate=force_inadequate)
+            self._persist_report(report)
+            return report
+
+        self._started = True
+        self._start_time = self._now()
+        self._mono_start = self._mono()
+        now = self._now()
 
         try:
             self._tick()
@@ -284,7 +284,7 @@ class NightshiftRunner:
             self._tick()
             # Drive orchestrator and inspect actual result before recording success
             orch_result = self.orchestrator.run(task_id, objective, force_correction=force_inadequate)
-            # Require task ID, COMPLETE status, and no outstanding issues
+            # Require matching task ID, COMPLETE status, approved review, empty unacknowledged, no HALT
             if not isinstance(orch_result, dict) or orch_result.get("task_id") != task_id:
                 raise NightshiftError("Orchestrator result missing expected task identity")
             if orch_result.get("status") != "COMPLETE":
@@ -302,6 +302,46 @@ class NightshiftRunner:
                     source_verified=False,
                     ci_verified=False,
                     refusal_reason=f"Orchestrator incomplete: {orch_result.get('status')}",
+                    pending_chief_decisions=[],
+                )
+                self._persist_report(report)
+                return report
+            # Final review outcome must be approved
+            if orch_result.get("review_outcome") not in {None, "approved", "APPROVED"}:
+                report = NightshiftReport(
+                    assignment_id=assignment_id,
+                    project_id=project_id,
+                    task_id=task_id,
+                    checkpoint_id=checkpoint_id,
+                    objective=objective,
+                    force_inadequate=force_inadequate,
+                    state="UNCERTAIN",
+                    outcome="uncertain",
+                    correction_count=self._corrections,
+                    local_tests_reported=None,
+                    source_verified=False,
+                    ci_verified=False,
+                    refusal_reason="Review outcome not approved",
+                    pending_chief_decisions=[],
+                )
+                self._persist_report(report)
+                return report
+            # Empty unacknowledged collection
+            if self.protocol.unacknowledged():
+                report = NightshiftReport(
+                    assignment_id=assignment_id,
+                    project_id=project_id,
+                    task_id=task_id,
+                    checkpoint_id=checkpoint_id,
+                    objective=objective,
+                    force_inadequate=force_inadequate,
+                    state="UNCERTAIN",
+                    outcome="uncertain",
+                    correction_count=self._corrections,
+                    local_tests_reported=None,
+                    source_verified=False,
+                    ci_verified=False,
+                    refusal_reason="Outstanding acknowledgments present",
                     pending_chief_decisions=[],
                 )
                 self._persist_report(report)
@@ -437,9 +477,31 @@ class NightshiftRunner:
             return report
 
         except (LedgerError, ProtocolError, NightshiftError, Exception) as exc:
-            report = self._refuse(
-                assignment_id, project_id, task_id, checkpoint_id, str(exc)
-            )
+            # Distinguish clean pre-admission refusal from partial persistence
+            status = self.ledger.status(project_id, task_id)
+            if status is not None:
+                # Work has partially persisted — report UNCERTAIN
+                report = NightshiftReport(
+                    assignment_id=assignment_id,
+                    project_id=project_id,
+                    task_id=task_id,
+                    checkpoint_id=checkpoint_id,
+                    objective=objective,
+                    force_inadequate=force_inadequate,
+                    state="UNCERTAIN",
+                    outcome="uncertain",
+                    correction_count=self._corrections,
+                    local_tests_reported=None,
+                    source_verified=False,
+                    ci_verified=False,
+                    refusal_reason=f"Partial persistence: {exc}",
+                    pending_chief_decisions=[],
+                )
+            else:
+                report = self._refuse(
+                    assignment_id, project_id, task_id, checkpoint_id, str(exc),
+                    objective=objective, force_inadequate=force_inadequate,
+                )
             try:
                 self._persist_report(report)
             except Exception:
