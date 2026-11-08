@@ -45,3 +45,36 @@ Thin, offline, non-executing orchestration layer for one simulated Chief assignm
 ```
 
 See `skippy/collaboration/nightshift_runner.py` and `tests/test_nightshift_runner.py`.
+
+## NIGHTSHIFT-01 corrections applied
+- Correction cycles record correction submission and final review. Successful completion is never reported while the ledger remains in CORRECTION_REQUESTED.
+- Morning reports are persisted (assignment ID, outcome, correction count, refusal reason, final state). Restart reconstructs the same factual report without re-running work. Fail-closed outcomes are recorded durably when storage is available.
+- Before recording an assignment, the runner verifies that the supplied coordinated guard is the existing guard bound to the protocol. Missing, mismatched, replaced, HALTED, or UNKNOWN guards prevent work from being dispatched.
+- Step budget and monotonic timeout are enforced during processing. Deterministic clock and step-limit test doubles are supported.
+
+## Example reports (post-correction)
+
+### Successful synthetic handoff
+```json
+{
+  "assignment_id": "ex-success",
+  "state": "SOURCE_VERIFIED",
+  "outcome": "synthetic-complete",
+  "correction_count": 0,
+  "ci_verified": false,
+  "synthetic": true,
+  "execution_enabled": false
+}
+```
+
+### Fail-closed (missing guard)
+```json
+{
+  "assignment_id": "ex-fail",
+  "state": "REFUSED",
+  "outcome": "fail-closed",
+  "refusal_reason": "Missing coordinated guard",
+  "execution_enabled": false,
+  "synthetic": true
+}
+```

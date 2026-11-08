@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -72,6 +72,7 @@ class NightshiftRunner:
     execution_enabled = False
     MAX_STEPS = 8
     MAX_CORRECTIONS = 1
+    TIMEOUT_SECONDS = 30
 
     def __init__(
         self,
@@ -79,6 +80,8 @@ class NightshiftRunner:
         ledger: CheckpointLedger,
         gate: CoordinatedHaltGate | None = None,
         clock=None,
+        max_steps: int | None = None,
+        timeout_seconds: float | None = None,
     ):
         if gate is not None and type(gate) is not CoordinatedHaltGate:
             raise NightshiftError("Invalid coordinated guard type")
@@ -90,14 +93,74 @@ class NightshiftRunner:
         self._steps = 0
         self._corrections = 0
         self._started = False
+        self._max_steps = max_steps if max_steps is not None else self.MAX_STEPS
+        self._timeout = timeout_seconds if timeout_seconds is not None else self.TIMEOUT_SECONDS
+        self._start_time: datetime | None = None
+        self._init_report_table()
 
     def _now(self) -> datetime:
         return self._clock()
 
+    def _init_report_table(self):
+        """Durable report storage in the ledger database."""
+        with sqlite3.connect(self.ledger.database_path) as connection:
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS nightshift_reports (
+                    assignment_id TEXT PRIMARY KEY,
+                    project_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    checkpoint_id TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    correction_count INTEGER NOT NULL,
+                    local_tests_reported INTEGER,
+                    source_verified INTEGER NOT NULL,
+                    ci_verified INTEGER NOT NULL,
+                    refusal_reason TEXT,
+                    pending_decisions TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                )
+                """
+            )
+
+    def _persist_report(self, report: NightshiftReport) -> None:
+        with sqlite3.connect(self.ledger.database_path) as connection:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO nightshift_reports (
+                    assignment_id, project_id, task_id, checkpoint_id,
+                    state, outcome, correction_count, local_tests_reported,
+                    source_verified, ci_verified, refusal_reason,
+                    pending_decisions, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    report.assignment_id,
+                    report.project_id,
+                    report.task_id,
+                    report.checkpoint_id,
+                    report.state,
+                    report.outcome,
+                    report.correction_count,
+                    report.local_tests_reported,
+                    1 if report.source_verified else 0,
+                    1 if report.ci_verified else 0,
+                    report.refusal_reason,
+                    json.dumps(report.pending_chief_decisions),
+                    self._now().isoformat(),
+                ),
+            )
+
     def _check_prerequisites(self) -> str | None:
-        """Return refusal reason or None if ready."""
+        """Return refusal reason or None if ready. Uses existing admission controls."""
         if self.gate is None:
             return "Missing coordinated guard"
+        # Must be the guard already bound to the protocol
+        if getattr(self.protocol, "coordinated_guard", None) is not self.gate:
+            return "Mismatched or unbound coordinated guard"
+        if getattr(self.protocol, "coordinated_enforcement_required", False) is not True:
+            return "Protocol enforcement not required"
         try:
             result = self.gate.check()
             if not result.allowed or result.execution_enabled is not False:
@@ -111,6 +174,16 @@ class NightshiftRunner:
         if self.protocol.is_halted:
             return "Protocol is halted"
         return None
+
+    def _tick(self) -> None:
+        """Enforce step budget and timeout. Fail closed if exceeded."""
+        self._steps += 1
+        if self._steps > self._max_steps:
+            raise NightshiftError("Step budget exhausted")
+        if self._start_time is not None:
+            elapsed = (self._now() - self._start_time).total_seconds()
+            if elapsed > self._timeout:
+                raise NightshiftError("Timeout exceeded")
 
     def run(
         self,
@@ -130,17 +203,23 @@ class NightshiftRunner:
         execution. Fail-closed on any prerequisite or transition failure.
         """
         if self._started:
-            return self._refuse(assignment_id, project_id, task_id, checkpoint_id, "Duplicate runner instance")
+            report = self._refuse(assignment_id, project_id, task_id, checkpoint_id, "Duplicate runner instance")
+            self._persist_report(report)
+            return report
 
         refusal = self._check_prerequisites()
         if refusal:
-            return self._refuse(assignment_id, project_id, task_id, checkpoint_id, refusal)
+            report = self._refuse(assignment_id, project_id, task_id, checkpoint_id, refusal)
+            self._persist_report(report)
+            return report
 
         self._started = True
+        self._start_time = self._now()
         now = self._now()
 
         try:
-            # Record assignment
+            self._tick()
+            # Record assignment only after guard verification
             self.ledger.record_event(
                 event_type=EventType.ASSIGNMENT_CREATED,
                 project_id=project_id,
@@ -153,12 +232,12 @@ class NightshiftRunner:
                 expected_revision=expected_revision,
                 now=now,
             )
-            self._steps += 1
 
+            self._tick()
             # Drive orchestrator for the simulated workflow
-            report = self.orchestrator.run(task_id, objective, force_correction=force_inadequate)
-            self._steps += 1
+            self.orchestrator.run(task_id, objective, force_correction=force_inadequate)
 
+            self._tick()
             # Record implementation submitted (synthetic)
             self.ledger.record_event(
                 event_type=EventType.IMPLEMENTATION_SUBMITTED,
@@ -177,9 +256,9 @@ class NightshiftRunner:
                 expected_revision=expected_revision + 1,
                 now=now,
             )
-            self._steps += 1
 
-            # Record review
+            self._tick()
+            # Record initial review
             self.ledger.record_event(
                 event_type=EventType.REVIEW_RECORDED,
                 project_id=project_id,
@@ -197,9 +276,9 @@ class NightshiftRunner:
                 expected_revision=expected_revision + 2,
                 now=now,
             )
-            self._steps += 1
 
             if force_inadequate and self._corrections < self.MAX_CORRECTIONS:
+                self._tick()
                 self.ledger.record_event(
                     event_type=EventType.CORRECTION_REQUESTED,
                     project_id=project_id,
@@ -207,34 +286,88 @@ class NightshiftRunner:
                     checkpoint_id=checkpoint_id,
                     actor="skippy",
                     payload={"findings": "synthetic correction", "synthetic": True},
-                    message_id=f"corr-{assignment_id}",
-                    idempotency_key=f"idem-corr-{assignment_id}",
+                    message_id=f"corr-req-{assignment_id}",
+                    idempotency_key=f"idem-corr-req-{assignment_id}",
                     expected_revision=expected_revision + 3,
                     now=now,
                 )
                 self._corrections += 1
-                self._steps += 1
+
+                self._tick()
+                # Correction submission
+                self.ledger.record_event(
+                    event_type=EventType.CORRECTION_SUBMITTED,
+                    project_id=project_id,
+                    task_id=task_id,
+                    checkpoint_id=checkpoint_id,
+                    actor="jason",
+                    payload={
+                        "sha": "synthetic-local-corrected",
+                        "local_tests": 0,
+                        "synthetic": True,
+                        "assignment_id": assignment_id,
+                    },
+                    message_id=f"corr-sub-{assignment_id}",
+                    idempotency_key=f"idem-corr-sub-{assignment_id}",
+                    expected_revision=expected_revision + 4,
+                    now=now,
+                )
+
+                self._tick()
+                # Final review after correction
+                self.ledger.record_event(
+                    event_type=EventType.REVIEW_RECORDED,
+                    project_id=project_id,
+                    task_id=task_id,
+                    checkpoint_id=checkpoint_id,
+                    actor="skippy",
+                    payload={
+                        "sha": "synthetic-local-corrected",
+                        "source_verified": True,
+                        "synthetic": True,
+                        "assignment_id": assignment_id,
+                    },
+                    message_id=f"review-final-{assignment_id}",
+                    idempotency_key=f"idem-review-final-{assignment_id}",
+                    expected_revision=expected_revision + 5,
+                    now=now,
+                )
 
             status = self.ledger.status(project_id, task_id)
-            return NightshiftReport(
-                assignment_id=assignment_id,
-                project_id=project_id,
-                task_id=task_id,
-                checkpoint_id=checkpoint_id,
-                state=status.state.value if status else "UNCERTAIN",
-                outcome="synthetic-complete",
-                correction_count=self._corrections,
-                local_tests_reported=status.local_tests_reported if status else None,
-                source_verified=bool(status and status.state == CheckpointState.SOURCE_VERIFIED),
-                ci_verified=False,  # never claim independent CI
-                refusal_reason=None,
-                pending_chief_decisions=["PR authorization", "merge authorization"],
-            )
+            final_state = status.state.value if status else "UNCERTAIN"
+            # Never report success while still in CORRECTION_REQUESTED
+            if final_state == "CORRECTION_REQUESTED":
+                report = self._refuse(
+                    assignment_id, project_id, task_id, checkpoint_id,
+                    "Ledger remains in CORRECTION_REQUESTED"
+                )
+            else:
+                report = NightshiftReport(
+                    assignment_id=assignment_id,
+                    project_id=project_id,
+                    task_id=task_id,
+                    checkpoint_id=checkpoint_id,
+                    state=final_state,
+                    outcome="synthetic-complete",
+                    correction_count=self._corrections,
+                    local_tests_reported=status.local_tests_reported if status else None,
+                    source_verified=bool(status and status.state == CheckpointState.SOURCE_VERIFIED),
+                    ci_verified=False,
+                    refusal_reason=None,
+                    pending_chief_decisions=["PR authorization", "merge authorization"],
+                )
+            self._persist_report(report)
+            return report
 
-        except (LedgerError, ProtocolError, Exception) as exc:
-            return self._refuse(
+        except (LedgerError, ProtocolError, NightshiftError, Exception) as exc:
+            report = self._refuse(
                 assignment_id, project_id, task_id, checkpoint_id, str(exc)
             )
+            try:
+                self._persist_report(report)
+            except Exception:
+                pass  # best-effort persistence
+            return report
 
     def _refuse(
         self,
@@ -259,22 +392,33 @@ class NightshiftRunner:
             pending_chief_decisions=[],
         )
 
-    def report(self, project_id: str, task_id: str) -> NightshiftReport | None:
-        """Reconstruct report from durable ledger state. Does not re-run agents."""
-        status = self.ledger.status(project_id, task_id)
-        if status is None:
+    def report(self, assignment_id: str) -> NightshiftReport | None:
+        """Reconstruct report from durable storage. Does not re-run agents."""
+        with sqlite3.connect(self.ledger.database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT assignment_id, project_id, task_id, checkpoint_id,
+                       state, outcome, correction_count, local_tests_reported,
+                       source_verified, ci_verified, refusal_reason,
+                       pending_decisions
+                FROM nightshift_reports
+                WHERE assignment_id = ?
+                """,
+                (assignment_id,),
+            ).fetchone()
+        if row is None:
             return None
         return NightshiftReport(
-            assignment_id="reconstructed",
-            project_id=project_id,
-            task_id=task_id,
-            checkpoint_id=status.checkpoint_id,
-            state=status.state.value,
-            outcome="reconstructed-from-ledger",
-            correction_count=0,
-            local_tests_reported=status.local_tests_reported,
-            source_verified=status.state == CheckpointState.SOURCE_VERIFIED,
-            ci_verified=status.ci_verified,
-            refusal_reason=None,
-            pending_chief_decisions=["PR authorization", "merge authorization"],
+            assignment_id=row[0],
+            project_id=row[1],
+            task_id=row[2],
+            checkpoint_id=row[3],
+            state=row[4],
+            outcome=row[5],
+            correction_count=row[6],
+            local_tests_reported=row[7],
+            source_verified=bool(row[8]),
+            ci_verified=bool(row[9]),
+            refusal_reason=row[10],
+            pending_chief_decisions=json.loads(row[11]),
         )
