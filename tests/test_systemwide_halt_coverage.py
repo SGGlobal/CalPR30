@@ -119,13 +119,17 @@ def test_gated_protocol_rejects_the_same_condition(tmp_path):
     assert protocol.get_state("T-coverage") is None
 
 
-def test_ungated_orchestrator_runs_while_coordinated_is_halted(tmp_path):
+def test_ungated_orchestrator_rejects_while_coordinated_is_halted(tmp_path):
     coordinated = tmp_path / "coord.db"
     _init_authority(coordinated)
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
     orchestrator = CollaborationOrchestrator(protocol)
-    summary = orchestrator.run("T-orch", "coverage objective")
-    assert summary["status"] == "COMPLETE"
+    try:
+        orchestrator.run("T-orch", "coverage objective")
+        assert False, "ungated orchestrator accepted work"
+    except ProtocolError as exc:
+        assert "Work admission rejected" in str(exc)
+    assert protocol.get_state("T-orch") is None
     status, _sequence = CoordinatedHalt(coordinated).read_status()
     assert status is HaltStatus.HALTED
 
@@ -171,7 +175,8 @@ def test_ungated_lifecycle_evaluates_while_coordinated_is_halted(tmp_path):
     lifecycle = AuthorizationLifecycle(verifier, policy, protocol)
     assert lifecycle.coordinated_gate is None
     result = lifecycle.evaluate(challenge, private.sign(canonical_payload(challenge)))
-    assert result.accepted is True
+    assert result.accepted is False
+    assert result.reason == "Work admission rejected"
     assert result.execution_enabled is False
     status, _sequence = CoordinatedHalt(coordinated).read_status()
     assert status is HaltStatus.HALTED

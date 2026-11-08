@@ -138,6 +138,8 @@ def _setup(tmp_path, coordinated_state="NOT_HALTED", sequence=None):
         key_id="test-key",
     )
     gate = CoordinatedHaltGate(coordinated, policy, protocol)
+    policy.require_coordinated_guard(gate)
+    protocol.require_coordinated_guard(gate)
     lifecycle = AuthorizationLifecycle(verifier, policy, protocol, coordinated_gate=gate)
     return {
         "private": private,
@@ -326,9 +328,11 @@ def test_default_lifecycle_unchanged_without_gate(tmp_path):
     env = _setup(tmp_path)
     default = AuthorizationLifecycle(env["verifier"], env["policy"], env["protocol"])
     result = default.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
-    assert result.accepted is True
+    assert result.accepted is False
+    assert result.reason == "Work admission rejected"
     assert result.execution_enabled is False
     assert default.coordinated_gate is None
+    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
 
 
 def test_gate_result_execution_disabled_cannot_be_overridden():
@@ -384,38 +388,49 @@ class _BadResultGate:
         return self.result
 
 
-def test_gate_exception_rejects_without_consuming_challenge(tmp_path):
+def test_substitute_gate_cannot_authorize_admission(tmp_path):
     env = _setup(tmp_path)
-    lifecycle = AuthorizationLifecycle(
-        env["verifier"],
-        env["policy"],
-        env["protocol"],
-        coordinated_gate=_RaisingGate(env["policy"], env["protocol"]),
-    )
+    with pytest.raises(ValueError, match="must be a CoordinatedHaltGate"):
+        AuthorizationLifecycle(
+            env["verifier"],
+            env["policy"],
+            env["protocol"],
+            coordinated_gate=_BadResultGate(
+                env["policy"],
+                env["protocol"],
+                GateResult(True, "unsafe", "NOT_HALTED", True, False, False),
+            ),
+        )
+    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
 
-    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+
+def test_replaced_check_method_rejects_without_consuming_challenge(tmp_path):
+    env = _setup(tmp_path)
+
+    def boom():
+        raise RuntimeError("secret-token-should-not-leak")
+
+    env["gate"].check = boom
+    result = env["lifecycle"].evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
     assert result.accepted is False
-    assert result.identity_verified is False
-    assert result.execution_enabled is False
-    assert result.reason == "Coordinated gate evaluation failed"
+    assert result.reason == "Work admission rejected"
     assert "secret-token" not in result.reason
+    assert result.execution_enabled is False
     assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
     assert env["policy"].stored_state("auth-1") == "PENDING"
 
 
-def test_invalid_gate_result_rejects(tmp_path):
+def test_fabricated_successful_result_cannot_authorize(tmp_path):
     env = _setup(tmp_path)
-    lifecycle = AuthorizationLifecycle(
-        env["verifier"],
-        env["policy"],
-        env["protocol"],
-        coordinated_gate=_BadResultGate(env["policy"], env["protocol"], {"allowed": True}),
-    )
 
-    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+    def fake_success():
+        return GateResult(True, "fabricated", "NOT_HALTED", True, False, False)
+
+    env["gate"].check = fake_success
+    result = env["lifecycle"].evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
     assert result.accepted is False
+    assert result.reason == "Work admission rejected"
     assert result.execution_enabled is False
-    assert result.reason == "Coordinated gate result invalid"
     assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
 
 
@@ -423,23 +438,16 @@ def test_component_mismatch_rejected(tmp_path):
     env = _setup(tmp_path)
     other_policy = AuthorizationPolicy(tmp_path / "other-auth.db")
     mismatched = CoordinatedHaltGate(env["coordinated"], other_policy, env["protocol"])
-
     with pytest.raises(ValueError, match="authorization policy mismatch"):
         AuthorizationLifecycle(
-            env["verifier"],
-            env["policy"],
-            env["protocol"],
-            coordinated_gate=mismatched,
+            env["verifier"], env["policy"], env["protocol"], coordinated_gate=mismatched
         )
 
     other_protocol = CollaborationProtocol(tmp_path / "other-bridge.db")
     mismatched_protocol = CoordinatedHaltGate(env["coordinated"], env["policy"], other_protocol)
     with pytest.raises(ValueError, match="collaboration protocol mismatch"):
         AuthorizationLifecycle(
-            env["verifier"],
-            env["policy"],
-            env["protocol"],
-            coordinated_gate=mismatched_protocol,
+            env["verifier"], env["policy"], env["protocol"], coordinated_gate=mismatched_protocol
         )
 
 
@@ -457,7 +465,8 @@ def test_default_construction_unchanged(tmp_path):
     lifecycle = AuthorizationLifecycle(env["verifier"], env["policy"], env["protocol"])
     assert lifecycle.coordinated_gate is None
     result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
-    assert result.accepted is True
+    assert result.accepted is False
+    assert result.reason == "Work admission rejected"
     assert result.execution_enabled is False
 
 
@@ -489,99 +498,15 @@ def test_all_outcomes_report_execution_disabled(tmp_path):
     assert rejected.execution_enabled is False
 
 
-def test_allowed_result_reporting_halted_is_rejected(tmp_path):
+def test_inconsistent_result_via_replaced_check_rejects(tmp_path):
     env = _setup(tmp_path)
-    inconsistent = GateResult(True, "unsafe", "HALTED", True, False, False)
-    lifecycle = AuthorizationLifecycle(
-        env["verifier"],
-        env["policy"],
-        env["protocol"],
-        coordinated_gate=_BadResultGate(env["policy"], env["protocol"], inconsistent),
-    )
-    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
+
+    def halted():
+        return GateResult(True, "unsafe", "HALTED", True, False, False)
+
+    env["gate"].check = halted
+    result = env["lifecycle"].evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
     assert result.accepted is False
-    assert result.execution_enabled is False
-    assert result.reason == "Coordinated gate result invalid"
-    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
-
-
-def test_allowed_result_with_incomplete_migration_is_rejected(tmp_path):
-    env = _setup(tmp_path)
-    inconsistent = GateResult(True, "unsafe", "NOT_HALTED", False, False, False)
-    lifecycle = AuthorizationLifecycle(
-        env["verifier"],
-        env["policy"],
-        env["protocol"],
-        coordinated_gate=_BadResultGate(env["policy"], env["protocol"], inconsistent),
-    )
-    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
-    assert result.accepted is False
+    assert result.reason == "Work admission rejected"
     assert result.execution_enabled is False
     assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
-
-
-def test_allowed_result_reporting_legacy_halt_is_rejected(tmp_path):
-    env = _setup(tmp_path)
-    policy_halted = GateResult(True, "unsafe", "NOT_HALTED", True, True, False)
-    protocol_halted = GateResult(True, "unsafe", "NOT_HALTED", True, False, True)
-
-    for inconsistent in (policy_halted, protocol_halted):
-        lifecycle = AuthorizationLifecycle(
-            env["verifier"],
-            env["policy"],
-            env["protocol"],
-            coordinated_gate=_BadResultGate(env["policy"], env["protocol"], inconsistent),
-        )
-        result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
-        assert result.accepted is False
-        assert result.execution_enabled is False
-        assert result.reason == "Coordinated gate result invalid"
-    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
-
-
-def test_correctly_formed_safe_result_is_accepted(tmp_path):
-    env = _setup(tmp_path)
-    safe = GateResult(
-        True,
-        "Safety conditions satisfied; execution disabled",
-        "NOT_HALTED",
-        True,
-        False,
-        False,
-    )
-    lifecycle = AuthorizationLifecycle(
-        env["verifier"],
-        env["policy"],
-        env["protocol"],
-        coordinated_gate=_BadResultGate(env["policy"], env["protocol"], safe),
-    )
-    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
-    assert result.accepted is True
-    assert result.identity_verified is True
-    assert result.execution_enabled is False
-    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "consumed"
-
-
-class _ExplosiveStatus(GateResult):
-    def __getattribute__(self, name):
-        if name == "coordinated_status":
-            raise RuntimeError("secret-validation-token")
-        return super().__getattribute__(name)
-
-
-def test_result_validation_exception_fails_closed(tmp_path):
-    env = _setup(tmp_path)
-    explosive = _ExplosiveStatus(True, "unsafe", "NOT_HALTED", True, False, False)
-    lifecycle = AuthorizationLifecycle(
-        env["verifier"],
-        env["policy"],
-        env["protocol"],
-        coordinated_gate=_BadResultGate(env["policy"], env["protocol"], explosive),
-    )
-    result = lifecycle.evaluate(env["challenge"], _sign(env["private"], env["challenge"]))
-    assert result.accepted is False
-    assert result.execution_enabled is False
-    assert result.reason == "Coordinated gate evaluation failed"
-    assert "secret-validation-token" not in result.reason
-    assert _challenge_status(env["verifier"], env["challenge"]["challenge_id"]) == "open"
-    assert env["policy"].stored_state("auth-1") == "PENDING"

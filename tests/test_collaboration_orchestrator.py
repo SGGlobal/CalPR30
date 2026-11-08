@@ -4,10 +4,15 @@ SKIPPY AI Collaboration Bridge — Orchestrator Tests.
 LOCAL SYNTHETIC ONLY.
 """
 
+import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
+from skippy.collaboration.authorization import AuthorizationPolicy
+from skippy.collaboration.coordinated_halt import SUPPORTED_SCHEMA_VERSION
+from skippy.collaboration.coordinated_halt_gate import CoordinatedHaltGate
 from skippy.collaboration.orchestrator import CollaborationOrchestrator
 from skippy.collaboration.protocol import (
     CollaborationProtocol,
@@ -19,9 +24,71 @@ from skippy.collaboration.protocol import (
 from skippy.collaboration.router import LocalRouter, RouterError
 
 
+def _init_authority(path: Path) -> None:
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS halt_state (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                state TEXT NOT NULL CHECK (state IN ('NOT_HALTED', 'HALTED')),
+                sequence INTEGER NOT NULL CHECK (sequence >= 0),
+                updated_at TEXT NOT NULL,
+                reason TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS halt_events (
+                event_id TEXT PRIMARY KEY,
+                occurred_at TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                sequence INTEGER,
+                detail TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('schema_version', ?)",
+            (SUPPORTED_SCHEMA_VERSION,),
+        )
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO halt_state (singleton, state, sequence, updated_at, reason)
+            VALUES (1, 'NOT_HALTED', 0, '2026-01-01T00:00:00+00:00', 'test-init')
+            """
+        )
+
+
+def _bound_protocol(database):
+    parent = Path(database).parent
+    policy = AuthorizationPolicy(parent / f"{Path(database).name}.auth.db")
+    protocol = CollaborationProtocol(database)
+    coordinated = parent / f"{Path(database).name}.coord.db"
+    _init_authority(coordinated)
+    protocol.require_coordinated_guard(
+        CoordinatedHaltGate(coordinated, policy, protocol)
+    )
+    return protocol
+
+
+def _bound(tmp_path, name="bridge.db"):
+    """Synthetic admission fixture. Not production startup wiring."""
+    policy = AuthorizationPolicy(tmp_path / f"{name}.auth.db")
+    protocol = CollaborationProtocol(tmp_path / name)
+    coordinated = tmp_path / f"{name}.coord.db"
+    _init_authority(coordinated)
+    protocol.require_coordinated_guard(
+        CoordinatedHaltGate(coordinated, policy, protocol)
+    )
+    return protocol, CollaborationOrchestrator(protocol)
+
+
 def test_successful_round_trip(tmp_path):
-    protocol = CollaborationProtocol(tmp_path / "bridge.db")
-    orchestrator = CollaborationOrchestrator(protocol)
+    protocol, orchestrator = _bound(tmp_path)
 
     report = orchestrator.run("T1", "design local protocol")
 
@@ -32,8 +99,7 @@ def test_successful_round_trip(tmp_path):
 
 
 def test_correction_loop(tmp_path):
-    protocol = CollaborationProtocol(tmp_path / "bridge.db")
-    orchestrator = CollaborationOrchestrator(protocol)
+    protocol, orchestrator = _bound(tmp_path)
 
     report = orchestrator.run(
         "T2",
@@ -47,8 +113,7 @@ def test_correction_loop(tmp_path):
 
 
 def test_jason_handler_processes_assignment(tmp_path):
-    protocol = CollaborationProtocol(tmp_path / "bridge.db")
-    orchestrator = CollaborationOrchestrator(protocol)
+    protocol, orchestrator = _bound(tmp_path)
     now = datetime.now(timezone.utc)
 
     msg = Message(
@@ -67,8 +132,7 @@ def test_jason_handler_processes_assignment(tmp_path):
 
 
 def test_skyppy_handler_processes_review(tmp_path):
-    protocol = CollaborationProtocol(tmp_path / "bridge.db")
-    orchestrator = CollaborationOrchestrator(protocol)
+    protocol, orchestrator = _bound(tmp_path)
     now = datetime.now(timezone.utc)
 
     assignment = Message(
@@ -117,8 +181,7 @@ def test_skyppy_handler_processes_review(tmp_path):
 
 
 def test_handler_failure_prevents_acknowledgment(tmp_path):
-    protocol = CollaborationProtocol(tmp_path / "bridge.db")
-    orchestrator = CollaborationOrchestrator(protocol)
+    protocol, orchestrator = _bound(tmp_path)
 
     def failing(message):
         raise RuntimeError("handler failed")
@@ -204,7 +267,7 @@ def test_complete_with_unacknowledged_completion(tmp_path):
 
 def test_complete_all_acknowledged(tmp_path):
     database = tmp_path / "bridge.db"
-    CollaborationOrchestrator(CollaborationProtocol(database)).run("T5", "done")
+    CollaborationOrchestrator(_bound_protocol(database)).run("T5", "done")
 
     status = CollaborationOrchestrator(
         CollaborationProtocol(database)
@@ -310,8 +373,7 @@ def test_recovery_after_ack(tmp_path):
 
 
 def test_completed_task_not_replayed(tmp_path):
-    protocol = CollaborationProtocol(tmp_path / "bridge.db")
-    orchestrator = CollaborationOrchestrator(protocol)
+    protocol, orchestrator = _bound(tmp_path)
     orchestrator.run("T6", "done")
 
     with pytest.raises(ProtocolError, match="not replayed"):
@@ -320,10 +382,10 @@ def test_completed_task_not_replayed(tmp_path):
 
 def test_report_accurate_after_reopen(tmp_path):
     database = tmp_path / "bridge.db"
-    first = CollaborationOrchestrator(CollaborationProtocol(database))
+    first = CollaborationOrchestrator(_bound_protocol(database))
     first.run("T8", "report me", force_correction=True)
 
-    second = CollaborationOrchestrator(CollaborationProtocol(database))
+    second = CollaborationOrchestrator(_bound_protocol(database))
     report = second.report("T8")
 
     assert report["status"] == "COMPLETE"
@@ -334,7 +396,7 @@ def test_report_accurate_after_reopen(tmp_path):
 
 def test_task_specific_filtering(tmp_path):
     database = tmp_path / "bridge.db"
-    orchestrator = CollaborationOrchestrator(CollaborationProtocol(database))
+    orchestrator = CollaborationOrchestrator(_bound_protocol(database))
     orchestrator.run("T9", "one")
     orchestrator.run("T10", "two", force_correction=True)
 
@@ -383,7 +445,7 @@ def test_halt_before_next_agent_operation(tmp_path):
     assert orchestrator.report("THALT")["status"] == "ASSIGNED"
     assert orchestrator.report("THALT")["message_count"] == 1
 
-    reopened = CollaborationOrchestrator(CollaborationProtocol(database))
+    reopened = CollaborationOrchestrator(_bound_protocol(database))
     assert reopened.protocol.is_halted is True
     assert reopened.report("THALT")["status"] == "ASSIGNED"
 
@@ -392,10 +454,10 @@ def test_halt_persists_across_reopen(tmp_path):
     database = tmp_path / "bridge.db"
     CollaborationProtocol(database).halt()
 
-    second = CollaborationOrchestrator(CollaborationProtocol(database))
+    second = CollaborationOrchestrator(_bound_protocol(database))
     assert second.protocol.is_halted is True
 
-    with pytest.raises(ProtocolError, match="halted"):
+    with pytest.raises(ProtocolError, match="Work admission rejected"):
         second.run("T13", "still halted")
 
 
@@ -430,8 +492,7 @@ def test_router_rejects_unregistered_handler(tmp_path):
 
 
 def test_no_unauthorized_side_effects(tmp_path):
-    protocol = CollaborationProtocol(tmp_path / "bridge.db")
-    orchestrator = CollaborationOrchestrator(protocol)
+    protocol, orchestrator = _bound(tmp_path)
 
     report = orchestrator.run("T16", "local only")
 

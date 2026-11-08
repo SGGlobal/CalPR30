@@ -274,6 +274,10 @@ class CollaborationOrchestrator:
         Returns a summary dict. Does not authorize real actions.
         """
 
+        # Coordinated admission before any assignment, handler, or dispatch.
+        # A guard object alone is not sufficient; evaluation must succeed.
+        self.protocol.admit_work()
+
         if self.protocol.is_halted:
             raise ProtocolError("Protocol is halted; new work rejected")
 
