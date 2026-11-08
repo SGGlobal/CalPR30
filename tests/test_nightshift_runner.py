@@ -188,10 +188,9 @@ def test_step_budget_exhausted(tmp_path):
 
 def test_timeout_exceeded(tmp_path):
     protocol, policy, gate, ledger = _setup(tmp_path)
-    start = datetime(2026, 11, 7, 22, 0, tzinfo=timezone.utc)
-    times = [start, start + timedelta(seconds=100)]
-    clock = lambda: times.pop(0) if times else start + timedelta(seconds=200)
-    runner = NightshiftRunner(protocol, ledger, gate, clock=clock, timeout_seconds=1)
+    mono_times = [1000.0, 1000.0, 1100.0]
+    mono = lambda: mono_times.pop(0) if mono_times else 1200.0
+    runner = NightshiftRunner(protocol, ledger, gate, mono=mono, timeout_seconds=1)
     report = runner.run(
         assignment_id="ns-timeout",
         project_id="QLA",
@@ -320,3 +319,51 @@ def test_monotonic_timeout(tmp_path):
     )
     assert report.outcome == "fail-closed"
     assert "Timeout" in (report.refusal_reason or "")
+
+
+def test_wall_clock_change_cannot_bypass_timeout(tmp_path):
+    """Wall-clock changes do not affect monotonic timeout enforcement."""
+    protocol, policy, gate, ledger = _setup(tmp_path)
+    # Wall clock jumps backward; monotonic clock advances
+    wall_times = [
+        datetime(2026, 11, 7, 22, 0, tzinfo=timezone.utc),
+        datetime(2026, 11, 7, 21, 0, tzinfo=timezone.utc),  # backward
+    ]
+    mono_times = [1000.0, 1000.0, 1100.0]
+    clock = lambda: wall_times.pop(0) if wall_times else datetime(2026, 11, 7, 20, 0, tzinfo=timezone.utc)
+    mono = lambda: mono_times.pop(0) if mono_times else 1200.0
+    runner = NightshiftRunner(protocol, ledger, gate, clock=clock, mono=mono, timeout_seconds=1)
+    report = runner.run(
+        assignment_id="ns-wall",
+        project_id="QLA",
+        task_id="nightshift-wall",
+        checkpoint_id="cp-wall",
+        objective="wall",
+    )
+    assert report.outcome == "fail-closed"
+    assert "Timeout" in (report.refusal_reason or "")
+
+
+def test_conflicting_objective_rejected(tmp_path):
+    """Conflicting objective with same assignment ID fails closed and preserves original."""
+    protocol, policy, gate, ledger = _setup(tmp_path)
+    runner = NightshiftRunner(protocol, ledger, gate)
+    original = runner.run(
+        assignment_id="ns-obj",
+        project_id="QLA",
+        task_id="nightshift-obj",
+        checkpoint_id="cp-obj",
+        objective="original",
+    )
+    reopened = NightshiftRunner(protocol, ledger, gate)
+    with pytest.raises(Exception, match="Conflicting"):
+        reopened.run(
+            assignment_id="ns-obj",
+            project_id="QLA",
+            task_id="nightshift-obj",
+            checkpoint_id="cp-obj",
+            objective="different",
+        )
+    reconstructed = reopened.report("ns-obj")
+    assert reconstructed.objective == "original"
+    assert reconstructed.outcome == original.outcome

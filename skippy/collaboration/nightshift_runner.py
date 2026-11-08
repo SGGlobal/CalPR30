@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -48,6 +49,8 @@ class NightshiftReport:
     project_id: str
     task_id: str
     checkpoint_id: str
+    objective: str
+    force_inadequate: bool
     state: str
     outcome: str
     correction_count: int
@@ -91,8 +94,8 @@ class NightshiftRunner:
         self.gate = gate
         self.orchestrator = CollaborationOrchestrator(protocol)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
-        # Monotonic clock for timeout (injectable for tests)
-        self._mono = mono or (lambda: self._clock().timestamp())
+        # Default monotonic source is time.monotonic(); injectable for tests
+        self._mono = mono or time.monotonic
         self._steps = 0
         self._corrections = 0
         self._started = False
@@ -120,6 +123,8 @@ class NightshiftRunner:
                     project_id TEXT NOT NULL,
                     task_id TEXT NOT NULL,
                     checkpoint_id TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    force_inadequate INTEGER NOT NULL,
                     state TEXT NOT NULL,
                     outcome TEXT NOT NULL,
                     correction_count INTEGER NOT NULL,
@@ -149,16 +154,19 @@ class NightshiftRunner:
                 """
                 INSERT INTO nightshift_reports (
                     assignment_id, project_id, task_id, checkpoint_id,
+                    objective, force_inadequate,
                     state, outcome, correction_count, local_tests_reported,
                     source_verified, ci_verified, refusal_reason,
                     pending_decisions, recorded_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     report.assignment_id,
                     report.project_id,
                     report.task_id,
                     report.checkpoint_id,
+                    report.objective,
+                    1 if report.force_inadequate else 0,
                     report.state,
                     report.outcome,
                     report.correction_count,
@@ -249,6 +257,8 @@ class NightshiftRunner:
                 existing.project_id == project_id
                 and existing.task_id == task_id
                 and existing.checkpoint_id == checkpoint_id
+                and existing.objective == objective
+                and existing.force_inadequate == force_inadequate
             ):
                 # Identical redelivery — no new work
                 return existing
@@ -283,6 +293,8 @@ class NightshiftRunner:
                     project_id=project_id,
                     task_id=task_id,
                     checkpoint_id=checkpoint_id,
+                    objective=objective,
+                    force_inadequate=force_inadequate,
                     state="UNCERTAIN",
                     outcome="uncertain",
                     correction_count=self._corrections,
@@ -410,6 +422,8 @@ class NightshiftRunner:
                     project_id=project_id,
                     task_id=task_id,
                     checkpoint_id=checkpoint_id,
+                    objective=objective,
+                    force_inadequate=force_inadequate,
                     state=final_state,
                     outcome="synthetic-complete",
                     correction_count=self._corrections,
@@ -439,12 +453,16 @@ class NightshiftRunner:
         task_id: str,
         checkpoint_id: str,
         reason: str,
+        objective: str = "",
+        force_inadequate: bool = False,
     ) -> NightshiftReport:
         return NightshiftReport(
             assignment_id=assignment_id,
             project_id=project_id,
             task_id=task_id,
             checkpoint_id=checkpoint_id,
+            objective=objective,
+            force_inadequate=force_inadequate,
             state="REFUSED",
             outcome="fail-closed",
             correction_count=self._corrections,
@@ -461,6 +479,7 @@ class NightshiftRunner:
             row = connection.execute(
                 """
                 SELECT assignment_id, project_id, task_id, checkpoint_id,
+                       objective, force_inadequate,
                        state, outcome, correction_count, local_tests_reported,
                        source_verified, ci_verified, refusal_reason,
                        pending_decisions
@@ -476,12 +495,14 @@ class NightshiftRunner:
             project_id=row[1],
             task_id=row[2],
             checkpoint_id=row[3],
-            state=row[4],
-            outcome=row[5],
-            correction_count=row[6],
-            local_tests_reported=row[7],
-            source_verified=bool(row[8]),
-            ci_verified=bool(row[9]),
-            refusal_reason=row[10],
-            pending_chief_decisions=json.loads(row[11]),
+            objective=row[4],
+            force_inadequate=bool(row[5]),
+            state=row[6],
+            outcome=row[7],
+            correction_count=row[8],
+            local_tests_reported=row[9],
+            source_verified=bool(row[10]),
+            ci_verified=bool(row[11]),
+            refusal_reason=row[12],
+            pending_chief_decisions=json.loads(row[13]),
         )

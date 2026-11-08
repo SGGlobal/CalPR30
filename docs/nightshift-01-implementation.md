@@ -94,3 +94,8 @@ A successful report is persisted once. A subsequent submission with the same ass
 
 ## Synchronous operation limitation
 Orchestrator and ledger calls are synchronous. A timeout check occurs before each major step and before final completion, but an in-flight call cannot be interrupted.
+
+## Final requirement corrections
+- Default elapsed-time source is `time.monotonic()`. Injectable monotonic clock remains available for deterministic tests. Wall-clock changes cannot bypass the timeout.
+- Assignment identity includes objective and correction settings. Identical redelivery returns the existing report without dispatch. Conflicting reuse of an assignment ID fails closed and preserves the original report.
+- Completion requires matching task ID, COMPLETE status, absence of HALT, and expected synthetic review evidence before recording source verification. Partial persistence is reported as UNCERTAIN, distinct from a clean pre-admission refusal. No automatic continuation.
