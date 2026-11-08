@@ -104,3 +104,9 @@ Orchestrator and ledger calls are synchronous. A timeout check occurs before eac
 - Before recording SOURCE_VERIFIED, the runner requires matching task ID, COMPLETE status, approved review outcome, empty unacknowledged collection, no HALT, and correction-count consistency. Incomplete or contradictory results are marked UNCERTAIN.
 - Partial persistence (ledger or protocol operation has started) is reported as UNCERTAIN, distinct from a clean pre-admission refusal. Original evidence is preserved. No automatic continuation.
 - Refused reports persist the original objective and correction settings. Identical redelivery after restart returns the original report. Conflicting redelivery is rejected.
+
+## Completion-validation correction
+- Before recording SOURCE_VERIFIED, the runner requires `orch_result["outcome"] == "approved"`. Missing or unexpected review outcomes are rejected as UNCERTAIN.
+- The orchestrator's correction count must match the recorded NIGHTSHIFT correction count.
+- `unacknowledged` must be empty and `halted` must be false, using the returned task report.
+- Contradictory completion evidence is classified as UNCERTAIN.

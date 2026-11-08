@@ -284,7 +284,7 @@ class NightshiftRunner:
             self._tick()
             # Drive orchestrator and inspect actual result before recording success
             orch_result = self.orchestrator.run(task_id, objective, force_correction=force_inadequate)
-            # Require matching task ID, COMPLETE status, approved review, empty unacknowledged, no HALT
+            # Require matching task ID, COMPLETE status, approved outcome, empty unacknowledged, not halted
             if not isinstance(orch_result, dict) or orch_result.get("task_id") != task_id:
                 raise NightshiftError("Orchestrator result missing expected task identity")
             if orch_result.get("status") != "COMPLETE":
@@ -306,8 +306,8 @@ class NightshiftRunner:
                 )
                 self._persist_report(report)
                 return report
-            # Final review outcome must be approved
-            if orch_result.get("review_outcome") not in {None, "approved", "APPROVED"}:
+            # Final review outcome must be exactly "approved"
+            if orch_result.get("outcome") != "approved":
                 report = NightshiftReport(
                     assignment_id=assignment_id,
                     project_id=project_id,
@@ -321,13 +321,13 @@ class NightshiftRunner:
                     local_tests_reported=None,
                     source_verified=False,
                     ci_verified=False,
-                    refusal_reason="Review outcome not approved",
+                    refusal_reason=f"Review outcome not approved: {orch_result.get('outcome')}",
                     pending_chief_decisions=[],
                 )
                 self._persist_report(report)
                 return report
-            # Empty unacknowledged collection
-            if self.protocol.unacknowledged():
+            # Empty unacknowledged collection from the task report
+            if orch_result.get("unacknowledged"):
                 report = NightshiftReport(
                     assignment_id=assignment_id,
                     project_id=project_id,
@@ -346,8 +346,8 @@ class NightshiftRunner:
                 )
                 self._persist_report(report)
                 return report
-            # Absence of HALT
-            if self.protocol.is_halted:
+            # halted must be false
+            if orch_result.get("halted") is True or self.protocol.is_halted:
                 raise NightshiftError("HALT detected after orchestrator run")
 
             self._tick()
@@ -445,6 +445,27 @@ class NightshiftRunner:
                     expected_revision=expected_revision + 5,
                     now=now,
                 )
+
+            # Correction count must match orchestrator records after nightshift events
+            if orch_result.get("corrections", 0) != self._corrections:
+                report = NightshiftReport(
+                    assignment_id=assignment_id,
+                    project_id=project_id,
+                    task_id=task_id,
+                    checkpoint_id=checkpoint_id,
+                    objective=objective,
+                    force_inadequate=force_inadequate,
+                    state="UNCERTAIN",
+                    outcome="uncertain",
+                    correction_count=self._corrections,
+                    local_tests_reported=None,
+                    source_verified=False,
+                    ci_verified=False,
+                    refusal_reason=f"Correction count mismatch: orchestrator={orch_result.get('corrections')} nightshift={self._corrections}",
+                    pending_chief_decisions=[],
+                )
+                self._persist_report(report)
+                return report
 
             status = self.ledger.status(project_id, task_id)
             final_state = status.state.value if status else "UNCERTAIN"

@@ -408,3 +408,108 @@ def test_refused_report_preserves_identity(tmp_path):
             checkpoint_id="cp-refuse-id",
             objective="different-objective",
         )
+
+
+def test_missing_approval_is_uncertain(tmp_path, monkeypatch):
+    """Missing or non-approved outcome is UNCERTAIN."""
+    protocol, policy, gate, ledger = _setup(tmp_path)
+    runner = NightshiftRunner(protocol, ledger, gate)
+
+    def fake_run(task_id, objective, force_correction=False):
+        return {
+            "task_id": task_id,
+            "status": "COMPLETE",
+            "outcome": None,  # missing
+            "corrections": 0,
+            "unacknowledged": [],
+            "halted": False,
+        }
+
+    monkeypatch.setattr(runner.orchestrator, "run", fake_run)
+    report = runner.run(
+        assignment_id="ns-no-approval",
+        project_id="QLA",
+        task_id="nightshift-no-approval",
+        checkpoint_id="cp-no-approval",
+        objective="no approval",
+    )
+    assert report.outcome == "uncertain"
+    assert "not approved" in (report.refusal_reason or "")
+
+
+def test_rejected_approval_is_uncertain(tmp_path, monkeypatch):
+    protocol, policy, gate, ledger = _setup(tmp_path)
+    runner = NightshiftRunner(protocol, ledger, gate)
+
+    def fake_run(task_id, objective, force_correction=False):
+        return {
+            "task_id": task_id,
+            "status": "COMPLETE",
+            "outcome": "rejected",
+            "corrections": 0,
+            "unacknowledged": [],
+            "halted": False,
+        }
+
+    monkeypatch.setattr(runner.orchestrator, "run", fake_run)
+    report = runner.run(
+        assignment_id="ns-rejected",
+        project_id="QLA",
+        task_id="nightshift-rejected",
+        checkpoint_id="cp-rejected",
+        objective="rejected",
+    )
+    assert report.outcome == "uncertain"
+    assert "not approved" in (report.refusal_reason or "")
+
+
+def test_mismatched_correction_count_is_uncertain(tmp_path, monkeypatch):
+    protocol, policy, gate, ledger = _setup(tmp_path)
+    runner = NightshiftRunner(protocol, ledger, gate)
+
+    def fake_run(task_id, objective, force_correction=False):
+        return {
+            "task_id": task_id,
+            "status": "COMPLETE",
+            "outcome": "approved",
+            "corrections": 5,  # mismatch
+            "unacknowledged": [],
+            "halted": False,
+        }
+
+    monkeypatch.setattr(runner.orchestrator, "run", fake_run)
+    report = runner.run(
+        assignment_id="ns-mismatch-corr",
+        project_id="QLA",
+        task_id="nightshift-mismatch-corr",
+        checkpoint_id="cp-mismatch-corr",
+        objective="mismatch",
+    )
+    assert report.outcome == "uncertain"
+    assert "Correction count mismatch" in (report.refusal_reason or "")
+
+
+def test_outstanding_acknowledgments_is_uncertain(tmp_path, monkeypatch):
+    protocol, policy, gate, ledger = _setup(tmp_path)
+    runner = NightshiftRunner(protocol, ledger, gate)
+
+    def fake_run(task_id, objective, force_correction=False):
+        return {
+            "task_id": task_id,
+            "status": "COMPLETE",
+            "outcome": "approved",
+            "corrections": 0,
+            "unacknowledged": ["msg-1"],
+            "halted": False,
+        }
+
+    monkeypatch.setattr(runner.orchestrator, "run", fake_run)
+    report = runner.run(
+        assignment_id="ns-unacked",
+        project_id="QLA",
+        task_id="nightshift-unacked",
+        checkpoint_id="cp-unacked",
+        objective="unacked",
+    )
+    assert report.outcome == "uncertain"
+    assert "Outstanding acknowledgments" in (report.refusal_reason or "")
