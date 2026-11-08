@@ -29,6 +29,7 @@ from skippy.collaboration.coordinated_halt import (
     HaltStatus,
 )
 from skippy.collaboration.coordinated_halt_gate import CoordinatedHaltGate
+from skippy.collaboration.coordinated_halt_gate import CoordinatedHaltGate
 from skippy.collaboration.orchestrator import CollaborationOrchestrator
 from skippy.collaboration.protocol import (
     CollaborationProtocol,
@@ -136,7 +137,7 @@ def test_ungated_orchestrator_rejects_while_coordinated_is_halted(tmp_path):
 
 def test_ungated_lifecycle_evaluates_while_coordinated_is_halted(tmp_path):
     coordinated = tmp_path / "coord.db"
-    _init_authority(coordinated)
+    _init_authority(coordinated, state="NOT_HALTED", sequence=0)
     private = Ed25519PrivateKey.generate()
     public = private.public_key().public_bytes_raw()
     verifier = ChiefIdentityVerifier(tmp_path / "id.db")
@@ -161,6 +162,11 @@ def test_ungated_lifecycle_evaluates_while_coordinated_is_halted(tmp_path):
             state=AuthorizationState.PENDING,
         )
     )
+    # Bind for synthetic challenge issuance only. Lifecycle remains ungated.
+    gate = CoordinatedHaltGate(coordinated, policy, protocol)
+    policy.require_coordinated_guard(gate)
+    protocol.require_coordinated_guard(gate)
+    verifier.require_coordinated_guard(gate)
     challenge = verifier.issue_challenge(
         authorization_id="auth-coverage",
         action="merge_pull_request",
@@ -172,6 +178,12 @@ def test_ungated_lifecycle_evaluates_while_coordinated_is_halted(tmp_path):
         expected_sha="a" * 40,
         key_id="test-key",
     )
+    # Now set coordinated to HALTED for the evaluation under test
+    with sqlite3.connect(coordinated) as connection:
+        connection.execute(
+            "UPDATE halt_state SET state = 'HALTED', sequence = 1 WHERE singleton = 1"
+        )
+    # Create ungated lifecycle to confirm it still rejects
     lifecycle = AuthorizationLifecycle(verifier, policy, protocol)
     assert lifecycle.coordinated_gate is None
     result = lifecycle.evaluate(challenge, private.sign(canonical_payload(challenge)))

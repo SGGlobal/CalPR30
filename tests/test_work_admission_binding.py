@@ -99,7 +99,7 @@ def _lifecycle(tmp_path, state="NOT_HALTED"):
     policy = AuthorizationPolicy(tmp_path / "auth.db")
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
     coordinated = tmp_path / "coord.db"
-    _init_authority(coordinated, state)
+    _init_authority(coordinated, "NOT_HALTED")
     verifier.register_public_key("test-key", public)
     created = datetime.now(timezone.utc) - timedelta(minutes=1)
     policy.submit(
@@ -119,6 +119,10 @@ def _lifecycle(tmp_path, state="NOT_HALTED"):
             state=AuthorizationState.PENDING,
         )
     )
+    gate = CoordinatedHaltGate(coordinated, policy, protocol)
+    policy.require_coordinated_guard(gate)
+    protocol.require_coordinated_guard(gate)
+    verifier.require_coordinated_guard(gate)
     challenge = verifier.issue_challenge(
         authorization_id="auth-1",
         action="merge_pull_request",
@@ -130,9 +134,11 @@ def _lifecycle(tmp_path, state="NOT_HALTED"):
         expected_sha="a" * 40,
         key_id="test-key",
     )
-    gate = CoordinatedHaltGate(coordinated, policy, protocol)
-    policy.require_coordinated_guard(gate)
-    protocol.require_coordinated_guard(gate)
+    if state == "HALTED":
+        with sqlite3.connect(coordinated) as connection:
+            connection.execute(
+                "UPDATE halt_state SET state = 'HALTED', sequence = 1 WHERE singleton = 1"
+            )
     lifecycle = AuthorizationLifecycle(verifier, policy, protocol, coordinated_gate=gate)
     return {
         "private": private,

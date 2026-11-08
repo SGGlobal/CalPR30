@@ -66,18 +66,6 @@ def _setup(tmp_path):
         )
     )
 
-    challenge = verifier.issue_challenge(
-        authorization_id="auth-1",
-        action="merge_pull_request",
-        action_digest="digest-a",
-        repository="SGGlobal/QLA",
-        environment="local",
-        project_id="qla",
-        task_id="task-1",
-        expected_sha="a" * 40,
-        key_id="test-key",
-    )
-
     coordinated = tmp_path / "coord.db"
     with sqlite3.connect(coordinated) as connection:
         connection.execute(
@@ -118,6 +106,19 @@ def _setup(tmp_path):
     gate = CoordinatedHaltGate(coordinated, policy, protocol)
     policy.require_coordinated_guard(gate)
     protocol.require_coordinated_guard(gate)
+    verifier.require_coordinated_guard(gate)
+
+    challenge = verifier.issue_challenge(
+        authorization_id="auth-1",
+        action="merge_pull_request",
+        action_digest="digest-a",
+        repository="SGGlobal/QLA",
+        environment="local",
+        project_id="qla",
+        task_id="task-1",
+        expected_sha="a" * 40,
+        key_id="test-key",
+    )
     bridge = AuthorizationLifecycle(verifier, policy, protocol, coordinated_gate=gate)
     return bridge, private, challenge, policy, protocol, verifier
 

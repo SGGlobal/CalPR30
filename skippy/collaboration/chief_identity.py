@@ -171,6 +171,12 @@ class ChiefIdentityVerifier:
         if not self.database_path.parent.is_dir():
             raise IdentityError("Database directory does not exist")
         self._init_schema()
+        # Explicit opt-in coordinated guard. Default remains ungated.
+        # Ungated identity operations that produce work-related evidence
+        # fail closed. This binding does not create a separate authority.
+        self._coordinated_guard = None
+        self._coordinated_enforcement_required = False
+        self._coordinated_guard_snapshot = None
 
     def _connect(self):
         return sqlite3.connect(self.database_path, timeout=5.0)
@@ -249,6 +255,148 @@ class ChiefIdentityVerifier:
             if cursor.rowcount != 1:
                 raise IdentityError("Unknown key")
 
+    def require_coordinated_guard(self, gate) -> None:
+        """
+        Bind an explicit CoordinatedHaltGate to this identity verifier.
+
+        Requires a genuine CoordinatedHaltGate. Rejects subclasses,
+        replaced check methods, and mismatched policy/protocol identities.
+        Requires the policy and protocol to be already bound to the same
+        gate. Snapshots configuration. Cannot be replaced. Default
+        construction remains ungated; ungated work-related operations
+        fail closed. Does not create an independent security authority.
+        """
+
+        from skippy.collaboration.coordinated_halt_gate import CoordinatedHaltGate
+
+        if self._coordinated_guard is not None or self._coordinated_enforcement_required:
+            raise IdentityError("Coordinated guard cannot be replaced")
+        if type(gate) is not CoordinatedHaltGate:
+            raise IdentityError("Invalid coordinated guard type")
+        if getattr(gate.check, "__func__", None) is not CoordinatedHaltGate.check:
+            raise IdentityError("Coordinated gate method was replaced")
+        # Verify policy and protocol are the genuine ones bound to this gate
+        if gate.policy is None or gate.protocol is None:
+            raise IdentityError("Coordinated guard missing policy or protocol")
+        if not getattr(gate.policy, "coordinated_enforcement_required", False):
+            raise IdentityError("Policy not bound to coordinated guard")
+        if gate.policy.coordinated_guard is not gate:
+            raise IdentityError("Policy guard identity mismatch")
+        if not getattr(gate.protocol, "coordinated_enforcement_required", False):
+            raise IdentityError("Protocol not bound to coordinated guard")
+        if gate.protocol.coordinated_guard is not gate:
+            raise IdentityError("Protocol guard identity mismatch")
+        # Snapshot security-relevant configuration
+        from pathlib import Path
+
+        self._coordinated_guard = gate
+        self._coordinated_enforcement_required = True
+        self._coordinated_guard_snapshot = {
+            "guard": gate,
+            "policy": gate.policy,
+            "protocol": gate.protocol,
+            "policy_path": Path(gate.policy.database_path),
+            "protocol_path": Path(gate.protocol.database_path),
+            "coordinated_path": Path(gate.coordinated_path),
+            "absent_legacy_policy": gate.absent_legacy_policy,
+            "omitted_source_policy": gate.omitted_source_policy,
+        }
+
+    @property
+    def coordinated_guard(self):
+        """Read-only view of the established guard, if any."""
+        return self._coordinated_guard
+
+    @property
+    def coordinated_enforcement_required(self) -> bool:
+        """True after explicit binding. Does not itself prove validity."""
+        return self._coordinated_enforcement_required
+
+    def _identity_guard_rejection(self) -> str | None:
+        """
+        Enforce coordinated HALT protection for identity work operations.
+
+        Returns a controlled rejection reason, or None when protection
+        is valid and current evaluation succeeds. Never exposes internal
+        exception details. Never treats failure as permission.
+        Ungated (never bound) rejects. Rejects drift, replacement,
+        incomplete migration, HALTED, UNKNOWN, etc.
+        """
+
+        if not self._coordinated_enforcement_required:
+            return "Missing coordinated guard"
+        guard = self._coordinated_guard
+        snapshot = self._coordinated_guard_snapshot
+        if guard is None or snapshot is None or guard is not snapshot["guard"]:
+            return "Removed or replaced coordinated binding"
+        try:
+            from skippy.collaboration.coordinated_halt_gate import (
+                CoordinatedHaltGate,
+                GateResult,
+            )
+            from pathlib import Path
+
+            if type(guard) is not CoordinatedHaltGate:
+                return "Invalid guard type"
+            if getattr(guard.check, "__func__", None) is not CoordinatedHaltGate.check:
+                return "Replaced check method"
+            if guard.policy is not snapshot["policy"] or guard.policy is None:
+                return "Policy identity mismatch"
+            if guard.protocol is not snapshot["protocol"] or guard.protocol is None:
+                return "Protocol identity mismatch"
+            if not guard.policy.coordinated_enforcement_required:
+                return "Policy enforcement not required"
+            if guard.policy.coordinated_guard is not guard:
+                return "Policy guard identity mismatch"
+            if not guard.protocol.coordinated_enforcement_required:
+                return "Protocol enforcement not required"
+            if guard.protocol.coordinated_guard is not guard:
+                return "Protocol guard identity mismatch"
+            if Path(guard.policy.database_path) != snapshot["policy_path"]:
+                return "Configuration drift: policy path"
+            if Path(guard.protocol.database_path) != snapshot["protocol_path"]:
+                return "Configuration drift: protocol path"
+            if Path(guard.coordinated_path) != snapshot["coordinated_path"]:
+                return "Configuration drift: coordinated path"
+            if guard.absent_legacy_policy != snapshot["absent_legacy_policy"]:
+                return "Configuration drift: absent legacy policy"
+            if guard.omitted_source_policy != snapshot["omitted_source_policy"]:
+                return "Configuration drift: omitted source policy"
+            # Current safety evaluation
+            result = guard.check()
+            if not isinstance(result, GateResult):
+                return "Invalid guard result"
+            if result.execution_enabled is not False:
+                return "execution_enabled is not False"
+            if not result.allowed:
+                # Map specific conditions without leaking internals
+                reason = result.reason or "Coordinated protection rejected"
+                status = result.coordinated_status
+                if status == "HALTED":
+                    return "Coordinated HALTED"
+                if status == "UNKNOWN" or (status is None and "UNKNOWN" in reason.upper()):
+                    return "Coordinated UNKNOWN"
+                if "Migration" in reason or result.migration_completed is not True:
+                    return "Failed migration"
+                if result.legacy_policy_halted is True:
+                    return "Legacy policy HALT"
+                if result.legacy_protocol_halted is True:
+                    return "Legacy protocol HALT"
+                if "authority" in reason.lower() or status is None:
+                    return "Missing or corrupted coordinated authority"
+                return "Coordinated protection rejected"
+            # Allowed must be consistent
+            if (
+                result.coordinated_status != "NOT_HALTED"
+                or result.migration_completed is not True
+                or result.legacy_policy_halted is not False
+                or result.legacy_protocol_halted is not False
+            ):
+                return "Invalid or inconsistent gate results"
+            return None
+        except Exception:
+            return "Coordinated protection evaluation failed"
+
     def issue_challenge(
         self,
         *,
@@ -275,6 +423,12 @@ class ChiefIdentityVerifier:
         now = now or datetime.now(timezone.utc)
         if lifetime <= timedelta(0) or lifetime > MAX_CHALLENGE_LIFETIME:
             raise IdentityError("Invalid challenge lifetime")
+
+        # Coordinated HALT protection must be established and current
+        # before any challenge record is created.
+        rejection = self._identity_guard_rejection()
+        if rejection is not None:
+            raise IdentityError(rejection)
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -351,6 +505,14 @@ class ChiefIdentityVerifier:
         """
 
         now = now or datetime.now(timezone.utc)
+
+        # Require valid coordinated HALT protection before consuming
+        # a challenge or returning successful verification.
+        # An unbound verifier cannot return successful work-related
+        # verification. Rejection does not consume the challenge.
+        rejection = self._identity_guard_rejection()
+        if rejection is not None:
+            return VerificationResult(False, rejection)
 
         try:
             payload = canonical_payload(fields)
