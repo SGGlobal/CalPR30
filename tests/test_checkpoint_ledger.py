@@ -744,7 +744,7 @@ def test_ci_requires_source_verified_review(tmp_path):
 
 
 def test_assignment_created_not_uncertain(tmp_path):
-    """Assignment is represented and does not appear as UNCERTAIN."""
+    """Assignment is represented as ASSIGNED and does not appear as UNCERTAIN."""
     ledger = CheckpointLedger(tmp_path / "ledger.db")
     ledger.record_event(
         event_type=EventType.ASSIGNMENT_CREATED,
@@ -757,6 +757,7 @@ def test_assignment_created_not_uncertain(tmp_path):
     )
     status = ledger.status("p", "t")
     assert status is not None
+    assert status.state == CheckpointState.ASSIGNED
     assert status.state != CheckpointState.UNCERTAIN
     assert status.checkpoint_id == "c1"
 
@@ -786,3 +787,57 @@ def test_conflicting_assignment_rejected(tmp_path):
     status = ledger.status("p", "t")
     assert status.checkpoint_id == "c1"
     assert status.revision == 1
+
+
+def test_assignment_to_implementation_to_review(tmp_path):
+    """End-to-end: ASSIGNMENT_CREATED → ASSIGNED → IMPLEMENTATION_SUBMITTED → IMPLEMENTED_REPORTED → review."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+
+    # 1. Chief creates assignment
+    ledger.record_event(
+        event_type=EventType.ASSIGNMENT_CREATED,
+        project_id="QLA",
+        task_id="bridge-01",
+        checkpoint_id="cp-1",
+        actor="chief",
+        payload={"objective": "checkpoint ledger"},
+        expected_revision=0,
+    )
+
+    # 2. Ledger reports ASSIGNED
+    status = ledger.status("QLA", "bridge-01")
+    assert status.state == CheckpointState.ASSIGNED
+    assert status.checkpoint_id == "cp-1"
+
+    # 3. Jason submits implementation
+    ledger.record_event(
+        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        project_id="QLA",
+        task_id="bridge-01",
+        checkpoint_id="cp-1",
+        actor="jason",
+        payload={"sha": "f6575d1", "local_tests": 660},
+        expected_revision=1,
+    )
+
+    # 4. Ledger reports IMPLEMENTED_REPORTED
+    status = ledger.status("QLA", "bridge-01")
+    assert status.state == CheckpointState.IMPLEMENTED_REPORTED
+    assert status.current_sha == "f6575d1"
+
+    # 5. Skippy records matching source review
+    ledger.record_event(
+        event_type=EventType.REVIEW_RECORDED,
+        project_id="QLA",
+        task_id="bridge-01",
+        checkpoint_id="cp-1",
+        actor="skippy",
+        payload={"sha": "f6575d1", "source_verified": True},
+        expected_revision=2,
+    )
+
+    # 6. Ledger accepts the valid review
+    status = ledger.status("QLA", "bridge-01")
+    assert status.state == CheckpointState.SOURCE_VERIFIED
+    assert status.last_reviewed_sha == "f6575d1"
+    assert status.execution_enabled is False

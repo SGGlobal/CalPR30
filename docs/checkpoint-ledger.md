@@ -58,3 +58,9 @@ The ledger records supplied evidence. It cannot independently establish external
 - ASSIGNMENT_CREATED is represented in both state-projection methods. A newly recorded assignment does not appear as UNCERTAIN.
 - Multiple conflicting assignments or checkpoint identifiers under the same active project/task are rejected.
 - Mixed message ID / idempotency key pairs (first event's message ID + second event's key) produce a pair-mismatch rejection even when envelope content is otherwise identical. Exact duplicate redelivery remains a no-op.
+
+## Explicit ASSIGNED state
+- ASSIGNMENT_CREATED projects to the explicit ASSIGNED checkpoint state.
+- Legal progression: ASSIGNMENT_CREATED → ASSIGNED → IMPLEMENTATION_SUBMITTED → IMPLEMENTED_REPORTED → REVIEW_RECORDED.
+- Both state-projection methods and the legal transition table include ASSIGNED.
+- Duplicate protection, HALT enforcement, and authorization restrictions are unchanged.

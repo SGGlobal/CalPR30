@@ -28,6 +28,7 @@ class LedgerError(ValueError):
 
 
 class CheckpointState(str, Enum):
+    ASSIGNED = "ASSIGNED"
     IMPLEMENTED_REPORTED = "IMPLEMENTED_REPORTED"
     SOURCE_VERIFIED = "SOURCE_VERIFIED"
     CORRECTION_REQUESTED = "CORRECTION_REQUESTED"
@@ -61,6 +62,11 @@ class EventType(str, Enum):
 ALLOWED_TRANSITIONS: dict[CheckpointState | None, set[EventType]] = {
     None: {
         EventType.ASSIGNMENT_CREATED,
+        EventType.IMPLEMENTATION_SUBMITTED,
+        EventType.HALT,
+        EventType.UNCERTAIN,
+    },
+    CheckpointState.ASSIGNED: {
         EventType.IMPLEMENTATION_SUBMITTED,
         EventType.HALT,
         EventType.UNCERTAIN,
@@ -240,7 +246,7 @@ class CheckpointLedger:
             payload = json.loads(payload_json)
             if et == EventType.ASSIGNMENT_CREATED:
                 if state is None:
-                    state = CheckpointState.IMPLEMENTED_REPORTED  # assignment establishes an active work item
+                    state = CheckpointState.ASSIGNED
                 # else: subsequent assignment handled by record_event rejection
             elif et == EventType.IMPLEMENTATION_SUBMITTED:
                 state = CheckpointState.IMPLEMENTED_REPORTED
@@ -527,7 +533,7 @@ class CheckpointLedger:
             if et == EventType.ASSIGNMENT_CREATED:
                 assigned = True
                 if state == CheckpointState.UNCERTAIN:
-                    state = CheckpointState.IMPLEMENTED_REPORTED
+                    state = CheckpointState.ASSIGNED
             elif et == EventType.IMPLEMENTATION_SUBMITTED or et == EventType.CORRECTION_SUBMITTED:
                 # New SHA invalidates prior CI evidence
                 if current_sha and payload.get("sha") != current_sha:
