@@ -272,7 +272,7 @@ def test_simultaneous_concurrent_instances(tmp_path):
     # Exactly one should succeed
     assert len(results) == 1
     assert len(errors) == 1
-    assert "Sequence" in errors[0] or "Replay" in errors[0] or "Fail-stop" in errors[0] or "PENDING" in errors[0]
+    assert "Sequence" in errors[0] or "Replay" in errors[0] or "Fail-stop" in errors[0] or "PENDING" in errors[0] or "Unresolved" in errors[0]
 
 
 def test_rollback_does_not_persist_accepted_on_failure(tmp_path, monkeypatch):
@@ -363,7 +363,7 @@ def test_pending_intent_blocks_restart(tmp_path):
             """
         )
     # New instance must fail closed
-    with pytest.raises(OfflineAdapterError, match="PENDING"):
+    with pytest.raises(OfflineAdapterError, match="Unresolved|PENDING|Active"):
         OfflineAuthenticatedAdapter(
             ledger, receipts, trusted_fixture=True, halt_check=lambda: False
         )
@@ -393,3 +393,52 @@ def test_mixed_origin_events_ignored(tmp_path):
     env = _envelope()
     result = adapter.accept(env, now=_now())
     assert result == "accepted"
+
+
+def test_uncertain_blocks_restart(tmp_path):
+    """UNCERTAIN intent blocks subsequent admission and restart."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    import sqlite3
+    with sqlite3.connect(receipts) as c:
+        c.execute(
+            """
+            INSERT INTO intent_journal (
+                message_id, idempotency_key, project_id, task_id,
+                checkpoint_id, assignment_id, sequence, payload_digest,
+                state, recorded_at
+            ) VALUES ('uncertain-msg', 'uncertain-idem', 'QLA', 't', 'c', 'a', 1, 'd', 'UNCERTAIN', '2026-11-08T12:00:00')
+            """
+        )
+    with pytest.raises(OfflineAdapterError, match="Unresolved|UNCERTAIN|Active"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )
+
+
+def test_active_pending_blocks_second_instance(tmp_path):
+    """An active PENDING intent blocks a second adapter instance."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    import sqlite3
+    with sqlite3.connect(receipts) as c:
+        c.execute(
+            """
+            INSERT INTO intent_journal (
+                message_id, idempotency_key, project_id, task_id,
+                checkpoint_id, assignment_id, sequence, payload_digest,
+                state, recorded_at
+            ) VALUES ('active-msg', 'active-idem', 'QLA', 't', 'c', 'a', 1, 'd', 'PENDING', '2026-11-08T12:00:00')
+            """
+        )
+    # Second instance must fail on reconciliation
+    with pytest.raises(OfflineAdapterError, match="Unresolved|PENDING|Active"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )

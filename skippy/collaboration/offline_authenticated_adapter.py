@@ -101,14 +101,19 @@ class OfflineAuthenticatedAdapter:
 
         try:
             with sqlite3.connect(self.database_path) as connection:
-                pending = connection.execute(
-                    "SELECT message_id FROM intent_journal WHERE state = 'PENDING'"
+                unresolved = connection.execute(
+                    "SELECT message_id, state FROM intent_journal WHERE state IN ('PENDING', 'UNCERTAIN')"
                 ).fetchall()
                 accepted = connection.execute(
-                    "SELECT message_id FROM intent_journal WHERE state = 'ACCEPTED'"
+                    """
+                    SELECT message_id, idempotency_key, project_id, task_id,
+                           checkpoint_id, assignment_id, payload_digest
+                    FROM intent_journal WHERE state = 'ACCEPTED'
+                    """
                 ).fetchall()
-            pending_ids = {r[0] for r in pending}
-            accepted_ids = {r[0] for r in accepted}
+            unresolved_ids = {r[0] for r in unresolved}
+            accepted_rows = {r[0]: r for r in accepted}
+            accepted_ids = set(accepted_rows.keys())
         except Exception as exc:
             if adapter_ledger_ids:
                 raise OfflineAdapterError(
@@ -116,10 +121,10 @@ class OfflineAuthenticatedAdapter:
                 ) from exc
             return
 
-        # PENDING is always ambiguous — fail closed
-        if pending_ids:
+        # PENDING or UNCERTAIN is always unresolved — fail closed
+        if unresolved_ids:
             raise OfflineAdapterError(
-                f"Unresolved PENDING intent requires manual reconciliation: {sorted(pending_ids)}"
+                f"Unresolved intent requires manual reconciliation: {sorted(unresolved_ids)}"
             )
         # ACCEPTED without matching adapter-originated ledger event
         unmatched_accepted = accepted_ids - adapter_ledger_ids
@@ -165,8 +170,8 @@ class OfflineAuthenticatedAdapter:
                 """
                 CREATE TABLE IF NOT EXISTS intent_journal (
                     intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    message_id TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL,
+                    message_id TEXT NOT NULL UNIQUE,
+                    idempotency_key TEXT NOT NULL UNIQUE,
                     project_id TEXT NOT NULL,
                     task_id TEXT NOT NULL,
                     checkpoint_id TEXT NOT NULL,
@@ -332,6 +337,15 @@ class OfflineAuthenticatedAdapter:
                 if row and row[0]:
                     raise OfflineAdapterError(f"Fail-stop active: {row[1]}")
 
+                # Admission-time durable single-active-intent gate
+                active = connection.execute(
+                    "SELECT message_id FROM intent_journal WHERE state IN ('PENDING', 'UNCERTAIN')"
+                ).fetchall()
+                if active:
+                    raise OfflineAdapterError(
+                        f"Active unresolved intent blocks admission: {[r[0] for r in active]}"
+                    )
+
                 # Authoritative HALT check
                 try:
                     if self._halt_check():
@@ -459,10 +473,12 @@ class OfflineAuthenticatedAdapter:
                     raise OfflineAdapterError(f"Ledger rejection: {exc}") from exc
 
                 # Mark ACCEPTED only after successful ledger commit
-                connection.execute(
+                cursor = connection.execute(
                     "UPDATE intent_journal SET state = 'ACCEPTED' WHERE message_id = ? AND state = 'PENDING'",
                     (envelope.message_id,),
                 )
+                if cursor.rowcount != 1:
+                    raise OfflineAdapterError("Intent state transition failed")
 
                 # Atomic receipt + sequence + assignment identity
                 try:

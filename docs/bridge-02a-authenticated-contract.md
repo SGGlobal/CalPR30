@@ -110,3 +110,12 @@ execution_enabled remains False. External transport remains disabled.
 - No cross-database atomicity is claimed.
 
 execution_enabled remains False. External transport remains disabled.
+
+## BRIDGE-02A.8 intent-journal safety
+- Admission-time durable single-active-intent gate under the exclusive SQLite transaction. Any PENDING or UNCERTAIN intent blocks new admission.
+- UNCERTAIN is included in reconciliation. Any unresolved state blocks subsequent admission and restart.
+- message_id and idempotency_key are UNIQUE in the intent journal. State transitions check affected row count.
+- Concurrent instances cannot bypass an active PENDING operation.
+- Protected BRIDGE-01 ledger semantics remain unchanged.
+
+execution_enabled remains False. External transport remains disabled.
