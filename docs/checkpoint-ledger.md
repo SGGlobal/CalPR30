@@ -36,3 +36,12 @@ Local-only, fail-closed, append-only event ledger for offline checkpoint/state h
 - Independent of the pending identity verification halt enforcement branch.
 
 See `skippy/collaboration/checkpoint_ledger.py` and `tests/test_checkpoint_ledger.py`.
+
+## BRIDGE-01B integrity hardening
+- Complete message-envelope identity compared for duplicates (project, task, checkpoint, actor). Conflicting reuse across identities rejected. Exact duplicate remains no-op.
+- Source reviews must reference the current implementation SHA. CI verification requires a prior matching source review and is bound to that SHA. A new SHA invalidates prior CI evidence for the new revision.
+- Authorization requires structured, separately reviewed evidence (`authorization_id` + `reviewed`). Actor name or truthy values alone are insufficient. PR and merge authorizations remain independent.
+- Inconsistent checkpoint identifiers within the same active work item are rejected. Legal progression through review → CI → PR authorized → PR opened → merge authorized → merged is reachable. Rejected transitions leave the ledger unchanged.
+
+## Offline authenticity limitation
+The ledger records supplied evidence. It cannot independently establish external sender authenticity, live provider delivery, or that a submitted CI run actually occurred on GitHub. Those require a future separately reviewed adapter.

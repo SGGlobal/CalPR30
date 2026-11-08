@@ -149,7 +149,7 @@ def test_ci_evidence_must_match_reviewed_sha(tmp_path):
 
 
 def test_authorization_requires_explicit_evidence(tmp_path):
-    """Finding 4: actor=chief is not sufficient."""
+    """Finding 4 / BRIDGE-01B: structured, separately reviewed evidence required."""
     ledger = CheckpointLedger(tmp_path / "ledger.db")
     ledger.record_event(
         event_type=EventType.IMPLEMENTATION_SUBMITTED,
@@ -169,14 +169,26 @@ def test_authorization_requires_explicit_evidence(tmp_path):
         payload={"sha": "abc", "source_verified": True},
         expected_revision=1,
     )
-    with pytest.raises(LedgerError, match="authorization evidence required"):
+    # Truthy but unstructured
+    with pytest.raises(LedgerError, match="Structured authorization evidence"):
         ledger.record_event(
             event_type=EventType.PR_AUTHORIZED,
             project_id="p",
             task_id="t",
             checkpoint_id="c1",
             actor="chief",
-            payload={},
+            payload={"authorization_evidence": True},
+            expected_revision=2,
+        )
+    # Structured but not reviewed
+    with pytest.raises(LedgerError, match="not separately reviewed"):
+        ledger.record_event(
+            event_type=EventType.PR_AUTHORIZED,
+            project_id="p",
+            task_id="t",
+            checkpoint_id="c1",
+            actor="chief",
+            payload={"authorization_evidence": {"authorization_id": "auth-1"}},
             expected_revision=2,
         )
 
@@ -310,3 +322,264 @@ def test_restart_rebuilds_status(tmp_path):
     status = reopened.status("p", "t")
     assert status.state == CheckpointState.CORRECTION_REQUESTED
     assert status.outstanding_findings == "fix it"
+
+
+def test_conflicting_message_id_across_projects_rejected(tmp_path):
+    """BRIDGE-01B Task 1: complete envelope identity."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    ledger.record_event(
+        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        project_id="p1",
+        task_id="t1",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"sha": "abc"},
+        message_id="shared-msg",
+        expected_revision=0,
+    )
+    with pytest.raises(LedgerError, match="Conflicting reuse"):
+        ledger.record_event(
+            event_type=EventType.IMPLEMENTATION_SUBMITTED,
+            project_id="p2",  # different project
+            task_id="t1",
+            checkpoint_id="c1",
+            actor="jason",
+            payload={"sha": "abc"},
+            message_id="shared-msg",
+            expected_revision=1,
+        )
+
+
+def test_review_must_reference_current_sha(tmp_path):
+    """BRIDGE-01B Task 2: review SHA must match current implementation."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    ledger.record_event(
+        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"sha": "abc123"},
+        expected_revision=0,
+    )
+    with pytest.raises(LedgerError, match="Review SHA does not match"):
+        ledger.record_event(
+            event_type=EventType.REVIEW_RECORDED,
+            project_id="p",
+            task_id="t",
+            checkpoint_id="c1",
+            actor="skippy",
+            payload={"sha": "wrongsha"},
+            expected_revision=1,
+        )
+
+
+def test_ci_requires_prior_review(tmp_path):
+    """BRIDGE-01B Task 2: CI before source review rejected."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    ledger.record_event(
+        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"sha": "abc"},
+        expected_revision=0,
+    )
+    with pytest.raises(LedgerError, match="requires prior source review"):
+        ledger.record_event(
+            event_type=EventType.CI_VERIFICATION_RECORDED,
+            project_id="p",
+            task_id="t",
+            checkpoint_id="c1",
+            actor="ci",
+            payload={
+                "sha": "abc",
+                "workflow_run_id": "run-1",
+                "conclusion": "success",
+                "tests": 641,
+            },
+            expected_revision=1,
+        )
+
+
+def test_new_sha_invalidates_prior_ci(tmp_path):
+    """BRIDGE-01B Task 2: new SHA clears prior CI validity."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    ledger.record_event(
+        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"sha": "abc"},
+        expected_revision=0,
+    )
+    ledger.record_event(
+        event_type=EventType.REVIEW_RECORDED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="skippy",
+        payload={"sha": "abc"},
+        expected_revision=1,
+    )
+    ledger.record_event(
+        event_type=EventType.CI_VERIFICATION_RECORDED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="ci",
+        payload={
+            "sha": "abc",
+            "workflow_run_id": "run-1",
+            "conclusion": "success",
+            "tests": 641,
+        },
+        expected_revision=2,
+    )
+    status = ledger.status("p", "t")
+    assert status.ci_verified is True
+
+    # New correction changes SHA
+    ledger.record_event(
+        event_type=EventType.CORRECTION_REQUESTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="skippy",
+        payload={"findings": "update"},
+        expected_revision=3,
+    )
+    ledger.record_event(
+        event_type=EventType.CORRECTION_SUBMITTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"sha": "def456", "local_tests": 650},
+        expected_revision=4,
+    )
+    status = ledger.status("p", "t")
+    assert status.current_sha == "def456"
+    assert status.ci_verified is False
+    assert status.ci_sha is None
+
+
+def test_inconsistent_checkpoint_id_rejected(tmp_path):
+    """BRIDGE-01B Task 4: consistent checkpoint identifiers."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    ledger.record_event(
+        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"sha": "abc"},
+        expected_revision=0,
+    )
+    with pytest.raises(LedgerError, match="Inconsistent checkpoint identifier"):
+        ledger.record_event(
+            event_type=EventType.REVIEW_RECORDED,
+            project_id="p",
+            task_id="t",
+            checkpoint_id="c2",  # different
+            actor="skippy",
+            payload={"sha": "abc"},
+            expected_revision=1,
+        )
+
+
+def test_legal_progression_to_merged(tmp_path):
+    """BRIDGE-01B Task 4: reachable transitions through full progression."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    # Implementation
+    ledger.record_event(
+        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"sha": "abc"},
+        expected_revision=0,
+    )
+    # Review
+    ledger.record_event(
+        event_type=EventType.REVIEW_RECORDED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="skippy",
+        payload={"sha": "abc", "source_verified": True},
+        expected_revision=1,
+    )
+    # CI
+    ledger.record_event(
+        event_type=EventType.CI_VERIFICATION_RECORDED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="ci",
+        payload={
+            "sha": "abc",
+            "workflow_run_id": "run-1",
+            "conclusion": "success",
+            "tests": 641,
+        },
+        expected_revision=2,
+    )
+    # PR authorized
+    ledger.record_event(
+        event_type=EventType.PR_AUTHORIZED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="chief",
+        payload={
+            "authorization_evidence": {
+                "authorization_id": "auth-pr",
+                "reviewed": True,
+            }
+        },
+        expected_revision=3,
+    )
+    # PR opened
+    ledger.record_event(
+        event_type=EventType.PR_OPENED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="jason",
+        payload={"pr_number": 21},
+        expected_revision=4,
+    )
+    # Merge authorized
+    ledger.record_event(
+        event_type=EventType.MERGE_AUTHORIZED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="chief",
+        payload={
+            "authorization_evidence": {
+                "authorization_id": "auth-merge",
+                "reviewed": True,
+            }
+        },
+        expected_revision=5,
+    )
+    # Merged
+    ledger.record_event(
+        event_type=EventType.MERGED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="chief",
+        payload={"sha": "abc"},
+        expected_revision=6,
+    )
+    status = ledger.status("p", "t")
+    assert status.state == CheckpointState.MERGED
+    assert status.pr_authorized is True
+    assert status.merge_authorized is True
+    assert status.ci_verified is True

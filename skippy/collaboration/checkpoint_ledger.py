@@ -306,32 +306,72 @@ class CheckpointLedger:
 
             current_rev = self._current_revision(connection)
 
-            # Exact duplicate redelivery → no-op
+            # Exact duplicate redelivery → no-op (complete envelope identity)
             if message_id:
                 existing = connection.execute(
-                    "SELECT payload, event_type FROM events WHERE message_id = ?",
+                    """
+                    SELECT payload, event_type, project_id, task_id, checkpoint_id, actor
+                    FROM events WHERE message_id = ?
+                    """,
                     (message_id,),
                 ).fetchone()
                 if existing:
-                    if existing[0] == payload_json and existing[1] == event_type.value:
+                    ex_payload, ex_type, ex_proj, ex_task, ex_cp, ex_actor = existing
+                    if (
+                        ex_payload == payload_json
+                        and ex_type == event_type.value
+                        and ex_proj == project_id
+                        and ex_task == task_id
+                        and ex_cp == checkpoint_id
+                        and ex_actor == actor
+                    ):
                         return current_rev  # identical redelivery
                     raise LedgerError("Conflicting reuse of message_id")
 
             if idempotency_key:
                 existing = connection.execute(
-                    "SELECT payload, event_type FROM events WHERE idempotency_key = ?",
+                    """
+                    SELECT payload, event_type, project_id, task_id, checkpoint_id, actor
+                    FROM events WHERE idempotency_key = ?
+                    """,
                     (idempotency_key,),
                 ).fetchone()
                 if existing:
-                    if existing[0] == payload_json and existing[1] == event_type.value:
+                    ex_payload, ex_type, ex_proj, ex_task, ex_cp, ex_actor = existing
+                    if (
+                        ex_payload == payload_json
+                        and ex_type == event_type.value
+                        and ex_proj == project_id
+                        and ex_task == task_id
+                        and ex_cp == checkpoint_id
+                        and ex_actor == actor
+                    ):
                         return current_rev
                     raise LedgerError("Conflicting reuse of idempotency_key")
+
+            # If both supplied, both must agree (already checked individually)
+            if message_id and idempotency_key:
+                # Additional cross-check already covered by individual exact-match
+                pass
 
             if expected_revision is not None and expected_revision != current_rev:
                 raise LedgerError("Stale or concurrent revision rejected")
 
             # Project current state for validation
             state, current_sha, last_reviewed = self._projected_state(connection, project_id, task_id)
+
+            # Checkpoint identifier consistency within the same work item
+            if state is not None:
+                prior_cp = connection.execute(
+                    """
+                    SELECT checkpoint_id FROM events
+                    WHERE project_id = ? AND task_id = ?
+                    ORDER BY revision DESC LIMIT 1
+                    """,
+                    (project_id, task_id),
+                ).fetchone()
+                if prior_cp and prior_cp[0] != checkpoint_id:
+                    raise LedgerError("Inconsistent checkpoint identifier for active work item")
 
             # Stale implementation report detection
             if event_type in {EventType.IMPLEMENTATION_SUBMITTED, EventType.CORRECTION_SUBMITTED}:
@@ -348,23 +388,40 @@ class CheckpointLedger:
             if event_type not in allowed:
                 raise LedgerError(f"Illegal transition from {state} via {event_type.value}")
 
-            # CI evidence binding
+            # Source review must reference current implementation SHA
+            if event_type == EventType.REVIEW_RECORDED:
+                if payload.get("sha") != current_sha:
+                    raise LedgerError("Review SHA does not match current implementation")
+
+            # CI evidence binding and sequencing
             if event_type == EventType.CI_VERIFICATION_RECORDED:
+                if last_reviewed is None:
+                    raise LedgerError("CI verification requires prior source review")
                 required = {"sha", "workflow_run_id", "conclusion", "tests"}
                 if not required.issubset(payload.keys()):
                     raise LedgerError("CI evidence incomplete")
                 if payload.get("conclusion") != "success":
                     raise LedgerError("CI conclusion not success")
-                expected_sha = last_reviewed or current_sha
-                if payload.get("sha") != expected_sha:
+                if payload.get("sha") != last_reviewed:
                     raise LedgerError("CI evidence SHA does not match reviewed checkpoint")
 
-            # Authorization evidence required (not mere actor name)
+            # New SHA invalidates prior CI (handled by projection; explicit check on new impl)
+            if event_type in {EventType.IMPLEMENTATION_SUBMITTED, EventType.CORRECTION_SUBMITTED}:
+                new_sha = payload.get("sha")
+                if current_sha and new_sha and new_sha != current_sha:
+                    # Prior CI evidence no longer applies to the new revision
+                    pass  # projection will not carry old CI forward
+
+            # Authorization evidence required (structured, separately reviewed)
             if event_type in {EventType.PR_AUTHORIZED, EventType.MERGE_AUTHORIZED}:
-                if not payload.get("authorization_evidence"):
-                    raise LedgerError("Explicit Chief authorization evidence required")
-                if actor == "chief" and not payload.get("reviewed"):
+                evidence = payload.get("authorization_evidence")
+                if not isinstance(evidence, dict):
+                    raise LedgerError("Structured authorization evidence required")
+                if not evidence.get("reviewed") or not evidence.get("authorization_id"):
                     raise LedgerError("Authorization not separately reviewed")
+                # Actor name alone is never sufficient
+                if actor and not evidence.get("authorization_id"):
+                    raise LedgerError("Actor name does not establish authorization")
 
             new_rev = self._next_revision(connection)
             event_id = uuid.uuid4().hex
@@ -426,10 +483,20 @@ class CheckpointLedger:
             payload = json.loads(payload_json)
             et = EventType(event_type)
 
-            if et == EventType.IMPLEMENTATION_SUBMITTED:
-                state = CheckpointState.IMPLEMENTED_REPORTED
-                current_sha = payload.get("sha")
-                local_tests = payload.get("local_tests")
+            if et == EventType.IMPLEMENTATION_SUBMITTED or et == EventType.CORRECTION_SUBMITTED:
+                # New SHA invalidates prior CI evidence
+                if current_sha and payload.get("sha") != current_sha:
+                    ci_verified = False
+                    ci_tests = None
+                    ci_sha = None
+                if et == EventType.IMPLEMENTATION_SUBMITTED:
+                    state = CheckpointState.IMPLEMENTED_REPORTED
+                    current_sha = payload.get("sha")
+                    local_tests = payload.get("local_tests")
+                else:
+                    state = CheckpointState.IMPLEMENTED_REPORTED
+                    current_sha = payload.get("sha")
+                    local_tests = payload.get("local_tests")
             elif et == EventType.REVIEW_RECORDED:
                 last_reviewed_sha = payload.get("sha") or current_sha
                 if payload.get("source_verified") is True:
@@ -437,14 +504,11 @@ class CheckpointLedger:
             elif et == EventType.CORRECTION_REQUESTED:
                 state = CheckpointState.CORRECTION_REQUESTED
                 findings = payload.get("findings")
-            elif et == EventType.CORRECTION_SUBMITTED:
-                state = CheckpointState.IMPLEMENTED_REPORTED
-                current_sha = payload.get("sha")
-                local_tests = payload.get("local_tests")
             elif et == EventType.CI_VERIFICATION_RECORDED:
                 if (
                     payload.get("conclusion") == "success"
                     and payload.get("sha") == (last_reviewed_sha or current_sha)
+                    and last_reviewed_sha is not None
                 ):
                     state = CheckpointState.CI_VERIFIED
                     ci_verified = True
