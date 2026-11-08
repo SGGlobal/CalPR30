@@ -218,9 +218,22 @@ def validate_envelope(
     if key not in AUTHORIZATION_MATRIX:
         raise EnvelopeError(f"Unauthorized sender/role/recipient/type combination: {key}")
 
-    # Required payload fields
-    required = REQUIRED_PAYLOAD_FIELDS.get(payload_type, set())
-    if not required.issubset(payload.keys()):
-        raise EnvelopeError(f"Missing required payload fields: {required - payload.keys()}")
+    # Required payload fields and type constraints per event type
+    if payload_type == "implementation" or payload_type == "correction":
+        sha = payload.get("sha")
+        if not isinstance(sha, str) or not SHA_PATTERN.match(sha):
+            raise EnvelopeError("Invalid implementation/correction SHA")
+    if payload_type == "review":
+        sha = payload.get("sha")
+        if not isinstance(sha, str) or not SHA_PATTERN.match(sha):
+            raise EnvelopeError("Invalid review SHA")
+        if payload.get("source_verified") is not True:
+            raise EnvelopeError("source_verified must be literal True")
+    if payload_type == "assignment":
+        if not isinstance(payload.get("objective"), str) or not payload["objective"]:
+            raise EnvelopeError("Assignment objective must be a non-empty string")
+    if payload_type == "correction_request":
+        if not isinstance(payload.get("findings"), str) or not payload["findings"]:
+            raise EnvelopeError("Findings must be a non-empty string")
 
     return AUTHORIZATION_MATRIX[key]

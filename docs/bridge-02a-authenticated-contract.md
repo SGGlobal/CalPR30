@@ -40,3 +40,14 @@ Ledger rejections produce an UNCERTAIN receipt. If the ledger succeeds but the r
 - Independent of the pending identity verification halt enforcement branch.
 
 See `skippy/collaboration/authenticated_envelope.py`, `offline_authenticated_adapter.py`, and `tests/test_authenticated_envelope.py`.
+
+## BRIDGE-02A.3 corrections
+- Authoritative HALT check is required at construction. Omitted or falsey halt_check is rejected. Fail-closed on HALT.
+- Persistent fail-stop state is recorded on partial writes. Subsequent calls and restarts are blocked until manual reconciliation. No automatic continuation.
+- Sequence and receipt operations use BEGIN IMMEDIATE for cross-instance serialization. Concurrent adapter instances share the same admission gate.
+- Malformed payloads produce controlled EnvelopeError and a rejection receipt when safe.
+- Implementation, correction, and review SHA values are validated for format. source_verified must be literal True. Objective and findings must be non-empty strings.
+- Assignment identity is persisted and enforced across subsequent messages. Mismatched assignment IDs are rejected.
+- trusted_fixture remains a test-only harness dependency. It is a commissioning blocker for production use and is never treated as verified Chief authorization.
+
+execution_enabled remains False. External transport remains disabled.

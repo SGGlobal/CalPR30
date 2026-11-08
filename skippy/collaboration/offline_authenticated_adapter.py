@@ -59,12 +59,15 @@ class OfflineAuthenticatedAdapter:
         trusted_fixture: controlled dependency. True only when the caller
         is a test fixture that has established authorization outside the
         envelope. Never treat an inbound claim as Chief approval.
-        halt_check: optional callable returning True if HALTED/UNCERTAIN.
+        halt_check: required callable returning True if HALTED/UNCERTAIN.
+        Omitted or falsey halt_check is rejected.
         """
+        if halt_check is None or not callable(halt_check):
+            raise OfflineAdapterError("Authoritative HALT check is required")
         self.ledger = ledger
         self.database_path = Path(database_path)
         self._trusted_fixture = trusted_fixture
-        self._halt_check = halt_check or (lambda: False)
+        self._halt_check = halt_check
         self._lock = threading.Lock()
         self._init_receipts()
 
@@ -92,6 +95,28 @@ class OfflineAuthenticatedAdapter:
                 CREATE TABLE IF NOT EXISTS sequence_state (
                     stream_key TEXT PRIMARY KEY,
                     next_sequence INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS fail_stop (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    stopped INTEGER NOT NULL,
+                    reason TEXT
+                )
+                """
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO fail_stop (singleton, stopped, reason) VALUES (1, 0, NULL)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assignment_identity (
+                    project_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    assignment_id TEXT NOT NULL,
+                    PRIMARY KEY (project_id, task_id)
                 )
                 """
             )
@@ -186,6 +211,15 @@ class OfflineAuthenticatedAdapter:
         now = now or datetime.now(timezone.utc)
 
         with self._lock:
+            # Persistent fail-stop gate
+            with sqlite3.connect(self.database_path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                row = connection.execute(
+                    "SELECT stopped, reason FROM fail_stop WHERE singleton = 1"
+                ).fetchone()
+                if row and row[0]:
+                    raise OfflineAdapterError(f"Fail-stop active: {row[1]}")
+
             # Authoritative HALT check
             try:
                 if self._halt_check():
@@ -198,10 +232,25 @@ class OfflineAuthenticatedAdapter:
                 raise OfflineAdapterError(f"HALT check failed: {exc}") from exc
 
             # Assignment requires trusted fixture dependency
-            payload_type = envelope.payload.get("type")
+            try:
+                payload_type = envelope.payload.get("type")
+            except EnvelopeError as exc:
+                self._record_receipt(envelope, "rejected", str(exc), now)
+                raise OfflineAdapterError(str(exc)) from exc
+
             if payload_type == "assignment" and not self._trusted_fixture:
                 self._record_receipt(envelope, "rejected", "Assignment requires trusted fixture", now)
                 raise OfflineAdapterError("Assignment requires trusted fixture dependency")
+
+            # Assignment identity consistency
+            with sqlite3.connect(self.database_path) as connection:
+                prior = connection.execute(
+                    "SELECT assignment_id FROM assignment_identity WHERE project_id = ? AND task_id = ?",
+                    (envelope.project_id, envelope.task_id),
+                ).fetchone()
+                if prior and prior[0] != envelope.assignment_id:
+                    self._record_receipt(envelope, "rejected", "Assignment identity mismatch", now)
+                    raise OfflineAdapterError("Assignment identity mismatch")
 
             stream_key = f"{envelope.project_id}:{envelope.task_id}"
             expected_seq = self._expected_sequence(stream_key)
@@ -258,8 +307,23 @@ class OfflineAuthenticatedAdapter:
             try:
                 self._record_receipt(envelope, "accepted", None, now)
                 self._advance_sequence(stream_key, expected_seq + 1)
+                # Record assignment identity on first assignment
+                if payload_type == "assignment":
+                    with sqlite3.connect(self.database_path) as connection:
+                        connection.execute(
+                            """
+                            INSERT OR IGNORE INTO assignment_identity
+                            (project_id, task_id, assignment_id) VALUES (?, ?, ?)
+                            """,
+                            (envelope.project_id, envelope.task_id, envelope.assignment_id),
+                        )
             except Exception as exc:
-                # Ledger succeeded but receipt/sequence failed — UNCERTAIN
+                # Ledger succeeded but receipt/sequence failed — persistent fail-stop
+                with sqlite3.connect(self.database_path) as connection:
+                    connection.execute(
+                        "UPDATE fail_stop SET stopped = 1, reason = ? WHERE singleton = 1",
+                        (f"Partial write: {exc}",),
+                    )
                 raise OfflineAdapterError(f"Partial write: ledger accepted but receipt failed: {exc}") from exc
 
             return "accepted"

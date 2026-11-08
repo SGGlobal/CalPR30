@@ -47,7 +47,7 @@ def _envelope(**overrides):
 
 def test_legitimate_assignment_accepted(tmp_path):
     ledger = CheckpointLedger(tmp_path / "ledger.db")
-    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True)
+    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True, halt_check=lambda: False)
     env = _envelope()
     result = adapter.accept(env, now=_now())
     assert result == "accepted"
@@ -57,7 +57,7 @@ def test_legitimate_assignment_accepted(tmp_path):
 
 def test_assignment_without_trusted_fixture_rejected(tmp_path):
     ledger = CheckpointLedger(tmp_path / "ledger.db")
-    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=False)
+    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=False, halt_check=lambda: False)
     env = _envelope()
     with pytest.raises(OfflineAdapterError, match="trusted fixture"):
         adapter.accept(env, now=_now())
@@ -66,10 +66,10 @@ def test_assignment_without_trusted_fixture_rejected(tmp_path):
 def test_replay_rejected_and_durable_after_restart(tmp_path):
     ledger = CheckpointLedger(tmp_path / "ledger.db")
     receipts = tmp_path / "receipts.db"
-    adapter = OfflineAuthenticatedAdapter(ledger, receipts, trusted_fixture=True)
+    adapter = OfflineAuthenticatedAdapter(ledger, receipts, trusted_fixture=True, halt_check=lambda: False)
     env = _envelope()
     adapter.accept(env, now=_now())
-    adapter2 = OfflineAuthenticatedAdapter(ledger, receipts, trusted_fixture=True)
+    adapter2 = OfflineAuthenticatedAdapter(ledger, receipts, trusted_fixture=True, halt_check=lambda: False)
     with pytest.raises(OfflineAdapterError, match="Replay"):
         adapter2.accept(env, now=_now())
 
@@ -77,7 +77,7 @@ def test_replay_rejected_and_durable_after_restart(tmp_path):
 def test_sequence_gap_rejected(tmp_path):
     """Sequence 999 is rejected when expected is 1."""
     ledger = CheckpointLedger(tmp_path / "ledger.db")
-    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True)
+    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True, halt_check=lambda: False)
     env = _envelope(sequence=999)
     with pytest.raises(OfflineAdapterError, match="Sequence"):
         adapter.accept(env, now=_now())
@@ -134,7 +134,7 @@ def test_halted_envelope_rejected(tmp_path):
 def test_implementation_preserves_sha(tmp_path):
     """Implementation SHA is preserved in the ledger payload."""
     ledger = CheckpointLedger(tmp_path / "ledger.db")
-    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True)
+    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True, halt_check=lambda: False)
     # Assignment
     env1 = _envelope()
     adapter.accept(env1, now=_now())
@@ -156,7 +156,7 @@ def test_implementation_preserves_sha(tmp_path):
 def test_review_preserves_sha_and_source_verified(tmp_path):
     """Review SHA and source_verified are preserved."""
     ledger = CheckpointLedger(tmp_path / "ledger.db")
-    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True)
+    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True, halt_check=lambda: False)
     env1 = _envelope()
     adapter.accept(env1, now=_now())
     env2 = _envelope(
@@ -174,3 +174,37 @@ def test_review_preserves_sha_and_source_verified(tmp_path):
     status = ledger.status("QLA", "bridge-02")
     assert status.last_reviewed_sha == "abc1234"
     assert status.state.value == "SOURCE_VERIFIED"
+
+
+def test_adapter_requires_halt_check(tmp_path):
+    """Constructing adapter without halt_check is rejected."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    with pytest.raises(OfflineAdapterError, match="HALT check"):
+        OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True)
+
+
+def test_assignment_identity_mismatch_rejected(tmp_path):
+    """Different assignment ID on the same project/task is rejected."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, tmp_path / "receipts.db", trusted_fixture=True, halt_check=lambda: False
+    )
+    env1 = _envelope()
+    adapter.accept(env1, now=_now())
+    env2 = _envelope(
+        message_id="msg-2", idempotency_key="idem-2", sequence=2,
+        assignment_id="different-asgn",
+        sender="jason", recipient="skippy", role="implementer",
+        payload={"type": "implementation", "sha": "abc1234"},
+    )
+    with pytest.raises(OfflineAdapterError, match="Assignment identity"):
+        adapter.accept(env2, now=_now())
+
+
+def test_invalid_sha_format_rejected():
+    env = _envelope(
+        sender="jason", recipient="skippy", role="implementer",
+        payload={"type": "implementation", "sha": "not-a-sha"},
+    )
+    with pytest.raises(EnvelopeError, match="Invalid"):
+        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set(), expected_sequence=1)
