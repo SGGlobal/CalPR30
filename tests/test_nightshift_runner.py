@@ -222,3 +222,47 @@ def test_duplicate_runner_refuses(tmp_path):
     )
     assert second.outcome == "fail-closed"
     assert "Duplicate" in (second.refusal_reason or "")
+
+
+def test_duplicate_submission_preserves_original_report(tmp_path):
+    """Successful report remains unchanged after duplicate submission, including after restart."""
+    protocol, policy, gate, ledger = _setup(tmp_path)
+    runner = NightshiftRunner(protocol, ledger, gate)
+    original = runner.run(
+        assignment_id="ns-preserve",
+        project_id="QLA",
+        task_id="nightshift-preserve",
+        checkpoint_id="cp-preserve",
+        objective="preserve",
+    )
+    assert original.outcome == "synthetic-complete"
+
+    # Duplicate submission on same runner raises (original preserved)
+    with pytest.raises(Exception):
+        runner.run(
+            assignment_id="ns-preserve",
+            project_id="QLA",
+            task_id="nightshift-preserve",
+            checkpoint_id="cp-preserve",
+            objective="preserve-again",
+        )
+    # Original persisted report must be unchanged
+    reopened = NightshiftRunner(protocol, ledger, gate)
+    reconstructed = reopened.report("ns-preserve")
+    assert reconstructed is not None
+    assert reconstructed.outcome == original.outcome
+    assert reconstructed.state == original.state
+    assert reconstructed.correction_count == original.correction_count
+    assert reconstructed.refusal_reason == original.refusal_reason
+
+
+def test_oversized_step_limit_rejected(tmp_path):
+    protocol, policy, gate, ledger = _setup(tmp_path)
+    with pytest.raises(Exception, match="Step limit"):
+        NightshiftRunner(protocol, ledger, gate, max_steps=1000)
+
+
+def test_oversized_timeout_rejected(tmp_path):
+    protocol, policy, gate, ledger = _setup(tmp_path)
+    with pytest.raises(Exception, match="Timeout"):
+        NightshiftRunner(protocol, ledger, gate, timeout_seconds=10000)

@@ -78,3 +78,11 @@ See `skippy/collaboration/nightshift_runner.py` and `tests/test_nightshift_runne
   "synthetic": true
 }
 ```
+
+## Final integrity corrections
+- Historical reports are never overwritten. Unique assignment identity is enforced. An identical duplicate request does not erase or change the original outcome. Conflicting replays are rejected.
+- The runner inspects the actual result from CollaborationOrchestrator.run() before recording a successful final review. Expected task identity and terminal COMPLETE status are required. Incomplete results are reported as UNCERTAIN. SOURCE_VERIFIED is not manufactured from hardcoded fixtures.
+- Step and timeout limits are validated against fixed safe maximums at construction. Elapsed time is measured from the injected clock. Synchronous orchestrator and ledger operations cannot be interrupted mid-call; checks occur before each major step.
+
+## Evidence that duplicates cannot corrupt completed reports
+A successful report is persisted once. A subsequent submission with the same assignment ID either is a no-op (identical outcome) or raises Conflicting replay. After restart, report() returns the original outcome, state, and correction count unchanged.

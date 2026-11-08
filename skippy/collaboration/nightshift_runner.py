@@ -95,7 +95,13 @@ class NightshiftRunner:
         self._started = False
         self._max_steps = max_steps if max_steps is not None else self.MAX_STEPS
         self._timeout = timeout_seconds if timeout_seconds is not None else self.TIMEOUT_SECONDS
+        # Validate against fixed safe maximums
+        if self._max_steps < 1 or self._max_steps > 32:
+            raise NightshiftError("Step limit outside safe range")
+        if self._timeout < 0.1 or self._timeout > 300:
+            raise NightshiftError("Timeout outside safe range")
         self._start_time: datetime | None = None
+        self._mono_start: float | None = None
         self._init_report_table()
 
     def _now(self) -> datetime:
@@ -125,10 +131,20 @@ class NightshiftRunner:
             )
 
     def _persist_report(self, report: NightshiftReport) -> None:
+        """Persist a report. Never overwrite a completed assignment."""
         with sqlite3.connect(self.ledger.database_path) as connection:
+            existing = connection.execute(
+                "SELECT outcome FROM nightshift_reports WHERE assignment_id = ?",
+                (report.assignment_id,),
+            ).fetchone()
+            if existing is not None:
+                # Identical duplicate is a no-op; conflicting replay is rejected
+                if existing[0] == report.outcome:
+                    return  # preserve original
+                raise NightshiftError("Conflicting replay of completed assignment")
             connection.execute(
                 """
-                INSERT OR REPLACE INTO nightshift_reports (
+                INSERT INTO nightshift_reports (
                     assignment_id, project_id, task_id, checkpoint_id,
                     state, outcome, correction_count, local_tests_reported,
                     source_verified, ci_verified, refusal_reason,
@@ -176,7 +192,12 @@ class NightshiftRunner:
         return None
 
     def _tick(self) -> None:
-        """Enforce step budget and timeout. Fail closed if exceeded."""
+        """Enforce step budget and timeout. Fail closed if exceeded.
+
+        Uses the injected clock for elapsed time. Synchronous orchestrator
+        and ledger operations cannot be interrupted mid-call; the check
+        occurs before each major step.
+        """
         self._steps += 1
         if self._steps > self._max_steps:
             raise NightshiftError("Step budget exhausted")
@@ -234,8 +255,33 @@ class NightshiftRunner:
             )
 
             self._tick()
-            # Drive orchestrator for the simulated workflow
-            self.orchestrator.run(task_id, objective, force_correction=force_inadequate)
+            # Drive orchestrator and inspect actual result before recording success
+            orch_result = self.orchestrator.run(task_id, objective, force_correction=force_inadequate)
+            # Require expected task identity and terminal completion
+            if not isinstance(orch_result, dict) or orch_result.get("task_id") != task_id:
+                raise NightshiftError("Orchestrator result missing expected task identity")
+            if orch_result.get("status") != "COMPLETE":
+                # Partial or incomplete — report UNCERTAIN
+                report = self._refuse(
+                    assignment_id, project_id, task_id, checkpoint_id,
+                    f"Orchestrator incomplete: {orch_result.get('status')}"
+                )
+                report = NightshiftReport(
+                    assignment_id=assignment_id,
+                    project_id=project_id,
+                    task_id=task_id,
+                    checkpoint_id=checkpoint_id,
+                    state="UNCERTAIN",
+                    outcome="uncertain",
+                    correction_count=self._corrections,
+                    local_tests_reported=None,
+                    source_verified=False,
+                    ci_verified=False,
+                    refusal_reason=f"Orchestrator incomplete: {orch_result.get('status')}",
+                    pending_chief_decisions=[],
+                )
+                self._persist_report(report)
+                return report
 
             self._tick()
             # Record implementation submitted (synthetic)
