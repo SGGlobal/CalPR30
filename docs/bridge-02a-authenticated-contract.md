@@ -85,3 +85,28 @@ execution_enabled remains False. External transport remains disabled. No cross-d
 - No cross-database atomicity is claimed.
 
 execution_enabled remains False. External transport remains disabled.
+
+## BRIDGE-02A.7 adapter-owned intent journal
+- Durable PENDING intent is recorded before any ledger write.
+- Explicit states: PENDING, ACCEPTED, UNCERTAIN.
+- PENDING is always ambiguous on restart and fails closed. No automatic retry, acceptance, or recovery.
+- Reconciliation is scoped to ledger events carrying `adapter_origin: bridge-02a`. Independent BRIDGE-01 events are ignored.
+- ACCEPTED intents must match adapter-originated ledger events by message ID. Reverse mismatches fail closed.
+- Concurrent instances are serialized by the exclusive journal transaction. Any unresolved PENDING blocks new admissions.
+- Protected BRIDGE-01 ledger semantics are unchanged. The origin marker is carried in the existing event payload.
+
+### Manual reconciliation runbook
+1. Inspect the intent journal for PENDING or UNCERTAIN rows.
+2. Compare against adapter-originated ledger events (`payload.adapter_origin == "bridge-02a"`).
+3. If a PENDING intent has no matching ledger event, the ledger write did not occur. The intent remains blocked until Chief-authorized manual resolution.
+4. If a ledger event exists without an ACCEPTED intent, the journal commit failed after the ledger commit. Manual reconciliation is required.
+5. Never automatically clear HALT, retry, or mark recovered. Chief authorization is required for any correction.
+
+### Commissioning blockers (unchanged)
+- payload_digest is an integrity checksum, not actor authentication.
+- trusted_fixture is a test-only harness.
+- Review source_verified is synthetic fixture evidence only.
+- HALT callback is a synthetic check, not proven authoritative global HALT wiring.
+- No cross-database atomicity is claimed.
+
+execution_enabled remains False. External transport remains disabled.

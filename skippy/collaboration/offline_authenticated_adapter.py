@@ -19,6 +19,7 @@ execution_enabled remains False.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 from datetime import datetime, timezone
@@ -75,48 +76,62 @@ class OfflineAuthenticatedAdapter:
 
     def _reconcile(self) -> None:
         """
-        Compare ledger events against accepted receipts.
+        Scoped reconciliation of adapter-originated events.
 
-        Any mismatch, unreadable store, or missing receipt DB with a
-        nonempty ledger fails closed and requires manual reconciliation.
-        Never silently recreate a clean state over existing ledger evidence.
+        Compares only ledger events that carry the adapter origin marker
+        against the intent journal. Independent BRIDGE-01 events are ignored.
+        Any PENDING intent is ambiguous and fails closed. Any ACCEPTED intent
+        without a matching ledger event fails closed. Never auto-recovers.
         """
         try:
             with self.ledger._connect() as ledger_conn:
                 ledger_events = ledger_conn.execute(
-                    "SELECT message_id FROM events ORDER BY revision"
+                    "SELECT message_id, payload FROM events ORDER BY revision"
                 ).fetchall()
-            ledger_ids = {r[0] for r in ledger_events if r[0]}
+            adapter_ledger_ids = set()
+            for msg_id, payload_json in ledger_events:
+                try:
+                    payload = json.loads(payload_json) if payload_json else {}
+                except Exception:
+                    payload = {}
+                if payload.get("adapter_origin") == "bridge-02a":
+                    adapter_ledger_ids.add(msg_id)
         except Exception as exc:
             raise OfflineAdapterError(f"Ledger unreadable during reconciliation: {exc}") from exc
 
         try:
             with sqlite3.connect(self.database_path) as connection:
-                receipt_rows = connection.execute(
-                    "SELECT message_id FROM audit_receipts WHERE outcome = 'accepted'"
+                pending = connection.execute(
+                    "SELECT message_id FROM intent_journal WHERE state = 'PENDING'"
                 ).fetchall()
-            receipt_ids = {r[0] for r in receipt_rows}
+                accepted = connection.execute(
+                    "SELECT message_id FROM intent_journal WHERE state = 'ACCEPTED'"
+                ).fetchall()
+            pending_ids = {r[0] for r in pending}
+            accepted_ids = {r[0] for r in accepted}
         except Exception as exc:
-            if ledger_ids:
+            if adapter_ledger_ids:
                 raise OfflineAdapterError(
-                    f"Receipt store unreadable and ledger is nonempty: {exc}"
+                    f"Intent journal unreadable and adapter ledger events exist: {exc}"
                 ) from exc
-            return  # both empty is acceptable for a fresh start
+            return
 
-        # Ledger events without corresponding accepted receipts
-        unmatched = ledger_ids - receipt_ids
-        if unmatched:
-            # Persistent fail-stop
-            try:
-                with sqlite3.connect(self.database_path) as connection:
-                    connection.execute(
-                        "UPDATE fail_stop SET stopped = 1, reason = ? WHERE singleton = 1",
-                        (f"Reconciliation mismatch: {sorted(unmatched)}",),
-                    )
-            except Exception:
-                pass
+        # PENDING is always ambiguous — fail closed
+        if pending_ids:
             raise OfflineAdapterError(
-                f"Ledger/receipt mismatch requires manual reconciliation: {sorted(unmatched)}"
+                f"Unresolved PENDING intent requires manual reconciliation: {sorted(pending_ids)}"
+            )
+        # ACCEPTED without matching adapter-originated ledger event
+        unmatched_accepted = accepted_ids - adapter_ledger_ids
+        if unmatched_accepted:
+            raise OfflineAdapterError(
+                f"ACCEPTED intent without matching ledger event: {sorted(unmatched_accepted)}"
+            )
+        # Adapter-originated ledger event without ACCEPTED intent
+        unmatched_ledger = adapter_ledger_ids - accepted_ids
+        if unmatched_ledger:
+            raise OfflineAdapterError(
+                f"Adapter ledger event without ACCEPTED intent: {sorted(unmatched_ledger)}"
             )
 
     def _init_receipts(self):
@@ -143,6 +158,23 @@ class OfflineAuthenticatedAdapter:
                 CREATE TABLE IF NOT EXISTS sequence_state (
                     stream_key TEXT PRIMARY KEY,
                     next_sequence INTEGER NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS intent_journal (
+                    intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    checkpoint_id TEXT NOT NULL,
+                    assignment_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
                 )
                 """
             )
@@ -362,13 +394,14 @@ class OfflineAuthenticatedAdapter:
                     connection.commit()
                     raise OfflineAdapterError(str(exc)) from exc
 
-                # Build ledger payload preserving SHA evidence
+                # Build ledger payload preserving SHA evidence and adapter origin
                 ledger_payload = {
                     "assignment_id": envelope.assignment_id,
                     "synthetic": True,
                     "schema_version": envelope.schema_version,
                     "digest": envelope.payload_digest,
                     "type": payload_type,
+                    "adapter_origin": "bridge-02a",
                 }
                 if "sha" in envelope.payload:
                     ledger_payload["sha"] = envelope.payload["sha"]
@@ -376,6 +409,29 @@ class OfflineAuthenticatedAdapter:
                     ledger_payload["source_verified"] = envelope.payload["source_verified"]
                 if "findings" in envelope.payload:
                     ledger_payload["findings"] = envelope.payload["findings"]
+
+                # Record durable PENDING intent before ledger write
+                connection.execute(
+                    """
+                    INSERT INTO intent_journal (
+                        message_id, idempotency_key, project_id, task_id,
+                        checkpoint_id, assignment_id, sequence, payload_digest,
+                        state, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', ?)
+                    """,
+                    (
+                        envelope.message_id,
+                        envelope.idempotency_key,
+                        envelope.project_id,
+                        envelope.task_id,
+                        envelope.checkpoint_id,
+                        envelope.assignment_id,
+                        expected_seq,
+                        envelope.payload_digest,
+                        now.isoformat(),
+                    ),
+                )
+                connection.commit()
 
                 # Derive actual ledger revision
                 with self.ledger._connect() as ledger_conn:
@@ -395,9 +451,18 @@ class OfflineAuthenticatedAdapter:
                         now=now,
                     )
                 except LedgerError as exc:
-                    self._record_receipt_in(connection, envelope, "uncertain", str(exc), now)
+                    connection.execute(
+                        "UPDATE intent_journal SET state = 'UNCERTAIN' WHERE message_id = ? AND state = 'PENDING'",
+                        (envelope.message_id,),
+                    )
                     connection.commit()
                     raise OfflineAdapterError(f"Ledger rejection: {exc}") from exc
+
+                # Mark ACCEPTED only after successful ledger commit
+                connection.execute(
+                    "UPDATE intent_journal SET state = 'ACCEPTED' WHERE message_id = ? AND state = 'PENDING'",
+                    (envelope.message_id,),
+                )
 
                 # Atomic receipt + sequence + assignment identity
                 try:

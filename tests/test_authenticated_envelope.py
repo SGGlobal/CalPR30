@@ -272,7 +272,7 @@ def test_simultaneous_concurrent_instances(tmp_path):
     # Exactly one should succeed
     assert len(results) == 1
     assert len(errors) == 1
-    assert "Sequence" in errors[0] or "Replay" in errors[0] or "Fail-stop" in errors[0]
+    assert "Sequence" in errors[0] or "Replay" in errors[0] or "Fail-stop" in errors[0] or "PENDING" in errors[0]
 
 
 def test_rollback_does_not_persist_accepted_on_failure(tmp_path, monkeypatch):
@@ -304,7 +304,7 @@ def test_rollback_does_not_persist_accepted_on_failure(tmp_path, monkeypatch):
 
 
 def test_reconciliation_detects_missing_receipt(tmp_path):
-    """Startup reconciliation fails closed when receipt DB is missing but ledger is nonempty."""
+    """Startup reconciliation fails closed when intent journal is missing but adapter ledger events exist."""
     ledger = CheckpointLedger(tmp_path / "ledger.db")
     receipts = tmp_path / "receipts.db"
     adapter = OfflineAuthenticatedAdapter(
@@ -313,11 +313,11 @@ def test_reconciliation_detects_missing_receipt(tmp_path):
     env = _envelope()
     adapter.accept(env, now=_now())
 
-    # Simulate crash: remove the receipts database while leaving the ledger
+    # Simulate crash: remove the intent journal database while leaving the ledger
     receipts.unlink()
 
     # New instance must fail closed on reconciliation
-    with pytest.raises(OfflineAdapterError, match="unreadable|mismatch|reconciliation"):
+    with pytest.raises(OfflineAdapterError, match="unreadable|mismatch|reconciliation|intent"):
         OfflineAuthenticatedAdapter(
             ledger, receipts, trusted_fixture=True, halt_check=lambda: False
         )
@@ -341,3 +341,55 @@ def test_reconciliation_blocks_subsequent_admission(tmp_path):
         OfflineAuthenticatedAdapter(
             ledger, receipts, trusted_fixture=True, halt_check=lambda: False
         )
+
+
+def test_pending_intent_blocks_restart(tmp_path):
+    """A PENDING intent without resolution fails closed on restart."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    # Manually insert a PENDING intent
+    import sqlite3
+    with sqlite3.connect(receipts) as c:
+        c.execute(
+            """
+            INSERT INTO intent_journal (
+                message_id, idempotency_key, project_id, task_id,
+                checkpoint_id, assignment_id, sequence, payload_digest,
+                state, recorded_at
+            ) VALUES ('pending-msg', 'pending-idem', 'QLA', 't', 'c', 'a', 1, 'd', 'PENDING', '2026-11-08T12:00:00')
+            """
+        )
+    # New instance must fail closed
+    with pytest.raises(OfflineAdapterError, match="PENDING"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )
+
+
+def test_mixed_origin_events_ignored(tmp_path):
+    """Independent BRIDGE-01 events without adapter origin are ignored by reconciliation."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    # Direct ledger event without adapter origin
+    ledger.record_event(
+        event_type=__import__("skippy.collaboration.checkpoint_ledger", fromlist=["EventType"]).EventType.ASSIGNMENT_CREATED,
+        project_id="QLA",
+        task_id="other",
+        checkpoint_id="cp-other",
+        actor="chief",
+        payload={"assignment_id": "other", "synthetic": True},
+        message_id="independent-msg",
+        idempotency_key="independent-idem",
+        expected_revision=0,
+        now=_now(),
+    )
+    # Adapter should start cleanly — independent event is out of scope
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    env = _envelope()
+    result = adapter.accept(env, now=_now())
+    assert result == "accepted"
