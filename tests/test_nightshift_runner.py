@@ -266,3 +266,57 @@ def test_oversized_timeout_rejected(tmp_path):
     protocol, policy, gate, ledger = _setup(tmp_path)
     with pytest.raises(Exception, match="Timeout"):
         NightshiftRunner(protocol, ledger, gate, timeout_seconds=10000)
+
+
+def test_assignment_identity_after_restart(tmp_path):
+    """Identical redelivery after restart does not dispatch new work or alter the report."""
+    protocol, policy, gate, ledger = _setup(tmp_path)
+    runner = NightshiftRunner(protocol, ledger, gate)
+    original = runner.run(
+        assignment_id="ns-identity",
+        project_id="QLA",
+        task_id="nightshift-id",
+        checkpoint_id="cp-id",
+        objective="identity",
+    )
+    assert original.outcome == "synthetic-complete"
+
+    # Newly constructed runner after restart
+    reopened = NightshiftRunner(protocol, ledger, gate)
+    redelivery = reopened.run(
+        assignment_id="ns-identity",
+        project_id="QLA",
+        task_id="nightshift-id",
+        checkpoint_id="cp-id",
+        objective="identity",
+    )
+    assert redelivery.outcome == original.outcome
+    assert redelivery.state == original.state
+    assert redelivery.correction_count == original.correction_count
+
+    # Conflicting reuse rejected
+    with pytest.raises(Exception, match="Conflicting"):
+        reopened.run(
+            assignment_id="ns-identity",
+            project_id="OTHER",
+            task_id="nightshift-id",
+            checkpoint_id="cp-id",
+            objective="conflict",
+        )
+
+
+def test_monotonic_timeout(tmp_path):
+    """Injected monotonic clock enforces timeout."""
+    protocol, policy, gate, ledger = _setup(tmp_path)
+    mono_times = [1000.0, 1000.0, 1100.0]
+    mono = lambda: mono_times.pop(0) if mono_times else 1200.0
+    runner = NightshiftRunner(protocol, ledger, gate, mono=mono, timeout_seconds=1)
+    report = runner.run(
+        assignment_id="ns-mono",
+        project_id="QLA",
+        task_id="nightshift-mono",
+        checkpoint_id="cp-mono",
+        objective="mono",
+    )
+    assert report.outcome == "fail-closed"
+    assert "Timeout" in (report.refusal_reason or "")

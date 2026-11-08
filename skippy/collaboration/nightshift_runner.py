@@ -80,6 +80,7 @@ class NightshiftRunner:
         ledger: CheckpointLedger,
         gate: CoordinatedHaltGate | None = None,
         clock=None,
+        mono=None,
         max_steps: int | None = None,
         timeout_seconds: float | None = None,
     ):
@@ -90,6 +91,8 @@ class NightshiftRunner:
         self.gate = gate
         self.orchestrator = CollaborationOrchestrator(protocol)
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        # Monotonic clock for timeout (injectable for tests)
+        self._mono = mono or (lambda: self._clock().timestamp())
         self._steps = 0
         self._corrections = 0
         self._started = False
@@ -194,15 +197,15 @@ class NightshiftRunner:
     def _tick(self) -> None:
         """Enforce step budget and timeout. Fail closed if exceeded.
 
-        Uses the injected clock for elapsed time. Synchronous orchestrator
-        and ledger operations cannot be interrupted mid-call; the check
-        occurs before each major step.
+        Uses the injected monotonic clock for elapsed time. Synchronous
+        orchestrator and ledger operations cannot be interrupted mid-call;
+        the check occurs before each major step and before final completion.
         """
         self._steps += 1
         if self._steps > self._max_steps:
             raise NightshiftError("Step budget exhausted")
-        if self._start_time is not None:
-            elapsed = (self._now() - self._start_time).total_seconds()
+        if self._mono_start is not None:
+            elapsed = self._mono() - self._mono_start
             if elapsed > self._timeout:
                 raise NightshiftError("Timeout exceeded")
 
@@ -236,7 +239,21 @@ class NightshiftRunner:
 
         self._started = True
         self._start_time = self._now()
+        self._mono_start = self._mono()
         now = self._now()
+
+        # Assignment identity integrity: check existing report before dispatch
+        existing = self.report(assignment_id)
+        if existing is not None:
+            if (
+                existing.project_id == project_id
+                and existing.task_id == task_id
+                and existing.checkpoint_id == checkpoint_id
+            ):
+                # Identical redelivery — no new work
+                return existing
+            # Conflicting reuse
+            raise NightshiftError("Conflicting reuse of assignment ID")
 
         try:
             self._tick()
@@ -257,15 +274,10 @@ class NightshiftRunner:
             self._tick()
             # Drive orchestrator and inspect actual result before recording success
             orch_result = self.orchestrator.run(task_id, objective, force_correction=force_inadequate)
-            # Require expected task identity and terminal completion
+            # Require task ID, COMPLETE status, and no outstanding issues
             if not isinstance(orch_result, dict) or orch_result.get("task_id") != task_id:
                 raise NightshiftError("Orchestrator result missing expected task identity")
             if orch_result.get("status") != "COMPLETE":
-                # Partial or incomplete — report UNCERTAIN
-                report = self._refuse(
-                    assignment_id, project_id, task_id, checkpoint_id,
-                    f"Orchestrator incomplete: {orch_result.get('status')}"
-                )
                 report = NightshiftReport(
                     assignment_id=assignment_id,
                     project_id=project_id,
@@ -282,6 +294,9 @@ class NightshiftRunner:
                 )
                 self._persist_report(report)
                 return report
+            # Absence of HALT
+            if self.protocol.is_halted:
+                raise NightshiftError("HALT detected after orchestrator run")
 
             self._tick()
             # Record implementation submitted (synthetic)
@@ -381,6 +396,8 @@ class NightshiftRunner:
 
             status = self.ledger.status(project_id, task_id)
             final_state = status.state.value if status else "UNCERTAIN"
+            # Final deadline check before accepting completion
+            self._tick()
             # Never report success while still in CORRECTION_REQUESTED
             if final_state == "CORRECTION_REQUESTED":
                 report = self._refuse(

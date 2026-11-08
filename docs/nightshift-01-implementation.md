@@ -86,3 +86,11 @@ See `skippy/collaboration/nightshift_runner.py` and `tests/test_nightshift_runne
 
 ## Evidence that duplicates cannot corrupt completed reports
 A successful report is persisted once. A subsequent submission with the same assignment ID either is a no-op (identical outcome) or raises Conflicting replay. After restart, report() returns the original outcome, state, and correction count unchanged.
+
+## NIGHTSHIFT-01B targeted corrections
+- Assignment identity is checked before dispatch. Identical redelivery (same project/task/checkpoint) returns the existing report without new work. Conflicting reuse of an assignment ID fails closed. The completed report is preserved. Verified with a newly constructed runner after restart.
+- Timeout uses an injected monotonic clock. The deadline is validated before final completion. Synchronous operations cannot be interrupted mid-call (documented).
+- Orchestrator completion requires matching task ID, COMPLETE status, and absence of HALT. Incomplete or partial results are reported as UNCERTAIN. Source verification is recorded only when the expected synthetic review evidence is present.
+
+## Synchronous operation limitation
+Orchestrator and ledger calls are synchronous. A timeout check occurs before each major step and before final completion, but an in-flight call cannot be interrupted.
