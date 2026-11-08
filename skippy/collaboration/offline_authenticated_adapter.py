@@ -1,16 +1,25 @@
 """
-SKIPPY AI Collaboration Bridge — BRIDGE-02A Offline Adapter Stub.
+SKIPPY AI Collaboration Bridge — BRIDGE-02A.1 Offline Adapter Stub.
 
 LOCAL SYNTHETIC ONLY. NON-EXECUTING. FAIL-CLOSED.
 
 External transport is disabled. This adapter accepts only synthetic
 fixtures and records immutable audit receipts. It does not send,
 retry, or enable execution.
+
+SECURITY NOTES:
+- payload_digest is an integrity checksum, not actor authentication.
+- Replay protection is durable (persisted) and checked under a lock.
+- Ledger revision is derived from the ledger, never from message sequence.
+- Audit receipts are append-only. Partial writes are reported as UNCERTAIN.
+- No cross-database atomicity is claimed.
+execution_enabled remains False.
 """
 
 from __future__ import annotations
 
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,7 +28,7 @@ from skippy.collaboration.authenticated_envelope import (
     EnvelopeError,
     validate_envelope,
 )
-from skippy.collaboration.checkpoint_ledger import CheckpointLedger, EventType
+from skippy.collaboration.checkpoint_ledger import CheckpointLedger, EventType, LedgerError
 
 
 class OfflineAdapterError(RuntimeError):
@@ -40,8 +49,7 @@ class OfflineAuthenticatedAdapter:
     def __init__(self, ledger: CheckpointLedger, database_path: Path):
         self.ledger = ledger
         self.database_path = Path(database_path)
-        self._seen_message_ids: set[str] = set()
-        self._seen_idempotency_keys: set[str] = set()
+        self._lock = threading.Lock()
         self._init_receipts()
 
     def _init_receipts(self):
@@ -63,6 +71,32 @@ class OfflineAuthenticatedAdapter:
                 )
                 """
             )
+            # Append-only: no UPDATE/DELETE triggers that allow mutation
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_receipts_no_update
+                BEFORE UPDATE ON audit_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit_receipts is append-only');
+                END
+                """
+            )
+            connection.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS audit_receipts_no_delete
+                BEFORE DELETE ON audit_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit_receipts is append-only');
+                END
+                """
+            )
+
+    def _seen_ids(self) -> tuple[set[str], set[str]]:
+        with sqlite3.connect(self.database_path) as connection:
+            rows = connection.execute(
+                "SELECT message_id, idempotency_key FROM audit_receipts WHERE outcome = 'accepted'"
+            ).fetchall()
+        return {r[0] for r in rows}, {r[1] for r in rows}
 
     def _record_receipt(
         self,
@@ -99,46 +133,63 @@ class OfflineAuthenticatedAdapter:
         *,
         now: datetime | None = None,
         expected_sequence: int | None = None,
+        halted: bool = False,
     ) -> str:
         """
         Validate and record an envelope. Returns 'accepted' or raises.
 
         Fail-closed. Does not dispatch external transport. Does not retry.
+        If halted is True, the envelope is rejected and a receipt is recorded.
         """
         if self.TRANSPORT_ENABLED:
             raise OfflineAdapterError("External transport is disabled")
         now = now or datetime.now(timezone.utc)
-        try:
-            validate_envelope(
-                envelope,
-                now=now,
-                seen_message_ids=self._seen_message_ids,
-                seen_idempotency_keys=self._seen_idempotency_keys,
-                expected_sequence=expected_sequence,
-            )
-        except EnvelopeError as exc:
-            self._record_receipt(envelope, "rejected", str(exc), now)
-            raise OfflineAdapterError(str(exc)) from exc
 
-        # Record in ledger as evidence only
-        self.ledger.record_event(
-            event_type=EventType.ASSIGNMENT_CREATED if envelope.payload.get("type") == "assignment" else EventType.IMPLEMENTATION_SUBMITTED,
-            project_id=envelope.project_id,
-            task_id=envelope.task_id,
-            checkpoint_id=envelope.checkpoint_id,
-            actor=envelope.sender,
-            payload={
-                "assignment_id": envelope.assignment_id,
-                "synthetic": True,
-                "schema_version": envelope.schema_version,
-                "digest": envelope.payload_digest,
-            },
-            message_id=envelope.message_id,
-            idempotency_key=envelope.idempotency_key,
-            expected_revision=0 if envelope.sequence == 1 else None,
-            now=now,
-        )
-        self._seen_message_ids.add(envelope.message_id)
-        self._seen_idempotency_keys.add(envelope.idempotency_key)
-        self._record_receipt(envelope, "accepted", None, now)
-        return "accepted"
+        with self._lock:
+            if halted:
+                self._record_receipt(envelope, "rejected", "HALTED", now)
+                raise OfflineAdapterError("HALTED: envelope rejected")
+
+            seen_msg, seen_idem = self._seen_ids()
+            try:
+                event_type_name = validate_envelope(
+                    envelope,
+                    now=now,
+                    seen_message_ids=seen_msg,
+                    seen_idempotency_keys=seen_idem,
+                    expected_sequence=expected_sequence,
+                )
+            except EnvelopeError as exc:
+                self._record_receipt(envelope, "rejected", str(exc), now)
+                raise OfflineAdapterError(str(exc)) from exc
+
+            # Derive actual ledger revision; never confuse with message sequence
+            with self.ledger._connect() as connection:
+                current_rev = self.ledger._current_revision(connection)
+
+            try:
+                self.ledger.record_event(
+                    event_type=EventType[event_type_name],
+                    project_id=envelope.project_id,
+                    task_id=envelope.task_id,
+                    checkpoint_id=envelope.checkpoint_id,
+                    actor=envelope.sender,
+                    payload={
+                        "assignment_id": envelope.assignment_id,
+                        "synthetic": True,
+                        "schema_version": envelope.schema_version,
+                        "digest": envelope.payload_digest,
+                        "type": envelope.payload.get("type"),
+                    },
+                    message_id=envelope.message_id,
+                    idempotency_key=envelope.idempotency_key,
+                    expected_revision=current_rev,
+                    now=now,
+                )
+            except LedgerError as exc:
+                # Partial persistence or ledger rejection — record UNCERTAIN receipt
+                self._record_receipt(envelope, "uncertain", str(exc), now)
+                raise OfflineAdapterError(f"Ledger rejection: {exc}") from exc
+
+            self._record_receipt(envelope, "accepted", None, now)
+            return "accepted"
