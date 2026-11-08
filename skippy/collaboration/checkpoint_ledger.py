@@ -238,7 +238,11 @@ class CheckpointLedger:
         for et_str, payload_json in rows:
             et = EventType(et_str)
             payload = json.loads(payload_json)
-            if et == EventType.IMPLEMENTATION_SUBMITTED:
+            if et == EventType.ASSIGNMENT_CREATED:
+                if state is None:
+                    state = CheckpointState.IMPLEMENTED_REPORTED  # assignment establishes an active work item
+                # else: subsequent assignment handled by record_event rejection
+            elif et == EventType.IMPLEMENTATION_SUBMITTED:
                 state = CheckpointState.IMPLEMENTED_REPORTED
                 current_sha = payload.get("sha")
             elif et == EventType.REVIEW_RECORDED:
@@ -389,6 +393,10 @@ class CheckpointLedger:
                 if prior_cp and prior_cp[0] != checkpoint_id:
                     raise LedgerError("Inconsistent checkpoint identifier for active work item")
 
+            # Reject multiple conflicting assignments under the same project/task
+            if event_type == EventType.ASSIGNMENT_CREATED and state is not None:
+                raise LedgerError("Conflicting assignment for active project/task")
+
             # Stale implementation report detection
             if event_type in {EventType.IMPLEMENTATION_SUBMITTED, EventType.CORRECTION_SUBMITTED}:
                 reported_sha = payload.get("sha")
@@ -510,12 +518,17 @@ class CheckpointLedger:
         merge_auth = False
         checkpoint_id = rows[-1][1]
         revision = rows[-1][3]
+        assigned = False
 
         for event_type, cp_id, payload_json, rev in rows:
             payload = json.loads(payload_json)
             et = EventType(event_type)
 
-            if et == EventType.IMPLEMENTATION_SUBMITTED or et == EventType.CORRECTION_SUBMITTED:
+            if et == EventType.ASSIGNMENT_CREATED:
+                assigned = True
+                if state == CheckpointState.UNCERTAIN:
+                    state = CheckpointState.IMPLEMENTED_REPORTED
+            elif et == EventType.IMPLEMENTATION_SUBMITTED or et == EventType.CORRECTION_SUBMITTED:
                 # New SHA invalidates prior CI evidence
                 if current_sha and payload.get("sha") != current_sha:
                     ci_verified = False

@@ -53,3 +53,8 @@ The ledger records supplied evidence. It cannot independently establish external
 
 ## Offline authenticity limitation (reaffirmed)
 The ledger records supplied evidence. It cannot independently establish external sender authenticity or that a submitted CI run actually occurred.
+
+## Final assignment-state and mixed-identifier corrections
+- ASSIGNMENT_CREATED is represented in both state-projection methods. A newly recorded assignment does not appear as UNCERTAIN.
+- Multiple conflicting assignments or checkpoint identifiers under the same active project/task are rejected.
+- Mixed message ID / idempotency key pairs (first event's message ID + second event's key) produce a pair-mismatch rejection even when envelope content is otherwise identical. Exact duplicate redelivery remains a no-op.

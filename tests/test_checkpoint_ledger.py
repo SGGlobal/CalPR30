@@ -586,54 +586,52 @@ def test_legal_progression_to_merged(tmp_path):
 
 
 def test_both_identifiers_must_match_same_event(tmp_path):
-    """BRIDGE-01C Task 1: both identifiers verified before duplicate no-op."""
+    """BRIDGE-01C: mixed identifiers produce pair-mismatch rejection."""
     ledger = CheckpointLedger(tmp_path / "ledger.db")
+    # Two events with identical envelope content except message/idempotency pair
+    # Use HALT which is always allowed so both can be recorded
     ledger.record_event(
-        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        event_type=EventType.HALT,
         project_id="p",
         task_id="t",
         checkpoint_id="c1",
-        actor="jason",
-        payload={"sha": "abc"},
+        actor="chief",
+        payload={"reason": "test"},
         message_id="msg-a",
         idempotency_key="idem-a",
-        expected_revision=0,
     )
     ledger.record_event(
-        event_type=EventType.REVIEW_RECORDED,
+        event_type=EventType.HALT,
         project_id="p",
         task_id="t",
         checkpoint_id="c1",
-        actor="skippy",
-        payload={"sha": "abc"},
+        actor="chief",
+        payload={"reason": "test"},
         message_id="msg-b",
         idempotency_key="idem-b",
-        expected_revision=1,
     )
-    # Mix first message_id with second idempotency_key
-    with pytest.raises(LedgerError, match="Conflicting"):
+    # Mix first message_id with second idempotency_key — must hit pair comparison
+    with pytest.raises(LedgerError, match="pair mismatch|Conflicting identity"):
         ledger.record_event(
-            event_type=EventType.IMPLEMENTATION_SUBMITTED,
+            event_type=EventType.HALT,
             project_id="p",
             task_id="t",
             checkpoint_id="c1",
-            actor="jason",
-            payload={"sha": "abc"},
+            actor="chief",
+            payload={"reason": "test"},
             message_id="msg-a",
             idempotency_key="idem-b",
-            expected_revision=2,
         )
     # Exact duplicate of first event remains no-op
     rev = ledger.record_event(
-        event_type=EventType.IMPLEMENTATION_SUBMITTED,
+        event_type=EventType.HALT,
         project_id="p",
         task_id="t",
         checkpoint_id="c1",
-        actor="jason",
-        payload={"sha": "abc"},
+        actor="chief",
+        payload={"reason": "test"},
         message_id="msg-a",
         idempotency_key="idem-a",
-        expected_revision=2,
     )
     assert rev == 2  # unchanged
 
@@ -743,3 +741,48 @@ def test_ci_requires_source_verified_review(tmp_path):
     status = ledger.status("p", "t")
     assert status.current_sha == "def999"
     assert status.ci_verified is False
+
+
+def test_assignment_created_not_uncertain(tmp_path):
+    """Assignment is represented and does not appear as UNCERTAIN."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    ledger.record_event(
+        event_type=EventType.ASSIGNMENT_CREATED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="chief",
+        payload={"objective": "test"},
+        expected_revision=0,
+    )
+    status = ledger.status("p", "t")
+    assert status is not None
+    assert status.state != CheckpointState.UNCERTAIN
+    assert status.checkpoint_id == "c1"
+
+
+def test_conflicting_assignment_rejected(tmp_path):
+    """Multiple conflicting assignments under the same project/task are rejected."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    ledger.record_event(
+        event_type=EventType.ASSIGNMENT_CREATED,
+        project_id="p",
+        task_id="t",
+        checkpoint_id="c1",
+        actor="chief",
+        payload={"objective": "first"},
+        expected_revision=0,
+    )
+    with pytest.raises(LedgerError, match="Conflicting assignment|Inconsistent checkpoint"):
+        ledger.record_event(
+            event_type=EventType.ASSIGNMENT_CREATED,
+            project_id="p",
+            task_id="t",
+            checkpoint_id="c2",
+            actor="chief",
+            payload={"objective": "second"},
+            expected_revision=1,
+        )
+    status = ledger.status("p", "t")
+    assert status.checkpoint_id == "c1"
+    assert status.revision == 1
