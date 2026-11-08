@@ -1,14 +1,12 @@
 """
-SKIPPY AI Collaboration Bridge — BRIDGE-02A.1 Authenticated Envelope Contract.
+SKIPPY AI Collaboration Bridge — BRIDGE-02A.2 Offline Integrity Contract.
 
 LOCAL SYNTHETIC ONLY. NON-EXECUTING. FAIL-CLOSED.
 
-Defines the offline message envelope and validation rules for SKIPPY↔Jason
-development handoff. External transport remains disabled.
-
-SECURITY NOTE: payload_digest is an integrity checksum over the payload,
-not cryptographic actor authentication. Trusted fixture injection is
-modeled separately from untrusted inputs. No live secrets are introduced.
+This is an offline integrity contract, not authenticated actor messaging.
+payload_digest is an integrity checksum over the payload. Trusted fixture
+injection is provided through a separate controlled dependency, not a claim
+asserted by inbound envelope data. External transport remains disabled.
 execution_enabled remains False.
 """
 
@@ -28,14 +26,14 @@ class EnvelopeError(ValueError):
 
 SCHEMA_VERSION = "1.0"
 
-# Explicit sender↔role↔event-type authorization matrix.
+# Explicit sender↔role↔recipient↔event-type authorization matrix.
 # Unknown combinations are rejected.
-AUTHORIZATION_MATRIX: dict[tuple[str, str, str], str] = {
-    ("chief", "chief", "assignment"): "ASSIGNMENT_CREATED",
-    ("jason", "implementer", "implementation"): "IMPLEMENTATION_SUBMITTED",
-    ("skippy", "reviewer", "review"): "REVIEW_RECORDED",
-    ("skippy", "reviewer", "correction_request"): "CORRECTION_REQUESTED",
-    ("jason", "implementer", "correction"): "CORRECTION_SUBMITTED",
+AUTHORIZATION_MATRIX: dict[tuple[str, str, str, str], str] = {
+    ("chief", "chief", "jason", "assignment"): "ASSIGNMENT_CREATED",
+    ("jason", "implementer", "skippy", "implementation"): "IMPLEMENTATION_SUBMITTED",
+    ("skippy", "reviewer", "jason", "review"): "REVIEW_RECORDED",
+    ("skippy", "reviewer", "jason", "correction_request"): "CORRECTION_REQUESTED",
+    ("jason", "implementer", "skippy", "correction"): "CORRECTION_SUBMITTED",
 }
 
 ALLOWED_SENDERS = {"chief", "skippy", "jason"}
@@ -45,13 +43,23 @@ MAX_CLOCK_SKEW_SECONDS = 60
 MAX_ENVELOPE_AGE_SECONDS = 3600
 SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{7,64}$")
 
+# Required payload fields per event type
+REQUIRED_PAYLOAD_FIELDS: dict[str, set[str]] = {
+    "assignment": {"objective"},
+    "implementation": {"sha"},
+    "review": {"sha", "source_verified"},
+    "correction_request": {"findings"},
+    "correction": {"sha"},
+}
+
 
 @dataclass(frozen=True)
 class AuthenticatedEnvelope:
-    """Versioned message envelope for offline handoff.
+    """Versioned message envelope for offline integrity contract.
 
-    payload is stored as a frozen JSON string to prevent mutation after
-    construction. The digest is an integrity checksum, not actor authentication.
+    payload is stored as a frozen JSON string. The digest is an integrity
+    checksum, not actor authentication. trusted_fixture is not an envelope
+    field; it is supplied separately by the adapter.
     """
 
     project_id: str
@@ -63,23 +71,29 @@ class AuthenticatedEnvelope:
     sender: str
     recipient: str
     role: str
-    payload_json: str  # frozen canonical JSON
+    payload_json: str
     payload_digest: str
     schema_version: str
     timestamp: datetime
     expiry: datetime
     sequence: int
     reviewed_sha: str | None = None
-    # Trusted fixture flag: True only when the caller is a test fixture
-    # that has already established Chief authorization outside this envelope.
-    trusted_fixture: bool = False
 
     @property
     def payload(self) -> dict:
-        return json.loads(self.payload_json)
+        try:
+            data = json.loads(self.payload_json)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise EnvelopeError(f"Malformed payload JSON: {exc}") from exc
+        if not isinstance(data, dict):
+            raise EnvelopeError("Payload must be a JSON object")
+        return data
 
     def computed_digest(self) -> str:
-        return hashlib.sha256(self.payload_json.encode()).hexdigest()
+        try:
+            return hashlib.sha256(self.payload_json.encode()).hexdigest()
+        except (AttributeError, TypeError) as exc:
+            raise EnvelopeError(f"Cannot compute digest: {exc}") from exc
 
 
 def build_envelope(
@@ -98,7 +112,6 @@ def build_envelope(
     expiry: datetime,
     sequence: int,
     reviewed_sha: str | None = None,
-    trusted_fixture: bool = False,
 ) -> AuthenticatedEnvelope:
     """Build an envelope with a computed payload digest."""
     if not isinstance(payload, dict):
@@ -122,7 +135,6 @@ def build_envelope(
         expiry=expiry,
         sequence=sequence,
         reviewed_sha=reviewed_sha,
-        trusted_fixture=trusted_fixture,
     )
 
 
@@ -132,7 +144,7 @@ def validate_envelope(
     now: datetime,
     seen_message_ids: set[str],
     seen_idempotency_keys: set[str],
-    expected_sequence: int | None = None,
+    expected_sequence: int,
 ) -> str:
     """
     Fail-closed validation of an envelope.
@@ -142,7 +154,10 @@ def validate_envelope(
     expiry, or authorization failure.
 
     Note: payload_digest is an integrity checksum, not actor authentication.
+    expected_sequence is required (not optional).
     """
+    if not isinstance(now, datetime) or now.tzinfo is None:
+        raise EnvelopeError("now must be a timezone-aware datetime")
     if not isinstance(envelope.timestamp, datetime) or envelope.timestamp.tzinfo is None:
         raise EnvelopeError("Timestamp must be timezone-aware")
     if not isinstance(envelope.expiry, datetime) or envelope.expiry.tzinfo is None:
@@ -151,11 +166,11 @@ def validate_envelope(
         raise EnvelopeError("Expiry must be after timestamp")
     if envelope.schema_version != SCHEMA_VERSION:
         raise EnvelopeError("Unsupported schema version")
-    if envelope.sender not in ALLOWED_SENDERS:
+    if not isinstance(envelope.sender, str) or envelope.sender not in ALLOWED_SENDERS:
         raise EnvelopeError("Unauthorized sender")
-    if envelope.role not in ALLOWED_ROLES:
+    if not isinstance(envelope.role, str) or envelope.role not in ALLOWED_ROLES:
         raise EnvelopeError("Unauthorized role")
-    if envelope.recipient not in ALLOWED_RECIPIENTS:
+    if not isinstance(envelope.recipient, str) or envelope.recipient not in ALLOWED_RECIPIENTS:
         raise EnvelopeError("Unauthorized recipient")
     if envelope.sender == envelope.recipient:
         raise EnvelopeError("Sender and recipient must differ")
@@ -164,10 +179,15 @@ def validate_envelope(
         envelope.assignment_id, envelope.message_id, envelope.idempotency_key,
     )):
         raise EnvelopeError("Required identity fields missing")
-    if not isinstance(envelope.sequence, int) or envelope.sequence < 1:
+    if not isinstance(envelope.sequence, int) or isinstance(envelope.sequence, bool) or envelope.sequence < 1:
         raise EnvelopeError("Sequence must be a positive integer")
-    if envelope.computed_digest() != envelope.payload_digest:
-        raise EnvelopeError("Payload digest mismatch")
+    try:
+        if envelope.computed_digest() != envelope.payload_digest:
+            raise EnvelopeError("Payload digest mismatch")
+    except EnvelopeError:
+        raise
+    except Exception as exc:
+        raise EnvelopeError(f"Digest validation failed: {exc}") from exc
     if envelope.message_id in seen_message_ids:
         raise EnvelopeError("Replay detected: message_id already seen")
     if envelope.idempotency_key in seen_idempotency_keys:
@@ -179,22 +199,28 @@ def validate_envelope(
         raise EnvelopeError("Envelope timestamp too far in the future")
     if now >= envelope.expiry:
         raise EnvelopeError("Envelope expired")
-    if expected_sequence is not None and envelope.sequence != expected_sequence:
+    if envelope.sequence != expected_sequence:
         raise EnvelopeError("Sequence mismatch")
     if envelope.reviewed_sha is not None and not SHA_PATTERN.match(envelope.reviewed_sha):
         raise EnvelopeError("Invalid reviewed SHA format")
 
-    # Authorization matrix: exact sender/role/payload-type mapping required
-    payload = envelope.payload
+    # Authorization matrix including recipient
+    try:
+        payload = envelope.payload
+    except EnvelopeError:
+        raise
+    except Exception as exc:
+        raise EnvelopeError(f"Payload validation failed: {exc}") from exc
     payload_type = payload.get("type")
     if not isinstance(payload_type, str):
         raise EnvelopeError("Payload type missing or invalid")
-    key = (envelope.sender, envelope.role, payload_type)
+    key = (envelope.sender, envelope.role, envelope.recipient, payload_type)
     if key not in AUTHORIZATION_MATRIX:
-        raise EnvelopeError(f"Unauthorized sender/role/type combination: {key}")
+        raise EnvelopeError(f"Unauthorized sender/role/recipient/type combination: {key}")
 
-    # Assignment requires trusted fixture or explicit external authorization
-    if payload_type == "assignment" and not envelope.trusted_fixture:
-        raise EnvelopeError("Assignment requires trusted fixture authorization")
+    # Required payload fields
+    required = REQUIRED_PAYLOAD_FIELDS.get(payload_type, set())
+    if not required.issubset(payload.keys()):
+        raise EnvelopeError(f"Missing required payload fields: {required - payload.keys()}")
 
     return AUTHORIZATION_MATRIX[key]

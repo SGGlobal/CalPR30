@@ -1,25 +1,36 @@
-# BRIDGE-02A — Authenticated Envelope Contract (Offline)
+# BRIDGE-02A — Offline Integrity Contract
 
-Offline, synthetic, non-executing communication contract for SKIPPY↔Jason development handoff.
+Offline, synthetic, non-executing integrity contract for SKIPPY↔Jason development handoff.
+
+**This is an offline integrity contract, not authenticated actor messaging.**
+`payload_digest` is an integrity checksum over the payload. Trusted fixture injection is provided through a separate controlled dependency, not a claim asserted by inbound envelope data. No live secrets.
 
 ## Envelope fields
 - project_id, task_id, checkpoint_id, assignment_id
 - message_id, idempotency_key
 - sender, recipient, role
-- payload, payload_digest (SHA-256)
+- payload, payload_digest (SHA-256 integrity checksum)
 - schema_version, timestamp, expiry, sequence
-- reviewed_sha (optional)
-- chief_authorization (required for assignment dispatch)
+- reviewed_sha (optional, format-validated)
+
+## Authorization matrix
+Exact (sender, role, recipient, type) combinations are required. Unknown combinations are rejected. Assignment requires a trusted fixture dependency injected by the adapter.
 
 ## Fail-closed rules
-- Unauthorized sender/role/recipient rejected.
+- Unauthorized sender/role/recipient/type rejected.
 - Payload digest mismatch rejected.
-- Replay of message_id or idempotency_key rejected.
+- Replay of message_id or idempotency_key rejected (durable, survives restart).
+- Sequence is enforced durably per stream; gaps and reorder are rejected.
 - Expired or future-dated envelopes rejected.
-- Sequence mismatch rejected.
-- Assignment dispatch requires explicit Chief authorization.
 - External transport is disabled (`TRANSPORT_ENABLED = False`).
+- HALT is derived from authoritative state, not a caller flag.
 - No automatic retry or catch-up after HALT.
+
+## SHA evidence preservation
+Implementation and review payloads preserve `sha`. Review payloads preserve `source_verified`. The ledger projection reflects the actual implementation SHA and source-verified status.
+
+## Partial-write policy
+Ledger rejections produce an UNCERTAIN receipt. If the ledger succeeds but the receipt write fails, the outcome is reported as a partial-write error. No cross-database atomicity is claimed. SQLite UPDATE/DELETE triggers are application constraints, not tamper-evident audit security.
 
 ## Security notes
 - Synthetic fixtures only. No credentials. No network.
@@ -29,14 +40,3 @@ Offline, synthetic, non-executing communication contract for SKIPPY↔Jason deve
 - Independent of the pending identity verification halt enforcement branch.
 
 See `skippy/collaboration/authenticated_envelope.py`, `offline_authenticated_adapter.py`, and `tests/test_authenticated_envelope.py`.
-
-## BRIDGE-02A.1 security corrections
-1. **Integrity checksum, not authentication.** payload_digest is documented as an integrity checksum. Trusted fixture injection is modeled separately. No live secrets.
-2. **Authorization matrix.** Exact sender/role/payload-type mapping required. Role spoofing (implementer + assignment) is rejected. Unknown types are rejected.
-3. **Ledger revision.** Derived from the ledger, never from message sequence. Nonzero revision is handled correctly.
-4. **Durable replay protection.** Seen message and idempotency IDs are persisted and checked under a lock. Restart replay is rejected.
-5. **Append-only audit receipts.** UPDATE and DELETE are aborted by triggers. Ledger rejections produce an UNCERTAIN receipt. No cross-database atomicity is claimed.
-6. **Input validation.** Timezone-aware datetimes, positive sequences, expiry after timestamp, SHA format, and clock skew/age bounds are enforced.
-7. **HALT integration.** Explicit halted flag rejects the envelope and records a rejection receipt. No catch-up after HALT.
-
-execution_enabled remains False. External transport remains disabled.

@@ -1,5 +1,5 @@
 """
-SKIPPY AI Collaboration Bridge — BRIDGE-02A.1 Offline Contract Tests.
+SKIPPY AI Collaboration Bridge — BRIDGE-02A.2 Offline Contract Tests.
 
 Synthetic. Offline. Non-executing.
 """
@@ -40,7 +40,6 @@ def _envelope(**overrides):
         timestamp=_now(),
         expiry=_now() + timedelta(hours=1),
         sequence=1,
-        trusted_fixture=True,
     )
     defaults.update(overrides)
     return build_envelope(**defaults)
@@ -48,7 +47,7 @@ def _envelope(**overrides):
 
 def test_legitimate_assignment_accepted(tmp_path):
     ledger = CheckpointLedger(tmp_path / "ledger.db")
-    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db")
+    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True)
     env = _envelope()
     result = adapter.accept(env, now=_now())
     assert result == "accepted"
@@ -56,89 +55,90 @@ def test_legitimate_assignment_accepted(tmp_path):
     assert adapter.TRANSPORT_ENABLED is False
 
 
+def test_assignment_without_trusted_fixture_rejected(tmp_path):
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=False)
+    env = _envelope()
+    with pytest.raises(OfflineAdapterError, match="trusted fixture"):
+        adapter.accept(env, now=_now())
+
+
 def test_replay_rejected_and_durable_after_restart(tmp_path):
     ledger = CheckpointLedger(tmp_path / "ledger.db")
     receipts = tmp_path / "receipts.db"
-    adapter = OfflineAuthenticatedAdapter(ledger, receipts)
+    adapter = OfflineAuthenticatedAdapter(ledger, receipts, trusted_fixture=True)
     env = _envelope()
     adapter.accept(env, now=_now())
-    # Restart
-    adapter2 = OfflineAuthenticatedAdapter(ledger, receipts)
+    adapter2 = OfflineAuthenticatedAdapter(ledger, receipts, trusted_fixture=True)
     with pytest.raises(OfflineAdapterError, match="Replay"):
         adapter2.accept(env, now=_now())
 
 
+def test_sequence_gap_rejected(tmp_path):
+    """Sequence 999 is rejected when expected is 1."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True)
+    env = _envelope(sequence=999)
+    with pytest.raises(OfflineAdapterError, match="Sequence"):
+        adapter.accept(env, now=_now())
+
+
 def test_role_spoofing_assignment_rejected():
-    """Implementer role with assignment type is rejected (no bypass)."""
-    env = _envelope(sender="jason", role="implementer", recipient="skippy")
+    env = _envelope(sender="jason", role="implementer", recipient="skippy", payload={"type": "assignment", "objective": "x"})
     with pytest.raises(EnvelopeError, match="Unauthorized"):
-        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set())
+        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set(), expected_sequence=1)
 
 
 def test_unknown_payload_type_rejected():
     env = _envelope(payload={"type": "unknown_kind"})
     with pytest.raises(EnvelopeError, match="Unauthorized"):
-        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set())
+        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set(), expected_sequence=1)
 
 
 def test_digest_mismatch_rejected():
     env = _envelope()
-    # Reconstruct with different payload_json would fail digest; simulate by checking
     from dataclasses import replace
     tampered = replace(env, payload_digest="0" * 64)
     with pytest.raises(EnvelopeError, match="digest"):
-        validate_envelope(tampered, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set())
+        validate_envelope(tampered, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set(), expected_sequence=1)
 
 
 def test_unauthorized_sender_rejected():
-    env = _envelope(sender="unknown", role="implementer", payload={"type": "implementation"})
+    env = _envelope(sender="unknown", role="implementer", recipient="skippy", payload={"type": "implementation", "sha": "abc1234"})
     with pytest.raises(EnvelopeError, match="Unauthorized sender"):
-        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set())
+        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set(), expected_sequence=1)
 
 
 def test_expired_envelope_rejected():
     env = _envelope(expiry=_now() - timedelta(minutes=1), timestamp=_now() - timedelta(hours=2))
     with pytest.raises(EnvelopeError, match="expired|too old"):
-        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set())
-
-
-def test_assignment_requires_trusted_fixture():
-    env = _envelope(trusted_fixture=False)
-    with pytest.raises(EnvelopeError, match="trusted fixture"):
-        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set())
-
-
-def test_sequence_mismatch_rejected():
-    env = _envelope(sequence=5)
-    with pytest.raises(EnvelopeError, match="Sequence"):
-        validate_envelope(
-            env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set(),
-            expected_sequence=1,
-        )
+        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set(), expected_sequence=1)
 
 
 def test_malformed_identity_rejected():
     env = _envelope(project_id="")
     with pytest.raises(EnvelopeError, match="identity"):
-        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set())
+        validate_envelope(env, now=_now(), seen_message_ids=set(), seen_idempotency_keys=set(), expected_sequence=1)
 
 
 def test_halted_envelope_rejected(tmp_path):
     ledger = CheckpointLedger(tmp_path / "ledger.db")
-    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db")
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, tmp_path / "receipts.db", trusted_fixture=True, halt_check=lambda: True
+    )
     env = _envelope()
     with pytest.raises(OfflineAdapterError, match="HALTED"):
-        adapter.accept(env, now=_now(), halted=True)
+        adapter.accept(env, now=_now())
 
 
-def test_nonzero_ledger_revision_accepted(tmp_path):
-    """Sequence and ledger revision are independent."""
+def test_implementation_preserves_sha(tmp_path):
+    """Implementation SHA is preserved in the ledger payload."""
     ledger = CheckpointLedger(tmp_path / "ledger.db")
-    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db")
-    # First event advances revision
-    env1 = _envelope(message_id="msg-1", idempotency_key="idem-1", sequence=1)
+    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True)
+    # Assignment
+    env1 = _envelope()
     adapter.accept(env1, now=_now())
-    # Second event with sequence 2 uses actual ledger revision
+    # Implementation with SHA
     env2 = _envelope(
         message_id="msg-2",
         idempotency_key="idem-2",
@@ -146,7 +146,31 @@ def test_nonzero_ledger_revision_accepted(tmp_path):
         sender="jason",
         recipient="skippy",
         role="implementer",
-        payload={"type": "implementation"},
+        payload={"type": "implementation", "sha": "abc1234"},
     )
-    result = adapter.accept(env2, now=_now())
-    assert result == "accepted"
+    adapter.accept(env2, now=_now())
+    status = ledger.status("QLA", "bridge-02")
+    assert status.current_sha == "abc1234"
+
+
+def test_review_preserves_sha_and_source_verified(tmp_path):
+    """Review SHA and source_verified are preserved."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    adapter = OfflineAuthenticatedAdapter(ledger, tmp_path / "receipts.db", trusted_fixture=True)
+    env1 = _envelope()
+    adapter.accept(env1, now=_now())
+    env2 = _envelope(
+        message_id="msg-2", idempotency_key="idem-2", sequence=2,
+        sender="jason", recipient="skippy", role="implementer",
+        payload={"type": "implementation", "sha": "abc1234"},
+    )
+    adapter.accept(env2, now=_now())
+    env3 = _envelope(
+        message_id="msg-3", idempotency_key="idem-3", sequence=3,
+        sender="skippy", recipient="jason", role="reviewer",
+        payload={"type": "review", "sha": "abc1234", "source_verified": True},
+    )
+    adapter.accept(env3, now=_now())
+    status = ledger.status("QLA", "bridge-02")
+    assert status.last_reviewed_sha == "abc1234"
+    assert status.state.value == "SOURCE_VERIFIED"
