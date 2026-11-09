@@ -46,28 +46,46 @@ def _envelope(**overrides):
 
 
 def test_live_pending_window_real_admission(tmp_path):
-    """
-    CURRENT FAILURE: No live pause after PENDING commit.
-
-    A real concurrent admission paused after committing PENDING but before
-    its ledger write is not demonstrated. The existing test inserts a
-    synthetic PENDING row directly and never runs accept() on the first
-    adapter. This test attempts a live interleaving and is expected to
-    fail or be incomplete against the current implementation.
-    """
+    """Real concurrent admission paused after PENDING commit blocks a second instance."""
     ledger = CheckpointLedger(tmp_path / "ledger.db")
     receipts = tmp_path / "receipts.db"
     paused = threading.Event()
     release = threading.Event()
     results = []
+    errors = []
 
-    # This test documents the expected behavior. Against current code,
-    # there is no hook to pause after PENDING commit, so the live window
-    # cannot be observed. Mark as expected failure.
-    pytest.skip(
-        "No pause hook after PENDING commit in current implementation. "
-        "Live window cannot be demonstrated without an adapter instrumentation point."
+    adapter1 = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
     )
+
+    def pause_hook():
+        paused.set()
+        release.wait(timeout=5)
+
+    adapter1._after_pending_commit = pause_hook
+
+    def first_admission():
+        try:
+            env = _envelope()
+            adapter1.accept(env, now=_now())
+            results.append("first-ok")
+        except Exception as exc:
+            errors.append(str(exc))
+
+    t1 = threading.Thread(target=first_admission)
+    t1.start()
+    assert paused.wait(timeout=5), "First admission did not reach PENDING commit"
+
+    # Second instance must be blocked while first is paused
+    with pytest.raises(OfflineAdapterError, match="Unresolved|PENDING|Active"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )
+
+    release.set()
+    t1.join(timeout=5)
+    assert "first-ok" in results
+    assert not errors
 
 
 def test_composite_unique_index_does_not_protect_columns(tmp_path):
@@ -163,7 +181,7 @@ def test_duplicate_accepted_receipt_and_sender_mismatch(tmp_path):
         )
     # Current reconciliation collapses duplicates and does not check sender.
     # This should fail closed.
-    with pytest.raises(OfflineAdapterError, match="duplicate|sender|mismatch"):
+    with pytest.raises(OfflineAdapterError, match="Duplicate|duplicate|sender|mismatch"):
         OfflineAuthenticatedAdapter(
             ledger, receipts, trusted_fixture=True, halt_check=lambda: False
         )

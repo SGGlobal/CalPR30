@@ -75,6 +75,10 @@ class OfflineAuthenticatedAdapter:
         # Deterministic reconciliation on startup
         self._reconcile()
 
+    def _after_pending_commit(self) -> None:
+        """Test-only seam. No-op in production. Tests may monkeypatch to pause."""
+        return
+
     def _schema_preflight(self) -> None:
         """
         Fail closed if an existing intent_journal lacks UNIQUE constraints.
@@ -89,15 +93,16 @@ class OfflineAuthenticatedAdapter:
             if not tables:
                 return  # fresh database; CREATE TABLE will apply constraints
             indices = connection.execute("PRAGMA index_list(intent_journal)").fetchall()
-            unique_columns = set()
+            single_column_unique = set()
             for idx in indices:
                 if idx[2]:  # unique
                     info = connection.execute(f"PRAGMA index_info({idx[1]})").fetchall()
-                    for col in info:
-                        unique_columns.add(col[2])
-            if "message_id" not in unique_columns or "idempotency_key" not in unique_columns:
+                    # Only single-column unique indices count
+                    if len(info) == 1:
+                        single_column_unique.add(info[0][2])
+            if "message_id" not in single_column_unique or "idempotency_key" not in single_column_unique:
                 raise OfflineAdapterError(
-                    "Legacy intent_journal lacks UNIQUE constraints on message_id and idempotency_key; migration required"
+                    "Legacy intent_journal lacks independent single-column UNIQUE constraints on message_id and idempotency_key; migration required"
                 )
 
     def _reconcile(self) -> None:
@@ -160,6 +165,13 @@ class OfflineAuthenticatedAdapter:
             accepted_rows = {r[0]: r for r in accepted}
             receipt_rows = {r[0]: r for r in receipts}
             receipt_ids = set(receipt_rows.keys())
+            # Detect duplicate accepted receipts (same message_id appears more than once)
+            receipt_counts: dict[str, int] = {}
+            for r in receipts:
+                receipt_counts[r[0]] = receipt_counts.get(r[0], 0) + 1
+            duplicates = [mid for mid, count in receipt_counts.items() if count > 1]
+            if duplicates:
+                raise OfflineAdapterError(f"Duplicate accepted receipts: {duplicates}")
             seq_map = {r[0]: r[1] for r in seq_rows}
         except Exception as exc:
             if adapter_ledger:
@@ -199,6 +211,14 @@ class OfflineAuthenticatedAdapter:
                 or receipt[5] != journal_row[5]
             ):
                 raise OfflineAdapterError(f"Receipt identity mismatch for {msg_id}")
+            # Sender must match ledger actor
+            if receipt[6] != ledger_row["actor"]:
+                raise OfflineAdapterError(f"Sender mismatch for {msg_id}")
+
+        # Reverse: accepted receipts without matching journal intents
+        for msg_id in receipt_ids:
+            if msg_id not in accepted_rows:
+                raise OfflineAdapterError(f"Extra accepted receipt without journal intent: {msg_id}")
 
         for msg_id in adapter_ledger:
             if msg_id not in accepted_rows:
@@ -532,6 +552,10 @@ class OfflineAuthenticatedAdapter:
                     ),
                 )
                 connection.commit()
+
+                # Test-only pause hook after PENDING commit and before ledger write.
+                # No-op in production. Tests may monkeypatch _after_pending_commit.
+                self._after_pending_commit()
 
                 # Derive actual ledger revision
                 with self.ledger._connect() as ledger_conn:

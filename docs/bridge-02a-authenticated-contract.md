@@ -170,3 +170,17 @@ The current journal schema does not store event_type or actor. To bind them with
 These four corrections are still within Approach A, but the live-window instrumentation and the journal schema addition increase complexity. If the live-window pause cannot be added without a production code change that Skippy rejects, or if the journal migration proves larger than expected, recommend Approach B (single atomic database) rather than continuing to patch.
 
 execution_enabled remains False. External transport remains disabled.
+
+## BRIDGE-02A.10 corrections
+- Schema preflight requires independent single-column UNIQUE constraints on message_id and idempotency_key. Composite indexes are rejected.
+- Bidirectional receipt reconciliation rejects extra accepted receipts, duplicate receipts, and sender mismatches against the ledger actor.
+- Test-only `_after_pending_commit` seam pauses after the real PENDING commit. The live-window test runs a real admission, pauses, and verifies a second instance is blocked.
+- Protected BRIDGE-01 ledger semantics remain unchanged.
+
+### Red-to-green evidence
+- test_composite_unique_index_does_not_protect_columns: FAILED → PASSED
+- test_extra_accepted_receipt_without_journal: FAILED → PASSED
+- test_duplicate_accepted_receipt_and_sender_mismatch: FAILED → PASSED
+- test_live_pending_window_real_admission: SKIPPED → PASSED
+
+execution_enabled remains False. External transport remains disabled.
