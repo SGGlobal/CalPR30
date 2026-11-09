@@ -21,7 +21,7 @@ jobs:
       - name: Restrict workflow_dispatch to approved SHA
         if: github.event_name == 'workflow_dispatch'
         env:
-          APPROVED_SHA: 795d627ae0e74cdc15c1758e659976d1e333a77a
+          APPROVED_SHA: ab93ccbd32d21b2f475ab71b3327cf3398d8c4ed
           FEATURE_BRANCH: feature/bridge-02-authenticated-handoff
         run: |
           set -euo pipefail
