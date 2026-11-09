@@ -144,3 +144,29 @@ execution_enabled remains False. External transport remains disabled.
 - Live-window test verifies that a committed PENDING intent blocks a second adapter instance.
 
 execution_enabled remains False. External transport remains disabled.
+
+## BRIDGE-02A test-first verification package (SHA d01985f)
+
+### Demonstrated current failures
+1. **Live PENDING window** — No pause hook exists after PENDING commit. A real concurrent admission cannot be paused and observed. The existing test inserts a synthetic PENDING row and never runs accept().
+2. **Composite UNIQUE indexes** — Preflight unions columns from any unique index. UNIQUE(message_id, other_col) is accepted even though message_id alone is not uniquely constrained. Duplicate message IDs remain possible.
+3. **Extra accepted receipts** — Reconciliation checks that every ACCEPTED journal intent has a receipt, but does not reject an accepted receipt that has no matching journal intent.
+4. **Duplicate receipts and sender mismatch** — Multiple accepted receipts for the same message ID are collapsed by dict comprehension. Receipt sender is not compared against ledger actor.
+
+### Proposed minimal corrections
+1. Add a test-only instrumentation point (or a barrier callback) that pauses after PENDING commit and before ledger write. Use it in a deterministic live-window test.
+2. Require a single-column UNIQUE index (or primary key) for message_id and for idempotency_key. Reject composite indexes that do not independently constrain each column.
+3. Reject accepted receipts that have no matching ACCEPTED journal intent. Enforce one-to-one cardinality.
+4. Compare receipt.sender against ledger.actor. Reject duplicates and sender mismatches.
+
+### Ledger event type and actor binding
+The current journal schema does not store event_type or actor. To bind them without modifying the protected ledger:
+- Add optional event_type and actor columns to the adapter-owned intent journal (adapter-owned migration only).
+- On reconciliation, compare journal event_type against the ledger event_type and journal actor against the ledger actor and receipt sender.
+- Fail closed if the journal lacks these columns on an existing database (schema preflight).
+- Leave the protected BRIDGE-01 ledger schema unchanged.
+
+### Recommendation
+These four corrections are still within Approach A, but the live-window instrumentation and the journal schema addition increase complexity. If the live-window pause cannot be added without a production code change that Skippy rejects, or if the journal migration proves larger than expected, recommend Approach B (single atomic database) rather than continuing to patch.
+
+execution_enabled remains False. External transport remains disabled.
