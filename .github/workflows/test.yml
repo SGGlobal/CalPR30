@@ -4,6 +4,7 @@ on:
   pull_request:
     branches:
       - phase-8-tradingview-integration
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -14,6 +15,27 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restrict workflow_dispatch to approved SHA
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          APPROVED_SHA: 795d627ae0e74cdc15c1758e659976d1e333a77a
+          FEATURE_BRANCH: feature/bridge-02-authenticated-handoff
+        run: |
+          set -euo pipefail
+          if ! git fetch origin "$APPROVED_SHA"; then
+            echo "Direct SHA fetch failed; fetching known feature branch."
+            git fetch origin "$FEATURE_BRANCH"
+          fi
+          git checkout --detach "$APPROVED_SHA"
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [ "$HEAD_SHA" != "$APPROVED_SHA" ]; then
+            echo "SHA mismatch: $HEAD_SHA != $APPROVED_SHA"
+            exit 1
+          fi
+          echo "Verified approved SHA: $HEAD_SHA"
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
