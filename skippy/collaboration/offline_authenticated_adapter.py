@@ -95,14 +95,16 @@ class OfflineAuthenticatedAdapter:
             indices = connection.execute("PRAGMA index_list(intent_journal)").fetchall()
             single_column_unique = set()
             for idx in indices:
-                if idx[2]:  # unique
+                unique = idx[2]
+                partial = idx[4] if len(idx) > 4 else 0
+                if unique and not partial:  # unique and not partial
                     info = connection.execute(f"PRAGMA index_info({idx[1]})").fetchall()
-                    # Only single-column unique indices count
+                    # Only non-partial single-column unique indices count
                     if len(info) == 1:
                         single_column_unique.add(info[0][2])
             if "message_id" not in single_column_unique or "idempotency_key" not in single_column_unique:
                 raise OfflineAdapterError(
-                    "Legacy intent_journal lacks independent single-column UNIQUE constraints on message_id and idempotency_key; migration required"
+                    "Legacy intent_journal lacks independent non-partial single-column UNIQUE constraints on message_id and idempotency_key; migration required"
                 )
 
     def _reconcile(self) -> None:
@@ -124,8 +126,10 @@ class OfflineAuthenticatedAdapter:
                 msg_id, idem, proj, task, cp, actor, payload_json = row
                 try:
                     payload = json.loads(payload_json) if payload_json else {}
-                except Exception:
-                    payload = {}
+                except Exception as exc:
+                    raise OfflineAdapterError(
+                        f"Malformed ledger payload for {msg_id}: {exc}"
+                    ) from exc
                 if payload.get("adapter_origin") == "bridge-02a":
                     adapter_ledger[msg_id] = {
                         "idempotency_key": idem,
@@ -174,6 +178,12 @@ class OfflineAuthenticatedAdapter:
                 raise OfflineAdapterError(f"Duplicate accepted receipts: {duplicates}")
             seq_map = {r[0]: r[1] for r in seq_rows}
         except Exception as exc:
+            # Fail closed on unreadable journal if the database file exists
+            # (distinguishes corrupt store from fresh empty setup)
+            if self.database_path.exists():
+                raise OfflineAdapterError(
+                    f"Intent journal unreadable: {exc}"
+                ) from exc
             if adapter_ledger:
                 raise OfflineAdapterError(
                     f"Intent journal unreadable and adapter ledger events exist: {exc}"

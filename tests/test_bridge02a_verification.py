@@ -185,3 +185,48 @@ def test_duplicate_accepted_receipt_and_sender_mismatch(tmp_path):
         OfflineAuthenticatedAdapter(
             ledger, receipts, trusted_fixture=True, halt_check=lambda: False
         )
+
+
+def test_partial_unique_index_rejected(tmp_path):
+    """Partial UNIQUE index does not independently guarantee uniqueness."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    with sqlite3.connect(receipts) as c:
+        c.execute(
+            """
+            CREATE TABLE intent_journal (
+                intent_id INTEGER PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                project_id TEXT, task_id TEXT, checkpoint_id TEXT,
+                assignment_id TEXT, sequence INTEGER, payload_digest TEXT,
+                state TEXT, recorded_at TEXT
+            )
+            """
+        )
+        c.execute("CREATE UNIQUE INDEX uq_msg ON intent_journal(message_id) WHERE state = 'ACCEPTED'")
+        c.execute("CREATE UNIQUE INDEX uq_idem ON intent_journal(idempotency_key) WHERE state = 'ACCEPTED'")
+    with pytest.raises(OfflineAdapterError, match="partial|UNIQUE|migration"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )
+
+
+def test_malformed_ledger_payload_rejected(tmp_path):
+    """Malformed ledger payload fails closed instead of being treated as unrelated."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    # Insert a ledger event with malformed payload
+    with ledger._connect() as c:
+        c.execute(
+            """
+            INSERT INTO events (
+                revision, event_type, project_id, task_id, checkpoint_id,
+                actor, payload, message_id, idempotency_key, occurred_at
+            ) VALUES (1, 'ASSIGNMENT_CREATED', 'QLA', 't', 'c', 'chief', '{bad json', 'malformed-msg', 'malformed-idem', '2026-11-08T12:00:00')
+            """
+        )
+    with pytest.raises(OfflineAdapterError, match="Malformed|unreadable"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )

@@ -184,3 +184,15 @@ execution_enabled remains False. External transport remains disabled.
 - test_live_pending_window_real_admission: SKIPPED → PASSED
 
 execution_enabled remains False. External transport remains disabled.
+
+## BRIDGE-02A.11 release-gate corrections
+- Schema preflight rejects partial UNIQUE indexes. Only non-partial single-column UNIQUE constraints on message_id and idempotency_key satisfy the check.
+- Malformed ledger payload JSON fails closed instead of being treated as unrelated.
+- Unreadable intent journal fails closed if the database file exists, distinguishing corrupt stores from a fresh empty setup.
+
+### Deferred commissioning limitations
+- Actor and ledger event-type binding remain partial.
+- Live-window test proves a second constructor fails while the first admission is paused, not a preconstructed second instance's accept.
+- Independent CI is required before any PR or merge.
+
+execution_enabled remains False. External transport remains disabled.
