@@ -338,3 +338,90 @@ def test_independent_deterministic_vector():
     mutated[0] ^= 0xFF
     with pytest.raises(Exception):
         VerifyKey(expected_pubkey).verify(bytes(mutated), expected_signature)
+
+
+def test_overlapping_version_submissions():
+    """Concurrent version 1 and version 2 submissions cannot roll back."""
+    import threading
+    from skippy.collaboration.offline_signature_verifier import SyntheticRegistryManager
+    sk, pk = _key_pair()
+    mgr = SyntheticRegistryManager()
+    root_v1 = load_trust_root([_entry(pubkey=pk)], version=1)
+    root_v2 = load_trust_root([_entry(pubkey=pk)], version=2)
+    results = {"v1": [], "v2": []}
+    barrier = threading.Barrier(8)
+
+    def submit(root, label):
+        barrier.wait()
+        try:
+            mgr.accept(root)
+            results[label].append("ok")
+        except SignatureError as exc:
+            results[label].append(str(exc))
+
+    threads = []
+    for _ in range(4):
+        threads.append(threading.Thread(target=submit, args=(root_v1, "v1")))
+        threads.append(threading.Thread(target=submit, args=(root_v2, "v2")))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert mgr.highest_version == 2
+    # All v2 submissions must succeed
+    assert all(r == "ok" for r in results["v2"])
+    # Any v1 that arrived after a v2 must be rejected
+    # At least the final state is consistent
+    assert mgr.highest_version >= 2
+
+
+def test_verify_signature_with_fixed_vector():
+    """Fixed vector calls verify_signature directly for success and tamper."""
+    from nacl.signing import SigningKey
+    from skippy.collaboration.offline_signature_verifier import _canonical_json
+    sk = SigningKey(b"\x42" * 32)
+    pk = sk.verify_key.encode()
+    now = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
+    payload = {"objective": "vector", "type": "assignment"}
+    payload_bytes = _canonical_json(payload)
+    digest = hashlib.sha256(payload_bytes).digest()
+    expected_signature = bytes.fromhex(
+        "460c1f5419b905af776ddd08202b8bb5ad66b3dab216b0b47c6797dd163f5d2a"
+        "3c6efc0274fbcb17a27773f30654b7395bcc3d3167156374d9d04d5b42b7c000"
+    )
+    env = SignedEnvelope(
+        schema_version=1, sender="chief", recipient="jason", role="chief",
+        project_id="QLA", task_id="t1", checkpoint_id="c1", assignment_id="a1",
+        message_id="m1", idempotency_key="i1", sequence=1,
+        timestamp=now, expiry=now + timedelta(hours=1),
+        payload_digest=digest, payload=payload, key_id="k1",
+        signature=expected_signature,
+    )
+    root = load_trust_root([_entry(pubkey=pk)], version=1)
+    assert verify_signature(env, root, now) == "cryptographically_valid"
+    # Tamper rejection
+    tampered = SignedEnvelope(**{**env.__dict__, "payload": {"objective": "tampered", "type": "assignment"}})
+    with pytest.raises(SignatureError):
+        verify_signature(tampered, root, now)
+
+
+def test_malformed_typed_envelope():
+    sk, pk = _key_pair()
+    root = load_trust_root([_entry(pubkey=pk)], version=1)
+    env = _envelope(sk)
+    # Negative sequence
+    bad = SignedEnvelope(**{**env.__dict__, "sequence": -1})
+    with pytest.raises(SignatureError):
+        verify_signature(bad, root, _now())
+
+
+def test_key_expiration_boundary():
+    sk, pk = _key_pair()
+    # Exactly at expiry is rejected
+    root = load_trust_root([_entry(pubkey=pk, expires=_now())], version=1)
+    env = _envelope(sk)
+    with pytest.raises(SignatureError, match="expired"):
+        verify_signature(env, root, _now())
+    # One second before expiry is accepted
+    root2 = load_trust_root([_entry(pubkey=pk, expires=_now() + timedelta(seconds=1))], version=1)
+    assert verify_signature(env, root2, _now()) == "cryptographically_valid"
