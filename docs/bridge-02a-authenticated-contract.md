@@ -119,3 +119,20 @@ execution_enabled remains False. External transport remains disabled.
 - Protected BRIDGE-01 ledger semantics remain unchanged.
 
 execution_enabled remains False. External transport remains disabled.
+
+## BRIDGE-02A.9 offline integrity closure
+- Bidirectional exact identity reconciliation compares message ID, idempotency key, project, task, checkpoint, assignment, and payload digest between the journal and adapter-originated ledger events. Fail closed on mismatch.
+- Every ACCEPTED journal entry must have a corresponding accepted audit receipt. Sequence state is reconstructed from accepted journal history per stream and compared against sequence_state. Fail closed on gap or mismatch.
+- Schema preflight inspects actual SQLite indices. An existing intent_journal without UNIQUE constraints fails closed with a migration-required message. No automatic mutation of protected state.
+- Deterministic tests cover identity mismatch, missing accepted receipt, and legacy schema without uniqueness.
+
+### Acceptance matrix status
+1. Matching message ID, conflicting idempotency key — PASS (identity comparison).
+2. Matching message ID, conflicting assignment identity — PASS (identity comparison).
+3. Matching message ID, conflicting payload digest — PASS (identity comparison).
+4. Missing accepted receipt — PASS (receipt verification).
+5. Corrupted sequence state — PASS (sequence reconstruction).
+6. Existing journal without UNIQUE constraints — PASS (schema preflight).
+7. Concurrent admissions during PENDING-to-ledger window — PASS (admission-time gate; live-window test present).
+
+execution_enabled remains False. External transport remains disabled.

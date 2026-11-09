@@ -71,8 +71,30 @@ class OfflineAuthenticatedAdapter:
         self._halt_check = halt_check
         self._lock = threading.Lock()
         self._init_receipts()
+        self._schema_preflight()
         # Deterministic reconciliation on startup
         self._reconcile()
+
+    def _schema_preflight(self) -> None:
+        """
+        Fail closed if an existing intent_journal lacks UNIQUE constraints.
+
+        CREATE TABLE IF NOT EXISTS does not migrate an old table. Inspect
+        actual indices and fail closed if uniqueness is missing.
+        """
+        with sqlite3.connect(self.database_path) as connection:
+            tables = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='intent_journal'"
+            ).fetchall()
+            if not tables:
+                return  # fresh database; CREATE TABLE will apply constraints
+            indices = connection.execute("PRAGMA index_list(intent_journal)").fetchall()
+            unique_indices = [idx for idx in indices if idx[2]]  # unique flag
+            # Expect at least two unique indices (message_id, idempotency_key)
+            if len(unique_indices) < 2:
+                raise OfflineAdapterError(
+                    "Legacy intent_journal lacks UNIQUE constraints; migration required"
+                )
 
     def _reconcile(self) -> None:
         """
@@ -86,16 +108,25 @@ class OfflineAuthenticatedAdapter:
         try:
             with self.ledger._connect() as ledger_conn:
                 ledger_events = ledger_conn.execute(
-                    "SELECT message_id, payload FROM events ORDER BY revision"
+                    "SELECT message_id, idempotency_key, project_id, task_id, checkpoint_id, actor, payload FROM events ORDER BY revision"
                 ).fetchall()
-            adapter_ledger_ids = set()
-            for msg_id, payload_json in ledger_events:
+            adapter_ledger = {}
+            for row in ledger_events:
+                msg_id, idem, proj, task, cp, actor, payload_json = row
                 try:
                     payload = json.loads(payload_json) if payload_json else {}
                 except Exception:
                     payload = {}
                 if payload.get("adapter_origin") == "bridge-02a":
-                    adapter_ledger_ids.add(msg_id)
+                    adapter_ledger[msg_id] = {
+                        "idempotency_key": idem,
+                        "project_id": proj,
+                        "task_id": task,
+                        "checkpoint_id": cp,
+                        "actor": actor,
+                        "assignment_id": payload.get("assignment_id"),
+                        "digest": payload.get("digest"),
+                    }
         except Exception as exc:
             raise OfflineAdapterError(f"Ledger unreadable during reconciliation: {exc}") from exc
 
@@ -107,15 +138,22 @@ class OfflineAuthenticatedAdapter:
                 accepted = connection.execute(
                     """
                     SELECT message_id, idempotency_key, project_id, task_id,
-                           checkpoint_id, assignment_id, payload_digest
+                           checkpoint_id, assignment_id, payload_digest, sequence
                     FROM intent_journal WHERE state = 'ACCEPTED'
                     """
                 ).fetchall()
+                receipts = connection.execute(
+                    "SELECT message_id FROM audit_receipts WHERE outcome = 'accepted'"
+                ).fetchall()
+                seq_rows = connection.execute(
+                    "SELECT stream_key, next_sequence FROM sequence_state"
+                ).fetchall()
             unresolved_ids = {r[0] for r in unresolved}
             accepted_rows = {r[0]: r for r in accepted}
-            accepted_ids = set(accepted_rows.keys())
+            receipt_ids = {r[0] for r in receipts}
+            seq_map = {r[0]: r[1] for r in seq_rows}
         except Exception as exc:
-            if adapter_ledger_ids:
+            if adapter_ledger:
                 raise OfflineAdapterError(
                     f"Intent journal unreadable and adapter ledger events exist: {exc}"
                 ) from exc
@@ -126,18 +164,40 @@ class OfflineAuthenticatedAdapter:
             raise OfflineAdapterError(
                 f"Unresolved intent requires manual reconciliation: {sorted(unresolved_ids)}"
             )
-        # ACCEPTED without matching adapter-originated ledger event
-        unmatched_accepted = accepted_ids - adapter_ledger_ids
-        if unmatched_accepted:
-            raise OfflineAdapterError(
-                f"ACCEPTED intent without matching ledger event: {sorted(unmatched_accepted)}"
-            )
-        # Adapter-originated ledger event without ACCEPTED intent
-        unmatched_ledger = adapter_ledger_ids - accepted_ids
-        if unmatched_ledger:
-            raise OfflineAdapterError(
-                f"Adapter ledger event without ACCEPTED intent: {sorted(unmatched_ledger)}"
-            )
+
+        # Bidirectional exact identity comparison
+        for msg_id, journal_row in accepted_rows.items():
+            if msg_id not in adapter_ledger:
+                raise OfflineAdapterError(f"ACCEPTED intent without matching ledger event: {msg_id}")
+            ledger_row = adapter_ledger[msg_id]
+            if (
+                journal_row[1] != ledger_row["idempotency_key"]
+                or journal_row[2] != ledger_row["project_id"]
+                or journal_row[3] != ledger_row["task_id"]
+                or journal_row[4] != ledger_row["checkpoint_id"]
+                or journal_row[5] != ledger_row["assignment_id"]
+                or journal_row[6] != ledger_row["digest"]
+            ):
+                raise OfflineAdapterError(f"Identity mismatch for {msg_id}")
+            if msg_id not in receipt_ids:
+                raise OfflineAdapterError(f"Missing accepted receipt for {msg_id}")
+
+        for msg_id in adapter_ledger:
+            if msg_id not in accepted_rows:
+                raise OfflineAdapterError(f"Adapter ledger event without ACCEPTED intent: {msg_id}")
+
+        # Sequence reconstruction per stream
+        streams: dict[str, int] = {}
+        for row in accepted_rows.values():
+            stream = f"{row[2]}:{row[3]}"
+            seq = row[7]
+            if stream in streams and seq != streams[stream] + 1:
+                raise OfflineAdapterError(f"Sequence gap in stream {stream}")
+            streams[stream] = seq
+        for stream, max_seq in streams.items():
+            expected = seq_map.get(stream)
+            if expected is not None and expected != max_seq + 1:
+                raise OfflineAdapterError(f"Sequence state mismatch for {stream}")
 
     def _init_receipts(self):
         with sqlite3.connect(self.database_path) as connection:

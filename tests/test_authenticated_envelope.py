@@ -442,3 +442,66 @@ def test_active_pending_blocks_second_instance(tmp_path):
         OfflineAuthenticatedAdapter(
             ledger, receipts, trusted_fixture=True, halt_check=lambda: False
         )
+
+
+def test_identity_mismatch_digest_rejected(tmp_path):
+    """Matching message ID with conflicting digest fails reconciliation."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    env = _envelope()
+    adapter.accept(env, now=_now())
+    # Tamper with the journal digest
+    import sqlite3
+    with sqlite3.connect(receipts) as c:
+        c.execute("UPDATE intent_journal SET payload_digest = 'tampered' WHERE message_id = 'msg-1'")
+    with pytest.raises(OfflineAdapterError, match="Identity mismatch|mismatch"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )
+
+
+def test_missing_accepted_receipt_rejected(tmp_path):
+    """ACCEPTED journal without accepted receipt fails reconciliation."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    env = _envelope()
+    adapter.accept(env, now=_now())
+    import sqlite3
+    # Bypass append-only trigger by dropping and recreating without the receipt
+    with sqlite3.connect(receipts) as c:
+        c.execute("DROP TRIGGER IF EXISTS audit_receipts_no_delete")
+        c.execute("DELETE FROM audit_receipts WHERE outcome = 'accepted'")
+    with pytest.raises(OfflineAdapterError, match="Missing accepted receipt"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )
+
+
+def test_legacy_schema_without_unique_rejected(tmp_path):
+    """Existing journal without UNIQUE constraints fails preflight."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    import sqlite3
+    with sqlite3.connect(receipts) as c:
+        c.execute(
+            """
+            CREATE TABLE intent_journal (
+                intent_id INTEGER PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                idempotency_key TEXT NOT NULL,
+                project_id TEXT, task_id TEXT, checkpoint_id TEXT,
+                assignment_id TEXT, sequence INTEGER, payload_digest TEXT,
+                state TEXT, recorded_at TEXT
+            )
+            """
+        )
+    with pytest.raises(OfflineAdapterError, match="UNIQUE|migration"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )
