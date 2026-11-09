@@ -136,3 +136,11 @@ execution_enabled remains False. External transport remains disabled.
 7. Concurrent admissions during PENDING-to-ledger window — PASS (admission-time gate; live-window test present).
 
 execution_enabled remains False. External transport remains disabled.
+
+## BRIDGE-02A.9 closure corrections
+- Sequence reconstruction is deterministic. Accepted journal rows are sorted per stream. First sequence must be 1. Contiguous sequences are required. sequence_state must exist and equal max+1. Orphan sequence_state is rejected.
+- Schema preflight verifies that message_id and idempotency_key are uniquely constrained via PRAGMA index_info, not merely that two unique indices exist.
+- Receipt reconciliation is bidirectional and compares identity fields (idempotency key, project, task, checkpoint, assignment) between the journal and the accepted receipt.
+- Live-window test verifies that a committed PENDING intent blocks a second adapter instance.
+
+execution_enabled remains False. External transport remains disabled.

@@ -272,7 +272,7 @@ def test_simultaneous_concurrent_instances(tmp_path):
     # Exactly one should succeed
     assert len(results) == 1
     assert len(errors) == 1
-    assert "Sequence" in errors[0] or "Replay" in errors[0] or "Fail-stop" in errors[0] or "PENDING" in errors[0] or "Unresolved" in errors[0]
+    assert "Sequence" in errors[0] or "Replay" in errors[0] or "Fail-stop" in errors[0] or "PENDING" in errors[0] or "Unresolved" in errors[0] or "Active" in errors[0]
 
 
 def test_rollback_does_not_persist_accepted_on_failure(tmp_path, monkeypatch):
@@ -502,6 +502,55 @@ def test_legacy_schema_without_unique_rejected(tmp_path):
             """
         )
     with pytest.raises(OfflineAdapterError, match="UNIQUE|migration"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )
+
+
+def test_missing_sequence_state_rejected(tmp_path):
+    """Missing sequence_state for a stream with accepted entries fails closed."""
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    env = _envelope()
+    adapter.accept(env, now=_now())
+    import sqlite3
+    with sqlite3.connect(receipts) as c:
+        c.execute("DELETE FROM sequence_state")
+    with pytest.raises(OfflineAdapterError, match="Sequence state mismatch|missing"):
+        OfflineAuthenticatedAdapter(
+            ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+        )
+
+
+def test_live_pending_window_blocks_second(tmp_path):
+    """Second admission is blocked while first has committed PENDING but not yet written ledger."""
+    import threading
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    receipts = tmp_path / "receipts.db"
+    barrier = threading.Event()
+    results = []
+
+    # Insert a PENDING intent directly to simulate the committed-PENDING window
+    adapter = OfflineAuthenticatedAdapter(
+        ledger, receipts, trusted_fixture=True, halt_check=lambda: False
+    )
+    import sqlite3
+    with sqlite3.connect(receipts) as c:
+        c.execute(
+            """
+            INSERT INTO intent_journal (
+                message_id, idempotency_key, project_id, task_id,
+                checkpoint_id, assignment_id, sequence, payload_digest,
+                state, recorded_at
+            ) VALUES ('window-msg', 'window-idem', 'QLA', 't', 'c', 'a', 1, 'd', 'PENDING', '2026-11-08T12:00:00')
+            """
+        )
+
+    # Second instance must be blocked
+    with pytest.raises(OfflineAdapterError, match="Unresolved|PENDING|Active"):
         OfflineAuthenticatedAdapter(
             ledger, receipts, trusted_fixture=True, halt_check=lambda: False
         )

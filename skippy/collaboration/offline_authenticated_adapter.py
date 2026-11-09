@@ -89,11 +89,15 @@ class OfflineAuthenticatedAdapter:
             if not tables:
                 return  # fresh database; CREATE TABLE will apply constraints
             indices = connection.execute("PRAGMA index_list(intent_journal)").fetchall()
-            unique_indices = [idx for idx in indices if idx[2]]  # unique flag
-            # Expect at least two unique indices (message_id, idempotency_key)
-            if len(unique_indices) < 2:
+            unique_columns = set()
+            for idx in indices:
+                if idx[2]:  # unique
+                    info = connection.execute(f"PRAGMA index_info({idx[1]})").fetchall()
+                    for col in info:
+                        unique_columns.add(col[2])
+            if "message_id" not in unique_columns or "idempotency_key" not in unique_columns:
                 raise OfflineAdapterError(
-                    "Legacy intent_journal lacks UNIQUE constraints; migration required"
+                    "Legacy intent_journal lacks UNIQUE constraints on message_id and idempotency_key; migration required"
                 )
 
     def _reconcile(self) -> None:
@@ -143,14 +147,19 @@ class OfflineAuthenticatedAdapter:
                     """
                 ).fetchall()
                 receipts = connection.execute(
-                    "SELECT message_id FROM audit_receipts WHERE outcome = 'accepted'"
+                    """
+                    SELECT message_id, idempotency_key, project_id, task_id,
+                           checkpoint_id, assignment_id, sender
+                    FROM audit_receipts WHERE outcome = 'accepted'
+                    """
                 ).fetchall()
                 seq_rows = connection.execute(
                     "SELECT stream_key, next_sequence FROM sequence_state"
                 ).fetchall()
             unresolved_ids = {r[0] for r in unresolved}
             accepted_rows = {r[0]: r for r in accepted}
-            receipt_ids = {r[0] for r in receipts}
+            receipt_rows = {r[0]: r for r in receipts}
+            receipt_ids = set(receipt_rows.keys())
             seq_map = {r[0]: r[1] for r in seq_rows}
         except Exception as exc:
             if adapter_ledger:
@@ -181,23 +190,40 @@ class OfflineAuthenticatedAdapter:
                 raise OfflineAdapterError(f"Identity mismatch for {msg_id}")
             if msg_id not in receipt_ids:
                 raise OfflineAdapterError(f"Missing accepted receipt for {msg_id}")
+            receipt = receipt_rows[msg_id]
+            if (
+                receipt[1] != journal_row[1]
+                or receipt[2] != journal_row[2]
+                or receipt[3] != journal_row[3]
+                or receipt[4] != journal_row[4]
+                or receipt[5] != journal_row[5]
+            ):
+                raise OfflineAdapterError(f"Receipt identity mismatch for {msg_id}")
 
         for msg_id in adapter_ledger:
             if msg_id not in accepted_rows:
                 raise OfflineAdapterError(f"Adapter ledger event without ACCEPTED intent: {msg_id}")
 
-        # Sequence reconstruction per stream
-        streams: dict[str, int] = {}
+        # Sequence reconstruction per stream (deterministic, ordered)
+        from collections import defaultdict
+        streams: dict[str, list[int]] = defaultdict(list)
         for row in accepted_rows.values():
             stream = f"{row[2]}:{row[3]}"
-            seq = row[7]
-            if stream in streams and seq != streams[stream] + 1:
-                raise OfflineAdapterError(f"Sequence gap in stream {stream}")
-            streams[stream] = seq
-        for stream, max_seq in streams.items():
+            streams[stream].append(row[7])
+        for stream, seqs in streams.items():
+            seqs.sort()
+            if seqs[0] != 1:
+                raise OfflineAdapterError(f"Sequence does not start at 1 for {stream}")
+            for i, s in enumerate(seqs):
+                if s != i + 1:
+                    raise OfflineAdapterError(f"Sequence gap in stream {stream}")
             expected = seq_map.get(stream)
-            if expected is not None and expected != max_seq + 1:
-                raise OfflineAdapterError(f"Sequence state mismatch for {stream}")
+            if expected is None or expected != seqs[-1] + 1:
+                raise OfflineAdapterError(f"Sequence state mismatch or missing for {stream}")
+        # Orphan sequence state
+        for stream in seq_map:
+            if stream not in streams:
+                raise OfflineAdapterError(f"Orphan sequence state for {stream}")
 
     def _init_receipts(self):
         with sqlite3.connect(self.database_path) as connection:
