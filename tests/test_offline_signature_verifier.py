@@ -1,5 +1,6 @@
 """BRIDGE-02B.1 offline signature verification tests."""
 
+import hashlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -49,11 +50,13 @@ def _envelope(signing_key, **overrides):
         sequence=1,
         timestamp=_now(),
         expiry=_now() + timedelta(hours=1),
-        payload_digest=b"\xab" * 32,
         payload={"type": "assignment", "objective": "test"},
         key_id="k1",
     )
     defaults.update(overrides)
+    from skippy.collaboration.offline_signature_verifier import _canonical_json
+    payload_bytes = _canonical_json(defaults["payload"])
+    defaults["payload_digest"] = hashlib.sha256(payload_bytes).digest()
     env = SignedEnvelope(**defaults, signature=b"\x00" * 64)
     from skippy.collaboration.offline_signature_verifier import canonical_bytes
     sig = signing_key.sign(canonical_bytes(env)).signature
@@ -72,7 +75,7 @@ def test_tampered_payload_rejected():
     root = load_trust_root([_entry(pubkey=pk)], version=1)
     env = _envelope(sk)
     tampered = SignedEnvelope(**{**env.__dict__, "payload": {"type": "assignment", "objective": "tampered"}})
-    with pytest.raises(SignatureError, match="Invalid signature"):
+    with pytest.raises(SignatureError, match="digest|Invalid signature"):
         verify_signature(tampered, root, _now())
 
 
@@ -137,9 +140,8 @@ def test_wrong_role_rejected():
 def test_reviewed_sha_rejected():
     sk, pk = _key_pair()
     root = load_trust_root([_entry(pubkey=pk)], version=1)
-    env = _envelope(sk, payload={"type": "assignment", "reviewed_sha": "abc"})
     with pytest.raises(SignatureError, match="reviewed_sha"):
-        verify_signature(env, root, _now())
+        _envelope(sk, payload={"type": "assignment", "reviewed_sha": "abc"})
 
 
 def test_duplicate_key_id_rejected():
@@ -174,4 +176,78 @@ def test_schema_version_rejected():
     root = load_trust_root([_entry(pubkey=pk)], version=1)
     env = _envelope(sk, schema_version=2)
     with pytest.raises(SignatureError, match="schema"):
+        verify_signature(env, root, _now())
+
+
+def test_digest_mismatch_rejected():
+    sk, pk = _key_pair()
+    root = load_trust_root([_entry(pubkey=pk)], version=1)
+    env = _envelope(sk)
+    bad = SignedEnvelope(**{**env.__dict__, "payload_digest": b"\xff" * 32})
+    with pytest.raises(SignatureError, match="digest"):
+        verify_signature(bad, root, _now())
+
+
+def test_fractional_timestamp_rejected():
+    sk, pk = _key_pair()
+    root = load_trust_root([_entry(pubkey=pk)], version=1)
+    frac = _now().replace(microsecond=123456)
+    with pytest.raises(SignatureError, match="fractional"):
+        _envelope(sk, timestamp=frac)
+
+
+def test_empty_required_field_rejected():
+    sk, pk = _key_pair()
+    root = load_trust_root([_entry(pubkey=pk)], version=1)
+    env = _envelope(sk)
+    bad = SignedEnvelope(**{**env.__dict__, "sender": ""})
+    with pytest.raises(SignatureError, match="empty"):
+        verify_signature(bad, root, _now())
+
+
+def test_nested_reviewed_sha_rejected():
+    sk, pk = _key_pair()
+    root = load_trust_root([_entry(pubkey=pk)], version=1)
+    with pytest.raises(SignatureError, match="reviewed_sha"):
+        _envelope(sk, payload={"type": "assignment", "meta": {"reviewed_sha": "abc"}})
+
+
+def test_wrong_actor_rejected():
+    sk, pk = _key_pair()
+    root = load_trust_root([_entry(pubkey=pk, actor="chief")], version=1)
+    env = _envelope(sk, sender="jason")
+    with pytest.raises(SignatureError, match="Actor"):
+        verify_signature(env, root, _now())
+
+
+def test_float_in_payload_rejected():
+    sk, pk = _key_pair()
+    with pytest.raises(SignatureError, match="Float"):
+        _envelope(sk, payload={"type": "assignment", "value": 1.5})
+
+
+def test_non_nfc_string_rejected():
+    sk, pk = _key_pair()
+    # e + combining acute = non-NFC
+    non_nfc = "e\u0301"
+    with pytest.raises(SignatureError, match="NFC"):
+        _envelope(sk, payload={"type": "assignment", "note": non_nfc})
+
+
+def test_registry_version_rollback_rejected():
+    from skippy.collaboration.offline_signature_verifier import SyntheticRegistryManager
+    sk, pk = _key_pair()
+    mgr = SyntheticRegistryManager()
+    root_v2 = load_trust_root([_entry(pubkey=pk)], version=2)
+    mgr.accept(root_v2)
+    root_v1 = load_trust_root([_entry(pubkey=pk)], version=1)
+    with pytest.raises(SignatureError, match="rollback"):
+        mgr.accept(root_v1)
+
+
+def test_key_expiry_equality_rejected():
+    sk, pk = _key_pair()
+    root = load_trust_root([_entry(pubkey=pk, expires=_now())], version=1)
+    env = _envelope(sk)
+    with pytest.raises(SignatureError, match="expired"):
         verify_signature(env, root, _now())

@@ -12,6 +12,7 @@ execution_enabled remains False. External transport remains disabled.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import unicodedata
 from dataclasses import dataclass
@@ -36,8 +37,8 @@ class KeyEntry:
     key_id: str
     actor_id: str
     permitted_role: str
-    public_key: bytes  # 32 bytes
-    state: str  # active | revoked | expired
+    public_key: bytes
+    state: str
     expires_at: datetime
 
 
@@ -63,10 +64,10 @@ class SignedEnvelope:
     sequence: int
     timestamp: datetime
     expiry: datetime
-    payload_digest: bytes  # 32 bytes
+    payload_digest: bytes
     payload: dict
     key_id: str
-    signature: bytes  # 64 bytes
+    signature: bytes
 
 
 def _require_nfc(value: str, field: str) -> None:
@@ -75,12 +76,20 @@ def _require_nfc(value: str, field: str) -> None:
 
 
 def _canonical_json(payload: dict) -> bytes:
-    """RFC 8785 constrained profile: sorted keys, no whitespace, integers only."""
-    def check(obj: Any) -> Any:
+    """Restricted canonical JSON: sorted keys, no whitespace, integers only, NFC."""
+    def check(obj: Any, path: str = "") -> Any:
         if isinstance(obj, dict):
-            return {k: check(v) for k, v in obj.items()}
+            if "reviewed_sha" in obj:
+                raise SignatureError(f"reviewed_sha not permitted at {path or 'root'}")
+            result = {}
+            for k, v in obj.items():
+                if not isinstance(k, str):
+                    raise SignatureError(f"Non-string key at {path}")
+                _require_nfc(k, f"key {path}.{k}")
+                result[k] = check(v, f"{path}.{k}")
+            return result
         if isinstance(obj, list):
-            return [check(v) for v in obj]
+            return [check(v, f"{path}[{i}]") for i, v in enumerate(obj)]
         if isinstance(obj, bool):
             raise SignatureError("Boolean not permitted in canonical JSON")
         if isinstance(obj, float):
@@ -90,7 +99,7 @@ def _canonical_json(payload: dict) -> bytes:
                 raise SignatureError("Integer exceeds JS-safe range")
             return obj
         if isinstance(obj, str):
-            _require_nfc(obj, "payload")
+            _require_nfc(obj, path or "payload")
             return obj
         raise SignatureError(f"Unsupported type in payload: {type(obj)}")
 
@@ -109,6 +118,8 @@ def _encode_str(value: str) -> bytes:
 def _encode_timestamp(dt: datetime) -> bytes:
     if dt.tzinfo is None or dt.utcoffset() != timedelta(0):
         raise SignatureError("Timestamp must be UTC")
+    if dt.microsecond != 0:
+        raise SignatureError("Timestamp must not have fractional seconds")
     text = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     if len(text) != 20:
         raise SignatureError("Timestamp must be exactly 20 bytes")
@@ -144,6 +155,8 @@ def canonical_bytes(env: SignedEnvelope) -> bytes:
 
 def load_trust_root(keys: list[KeyEntry], version: int) -> TrustRoot:
     """Validate and freeze a synthetic trust root. Fail closed on conflicts."""
+    if version < 1:
+        raise SignatureError("Registry version must be >= 1")
     seen_ids: set[str] = set()
     actor_roles: dict[str, str] = {}
     for entry in keys:
@@ -154,10 +167,36 @@ def load_trust_root(keys: list[KeyEntry], version: int) -> TrustRoot:
             raise SignatureError(f"Invalid public key length for {entry.key_id}")
         if entry.state not in ("active", "revoked", "expired"):
             raise SignatureError(f"Invalid state for {entry.key_id}")
+        if entry.expires_at.tzinfo is None:
+            raise SignatureError(f"Key expiry must be timezone-aware for {entry.key_id}")
         if entry.actor_id in actor_roles and actor_roles[entry.actor_id] != entry.permitted_role:
             raise SignatureError(f"Conflicting roles for actor {entry.actor_id}")
         actor_roles[entry.actor_id] = entry.permitted_role
     return TrustRoot(version=version, keys=tuple(keys))
+
+
+class SyntheticRegistryManager:
+    """
+    Process-local version tracker for synthetic trust roots.
+
+    Demonstrative only. Does not survive process restart.
+    Not a durable operational rollback defense.
+    """
+
+    def __init__(self) -> None:
+        self._highest_version: int = 0
+
+    def accept(self, root: TrustRoot) -> TrustRoot:
+        if root.version < self._highest_version:
+            raise SignatureError(
+                f"Registry version rollback: {root.version} < {self._highest_version}"
+            )
+        self._highest_version = max(self._highest_version, root.version)
+        return root
+
+    @property
+    def highest_version(self) -> int:
+        return self._highest_version
 
 
 def verify_signature(
@@ -173,14 +212,21 @@ def verify_signature(
     """
     if env.schema_version != 1:
         raise SignatureError("Unsupported schema version")
-    if "reviewed_sha" in env.payload:
-        raise SignatureError("reviewed_sha not permitted in schema version 1")
+    for field_name in ("sender", "recipient", "role", "project_id", "task_id",
+                       "checkpoint_id", "assignment_id", "message_id",
+                       "idempotency_key", "key_id"):
+        if not getattr(env, field_name):
+            raise SignatureError(f"Required field empty: {field_name}")
+    if not (0 <= env.sequence <= 2**64 - 1):
+        raise SignatureError("Sequence out of uint64 range")
+
+    payload_bytes = _canonical_json(env.payload)
+    expected_digest = hashlib.sha256(payload_bytes).digest()
+    if env.payload_digest != expected_digest:
+        raise SignatureError("payload_digest does not match canonical payload")
     if len(env.signature) != 64:
         raise SignatureError("Signature must be exactly 64 bytes")
-    if len(env.payload_digest) != 32:
-        raise SignatureError("payload_digest must be exactly 32 bytes")
 
-    # Time checks (exclusive boundaries)
     if now - env.timestamp >= MAX_AGE:
         raise SignatureError("Message exceeds maximum age")
     if env.timestamp - now >= MAX_FUTURE_SKEW:
@@ -188,7 +234,6 @@ def verify_signature(
     if now >= env.expiry:
         raise SignatureError("Message expired")
 
-    # Registry lookup
     entry = next((k for k in trust_root.keys if k.key_id == env.key_id), None)
     if entry is None:
         raise SignatureError(f"Unknown key_id: {env.key_id}")
@@ -201,7 +246,6 @@ def verify_signature(
     if entry.permitted_role != env.role:
         raise SignatureError("Role mismatch")
 
-    # Signature verification
     try:
         signed = canonical_bytes(env)
         VerifyKey(entry.public_key).verify(signed, env.signature)

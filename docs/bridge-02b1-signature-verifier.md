@@ -23,3 +23,12 @@ Does not authorize, admit, or enforce durable replay.
 - execution_enabled remains False.
 
 Frozen BRIDGE-02A baseline: aadc12e40d841a60c10900ae29ed1b9f927914c7
+
+## BRIDGE-02B.1 security corrections
+- payload_digest is verified against sha256 of the canonical payload bytes.
+- Restricted canonical JSON profile: sorted keys, no whitespace, integers only, recursive NFC checks on keys and values. Not full RFC 8785.
+- Timestamps with fractional seconds are rejected. Required fields must be non-empty. Nested reviewed_sha is rejected.
+- SyntheticRegistryManager provides process-local version rollback detection. Demonstrative only; does not survive restart.
+- Raw signed-wire decoding is deferred. The verifier operates on constructed SignedEnvelope objects.
+
+execution_enabled remains False. External transport remains disabled.
