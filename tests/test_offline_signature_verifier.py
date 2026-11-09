@@ -251,3 +251,90 @@ def test_key_expiry_equality_rejected():
     env = _envelope(sk)
     with pytest.raises(SignatureError, match="expired"):
         verify_signature(env, root, _now())
+
+
+def test_non_integer_version_rejected():
+    sk, pk = _key_pair()
+    with pytest.raises(SignatureError, match="version"):
+        load_trust_root([_entry(pubkey=pk)], version=True)
+    with pytest.raises(SignatureError, match="version"):
+        load_trust_root([_entry(pubkey=pk)], version=1.0)
+
+
+def test_naive_now_rejected():
+    sk, pk = _key_pair()
+    root = load_trust_root([_entry(pubkey=pk)], version=1)
+    env = _envelope(sk)
+    with pytest.raises(SignatureError, match="UTC"):
+        verify_signature(env, root, datetime(2026, 11, 8, 12, 0))
+
+
+def test_concurrent_rollback_rejected():
+    import threading
+    from skippy.collaboration.offline_signature_verifier import SyntheticRegistryManager
+    sk, pk = _key_pair()
+    mgr = SyntheticRegistryManager()
+    root_v2 = load_trust_root([_entry(pubkey=pk)], version=2)
+    root_v1 = load_trust_root([_entry(pubkey=pk)], version=1)
+    # Accept v2 first to establish the high-water mark
+    mgr.accept(root_v2)
+    errors = []
+    barrier = threading.Barrier(4)
+
+    def try_v1():
+        barrier.wait()
+        try:
+            mgr.accept(root_v1)
+        except SignatureError as exc:
+            errors.append(str(exc))
+
+    threads = [threading.Thread(target=try_v1) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert mgr.highest_version == 2
+    assert len(errors) == 4
+    assert all("rollback" in e for e in errors)
+
+
+def test_independent_deterministic_vector():
+    """Independently established canonical bytes and Ed25519 signature."""
+    from nacl.signing import VerifyKey
+    from skippy.collaboration.offline_signature_verifier import canonical_bytes, _canonical_json
+    expected_pubkey = bytes.fromhex(
+        "2152f8d19b791d24453242e15f2eab6cb7cffa7b6a5ed30097960e069881db12"
+    )
+    expected_canonical = bytes.fromhex(
+        "514c412d4252494447452d3032422d763100010005636869656600056a61736f6e"
+        "000563686965660003514c4100027431000263310002613100026d3100026931"
+        "0000000000000001323032362d31312d30385431323a30303a30305a323032362d"
+        "31312d30385431333a30303a30305a12a875821158e76336b94d04a55c2fa424"
+        "200c988c6439dad2a6bad37b0d75ac0000002a7b226f626a656374697665223a"
+        "22766563746f72222c2274797065223a2261737369676e6d656e74227d00026b31"
+    )
+    expected_signature = bytes.fromhex(
+        "460c1f5419b905af776ddd08202b8bb5ad66b3dab216b0b47c6797dd163f5d2a"
+        "3c6efc0274fbcb17a27773f30654b7395bcc3d3167156374d9d04d5b42b7c000"
+    )
+    # Verify the fixed signature against the fixed bytes
+    VerifyKey(expected_pubkey).verify(expected_canonical, expected_signature)
+    # Verify canonical_bytes produces the same bytes
+    now = datetime(2026, 11, 8, 12, 0, tzinfo=timezone.utc)
+    payload = {"objective": "vector", "type": "assignment"}
+    payload_bytes = _canonical_json(payload)
+    digest = hashlib.sha256(payload_bytes).digest()
+    env = SignedEnvelope(
+        schema_version=1, sender="chief", recipient="jason", role="chief",
+        project_id="QLA", task_id="t1", checkpoint_id="c1", assignment_id="a1",
+        message_id="m1", idempotency_key="i1", sequence=1,
+        timestamp=now, expiry=now + timedelta(hours=1),
+        payload_digest=digest, payload=payload, key_id="k1",
+        signature=expected_signature,
+    )
+    assert canonical_bytes(env) == expected_canonical
+    # Single-byte mutation fails
+    mutated = bytearray(expected_canonical)
+    mutated[0] ^= 0xFF
+    with pytest.raises(Exception):
+        VerifyKey(expected_pubkey).verify(bytes(mutated), expected_signature)

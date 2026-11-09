@@ -32,3 +32,11 @@ Frozen BRIDGE-02A baseline: aadc12e40d841a60c10900ae29ed1b9f927914c7
 - Raw signed-wire decoding is deferred. The verifier operates on constructed SignedEnvelope objects.
 
 execution_enabled remains False. External transport remains disabled.
+
+## BRIDGE-02B.1 final verification closeout
+- SyntheticRegistryManager.accept() is protected by a threading.Lock. Concurrent rollback attempts are rejected.
+- Non-integer registry versions (bool, float) are rejected.
+- now and envelope timestamps must be UTC-aware. Raw ValueError/OverflowError in canonical_bytes are converted to SignatureError.
+- An independently established deterministic Ed25519 test vector verifies both canonical_bytes output and the fixed signature.
+
+execution_enabled remains False. External transport remains disabled.

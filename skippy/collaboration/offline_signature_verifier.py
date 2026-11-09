@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -128,34 +129,39 @@ def _encode_timestamp(dt: datetime) -> bytes:
 
 def canonical_bytes(env: SignedEnvelope) -> bytes:
     """Produce the exact signed byte sequence."""
-    payload_bytes = _canonical_json(env.payload)
-    if len(payload_bytes) > 1_048_576:
-        raise SignatureError("Payload exceeds 1 MiB")
-    parts = [
-        DOMAIN_PREFIX,
-        bytes([env.schema_version]),
-        _encode_str(env.sender),
-        _encode_str(env.recipient),
-        _encode_str(env.role),
-        _encode_str(env.project_id),
-        _encode_str(env.task_id),
-        _encode_str(env.checkpoint_id),
-        _encode_str(env.assignment_id),
-        _encode_str(env.message_id),
-        _encode_str(env.idempotency_key),
-        env.sequence.to_bytes(8, "big"),
-        _encode_timestamp(env.timestamp),
-        _encode_timestamp(env.expiry),
-        env.payload_digest,
-        len(payload_bytes).to_bytes(4, "big") + payload_bytes,
-        _encode_str(env.key_id),
-    ]
-    return b"".join(parts)
+    try:
+        payload_bytes = _canonical_json(env.payload)
+        if len(payload_bytes) > 1_048_576:
+            raise SignatureError("Payload exceeds 1 MiB")
+        parts = [
+            DOMAIN_PREFIX,
+            bytes([env.schema_version]),
+            _encode_str(env.sender),
+            _encode_str(env.recipient),
+            _encode_str(env.role),
+            _encode_str(env.project_id),
+            _encode_str(env.task_id),
+            _encode_str(env.checkpoint_id),
+            _encode_str(env.assignment_id),
+            _encode_str(env.message_id),
+            _encode_str(env.idempotency_key),
+            env.sequence.to_bytes(8, "big"),
+            _encode_timestamp(env.timestamp),
+            _encode_timestamp(env.expiry),
+            env.payload_digest,
+            len(payload_bytes).to_bytes(4, "big") + payload_bytes,
+            _encode_str(env.key_id),
+        ]
+        return b"".join(parts)
+    except SignatureError:
+        raise
+    except (ValueError, OverflowError, UnicodeError) as exc:
+        raise SignatureError(f"Malformed envelope: {exc}") from exc
 
 
 def load_trust_root(keys: list[KeyEntry], version: int) -> TrustRoot:
     """Validate and freeze a synthetic trust root. Fail closed on conflicts."""
-    if version < 1:
+    if type(version) is not int or version < 1:
         raise SignatureError("Registry version must be >= 1")
     seen_ids: set[str] = set()
     actor_roles: dict[str, str] = {}
@@ -185,14 +191,16 @@ class SyntheticRegistryManager:
 
     def __init__(self) -> None:
         self._highest_version: int = 0
+        self._lock = threading.Lock()
 
     def accept(self, root: TrustRoot) -> TrustRoot:
-        if root.version < self._highest_version:
-            raise SignatureError(
-                f"Registry version rollback: {root.version} < {self._highest_version}"
-            )
-        self._highest_version = max(self._highest_version, root.version)
-        return root
+        with self._lock:
+            if root.version < self._highest_version:
+                raise SignatureError(
+                    f"Registry version rollback: {root.version} < {self._highest_version}"
+                )
+            self._highest_version = max(self._highest_version, root.version)
+            return root
 
     @property
     def highest_version(self) -> int:
@@ -210,7 +218,12 @@ def verify_signature(
     Returns "cryptographically_valid" or raises SignatureError.
     Does not enforce durable replay. Does not authorize.
     """
+    if now.tzinfo is None or now.utcoffset() != timedelta(0):
+        raise SignatureError("now must be UTC-aware")
+    if env.timestamp.tzinfo is None or env.expiry.tzinfo is None:
+        raise SignatureError("Envelope timestamps must be UTC-aware")
     if env.schema_version != 1:
+        raise SignatureError("Unsupported schema version")
         raise SignatureError("Unsupported schema version")
     for field_name in ("sender", "recipient", "role", "project_id", "task_id",
                        "checkpoint_id", "assignment_id", "message_id",
