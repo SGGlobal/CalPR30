@@ -5,6 +5,7 @@ import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 from nacl.signing import SigningKey
@@ -282,6 +283,57 @@ def test_init_connection_failure_raises(tmp_path, monkeypatch):
         )
     assert excinfo.value.__cause__ is not None
     assert isinstance(excinfo.value.__cause__, sqlite3.Error)
+
+
+def test_pragma_first_failure_closes_connection(tmp_path, monkeypatch):
+    sk, pk = _key_pair()
+    mock_conn = MagicMock()
+    mock_conn.execute.side_effect = [sqlite3.OperationalError("first pragma fail"), None]
+    mock_conn.close = MagicMock()
+
+    def fake_connect(*args, **kwargs):
+        return mock_conn
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+    with pytest.raises(AdmissionError) as excinfo:
+        root = load_trust_root(
+            [KeyEntry("k1", "chief", "chief", pk, "active", _now() + timedelta(days=30))],
+            version=1,
+        )
+        OfflineAdmissionGate(
+            tmp_path / "admit.db",
+            root,
+            AllowEvidence(),
+            ClearHalt(),
+        )
+    assert excinfo.value.__cause__ is not None
+    mock_conn.close.assert_called()
+
+
+def test_pragma_second_failure_closes_connection(tmp_path, monkeypatch):
+    sk, pk = _key_pair()
+    mock_conn = MagicMock()
+    # First PRAGMA succeeds, second fails
+    mock_conn.execute.side_effect = [None, sqlite3.OperationalError("second pragma fail")]
+    mock_conn.close = MagicMock()
+
+    def fake_connect(*args, **kwargs):
+        return mock_conn
+
+    monkeypatch.setattr(sqlite3, "connect", fake_connect)
+    with pytest.raises(AdmissionError) as excinfo:
+        root = load_trust_root(
+            [KeyEntry("k1", "chief", "chief", pk, "active", _now() + timedelta(days=30))],
+            version=1,
+        )
+        OfflineAdmissionGate(
+            tmp_path / "admit.db",
+            root,
+            AllowEvidence(),
+            ClearHalt(),
+        )
+    assert excinfo.value.__cause__ is not None
+    mock_conn.close.assert_called()
 
 
 def test_storage_failure_raises(tmp_path):
