@@ -72,8 +72,12 @@ class OfflineAdmissionGate:
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
-        connection.execute("PRAGMA journal_mode=WAL")
-        connection.execute("PRAGMA synchronous=FULL")
+        try:
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA synchronous=FULL")
+        except sqlite3.Error:
+            connection.close()
+            raise
         return connection
 
     def _init_db(self) -> None:
