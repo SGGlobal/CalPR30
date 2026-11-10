@@ -262,25 +262,26 @@ def test_split_key_collision_rejected(tmp_path):
     assert "ambiguous" in result.reason or "conflicting" in result.reason
 
 
-def test_init_connection_failure_raises(tmp_path):
+def test_init_connection_failure_raises(tmp_path, monkeypatch):
     sk, pk = _key_pair()
-    # Force connect failure by making path unwritable / mock
-    bad_path = tmp_path / "no_write" / "admit.db"
-    bad_path.parent.mkdir(mode=0o444, exist_ok=True)
-    try:
-        with pytest.raises(AdmissionError):
-            root = load_trust_root(
-                [KeyEntry("k1", "chief", "chief", pk, "active", _now() + timedelta(days=30))],
-                version=1,
-            )
-            OfflineAdmissionGate(
-                bad_path,
-                root,
-                AllowEvidence(),
-                ClearHalt(),
-            )
-    finally:
-        bad_path.parent.chmod(0o755)
+
+    def boom(*args, **kwargs):
+        raise sqlite3.OperationalError("injected init failure")
+
+    monkeypatch.setattr(sqlite3, "connect", boom)
+    with pytest.raises(AdmissionError) as excinfo:
+        root = load_trust_root(
+            [KeyEntry("k1", "chief", "chief", pk, "active", _now() + timedelta(days=30))],
+            version=1,
+        )
+        OfflineAdmissionGate(
+            tmp_path / "admit.db",
+            root,
+            AllowEvidence(),
+            ClearHalt(),
+        )
+    assert excinfo.value.__cause__ is not None
+    assert isinstance(excinfo.value.__cause__, sqlite3.Error)
 
 
 def test_storage_failure_raises(tmp_path):
