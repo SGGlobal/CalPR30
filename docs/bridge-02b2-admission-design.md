@@ -11,6 +11,12 @@ Synthetic-only SQLite reservation gate. It calls the BRIDGE-02B.1 verifier and r
 - Injected HALT probe. `halted` and `unavailable` reject.
 - `PENDING` and `UNCERTAIN` block admission after restart. No automatic promotion.
 
+## Security corrections (BRIDGE-02B.2.1 hardening)
+- Closed authorization: only message types `assignment`, `implementation`, `correction`, and `review` are accepted. All others are rejected.
+- Mandatory Chief authorization evidence for assignments (and for implementation/correction). Reviews require SKIPPY review evidence. Verification is fail-closed: any outcome other than `verified` (or any exception) rejects the reservation.
+- Exhaustive identity matching for duplicates: an existing reservation is a duplicate only when project_id, task_id, checkpoint_id, assignment_id, message_id, idempotency_key, sender, payload_digest, sequence, and state (`RESERVED`) all match exactly. Any mismatch is a conflicting identity and is rejected.
+- Concurrent reservation attempts use the same transaction isolation; conflicting identities are deterministically rejected.
+
 ## Remaining limitations
 - No operational Chief authorization or SKIPPY review. Evidence is synthetic.
 - HALT is an injected probe, not authoritative global HALT. A change between probe and commit is an uncovered race.
