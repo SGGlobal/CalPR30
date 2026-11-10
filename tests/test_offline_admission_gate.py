@@ -32,11 +32,11 @@ def _key_pair(seed: bytes = b"\x01" * 32):
 
 class AllowEvidence:
     def verify(self, kind, assignment_id, bound_sha, evidence_id, now):
-        if evidence_id and bound_sha == "abc123":
-            return "verified"
-        if not evidence_id and not bound_sha:
-            return "verified"  # allow pure assignments without sha/evidence for baseline tests
-        return "rejected"
+        if not evidence_id or not evidence_id.strip():
+            return "rejected"
+        if bound_sha and bound_sha != "abc123":
+            return "rejected"
+        return "verified"
 
 
 class RejectEvidence:
@@ -69,7 +69,12 @@ def _envelope(signing_key, **overrides):
         sequence=1,
         timestamp=_now(),
         expiry=_now() + timedelta(hours=1),
-        payload={"type": "assignment", "objective": "test"},
+        payload={
+            "type": "assignment",
+            "objective": "test",
+            "evidence_id": "e1",
+            "implementation_sha": "abc123",
+        },
         key_id="k1",
     )
     defaults.update(overrides)
@@ -125,9 +130,8 @@ def test_conflicting_sender_rejected(tmp_path):
     gate = _gate(tmp_path, (sk, pk))
     assert gate.reserve(_envelope(sk), _now()).outcome == "reserved"
     other = _envelope(sk, message_id="m1", idempotency_key="i2", sender="chief")
-    # same message_id already reserved; different idempotency is a conflict path
     result = gate.reserve(other, _now())
-    assert result.outcome in ("rejected", "duplicate")
+    assert result.outcome == "rejected"
 
 
 def test_invalid_signature_rejected(tmp_path):
@@ -149,6 +153,15 @@ def test_missing_evidence_rejected(tmp_path):
     result = gate.reserve(env, _now())
     assert result.outcome == "rejected"
     assert "evidence" in result.reason
+
+
+def test_empty_evidence_id_rejected(tmp_path):
+    sk, pk = _key_pair()
+    gate = _gate(tmp_path, (sk, pk))
+    env = _envelope(sk, payload={"type": "assignment", "objective": "test", "evidence_id": "   "})
+    result = gate.reserve(env, _now())
+    assert result.outcome == "rejected"
+    assert "missing or empty evidence_id" in result.reason
 
 
 def test_unavailable_halt_rejected(tmp_path):
@@ -194,7 +207,31 @@ def test_concurrent_same_identity(tmp_path):
     for t in threads:
         t.join()
     assert results.count("reserved") == 1
-    assert results.count("duplicate") + results.count("rejected") == 1
+    assert results.count("duplicate") == 1
+
+
+def test_concurrent_conflicting_identity(tmp_path):
+    sk, pk = _key_pair()
+    gate = _gate(tmp_path, (sk, pk))
+    env1 = _envelope(sk, message_id="m1", idempotency_key="i1")
+    env2 = _envelope(sk, message_id="m1", idempotency_key="i2")  # conflicting on message_id
+    results = []
+    barrier = threading.Barrier(2)
+
+    def attempt(env):
+        barrier.wait()
+        results.append(gate.reserve(env, _now()).outcome)
+
+    threads = [
+        threading.Thread(target=attempt, args=(env1,)),
+        threading.Thread(target=attempt, args=(env2,)),
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results.count("reserved") == 1
+    assert results.count("rejected") == 1
 
 
 def test_storage_failure_raises(tmp_path):
@@ -203,7 +240,6 @@ def test_storage_failure_raises(tmp_path):
     gate.database_path.chmod(0o444)
     try:
         with pytest.raises(AdmissionError):
-            # force a write failure by replacing connect
             def boom():
                 raise sqlite3.OperationalError("disk full")
 
@@ -216,7 +252,7 @@ def test_storage_failure_raises(tmp_path):
 def test_unauthorized_type_rejected(tmp_path):
     sk, pk = _key_pair()
     gate = _gate(tmp_path, (sk, pk))
-    env = _envelope(sk, payload={"type": "unauthorized", "objective": "test"})
+    env = _envelope(sk, payload={"type": "unauthorized", "objective": "test", "evidence_id": "e1"})
     result = gate.reserve(env, _now())
     assert result.outcome == "rejected"
     assert "unauthorized message type" in result.reason
