@@ -138,8 +138,11 @@ class OfflineAdmissionGate:
         if msg_type not in ALLOWED_TYPES:
             return ReservationResult("rejected", "unauthorized message type")
 
+        evidence_id = str(envelope.payload.get("evidence_id", "")).strip()
+        if not evidence_id:
+            return ReservationResult("rejected", "missing or empty evidence_id")
+
         bound_sha = str(envelope.payload.get("implementation_sha", ""))
-        evidence_id = str(envelope.payload.get("evidence_id", ""))
         evidence_kind = "skippy_review" if msg_type == "review" else "chief_authorization"
         try:
             evidence = self.evidence_verifier.verify(
@@ -154,10 +157,11 @@ class OfflineAdmissionGate:
         if evidence != "verified":
             return ReservationResult("rejected", f"evidence {evidence}")
 
-        connection = self._connect()
+        connection = None
         try:
+            connection = self._connect()
             connection.execute("BEGIN IMMEDIATE")
-            existing = connection.execute(
+            rows = connection.execute(
                 """
                 SELECT project_id, task_id, checkpoint_id, assignment_id,
                        message_id, idempotency_key, sender, payload_digest,
@@ -172,13 +176,16 @@ class OfflineAdmissionGate:
                     envelope.message_id,
                     envelope.idempotency_key,
                 ),
-            ).fetchone()
-            if existing:
+            ).fetchall()
+            if rows:
+                if len(rows) != 1:
+                    connection.rollback()
+                    return ReservationResult("rejected", "ambiguous or conflicting identity matches")
                 (
                     proj, task, ckpt, assign,
                     mid, idem, sender, digest,
                     seq, state,
-                ) = existing
+                ) = rows[0]
                 if (
                     proj == envelope.project_id
                     and task == envelope.task_id
@@ -237,7 +244,12 @@ class OfflineAdmissionGate:
             connection.commit()
             return ReservationResult("reserved", "ok")
         except sqlite3.Error as exc:
-            connection.rollback()
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
             raise AdmissionError(f"storage failure: {exc}") from exc
         finally:
-            connection.close()
+            if connection is not None:
+                connection.close()
