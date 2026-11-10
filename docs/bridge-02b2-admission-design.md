@@ -8,7 +8,7 @@ Synthetic-only SQLite reservation gate. It calls the BRIDGE-02B.1 verifier and r
 - Sequence starts at 1 and must be exact.
 - Sender and assignment are bound to the stream.
 - Injected evidence verifier. A caller-supplied verified flag is never accepted.
-- Injected HALT probe. `halted` and `unavailable` reject.
+- Injected HALT probe. `halted` and `unavailable` reject. Unexpected probe exceptions fail closed.
 - `PENDING` and `UNCERTAIN` block admission after restart. No automatic promotion.
 
 ## Security corrections (BRIDGE-02B.2.1 hardening)
@@ -17,7 +17,9 @@ Synthetic-only SQLite reservation gate. It calls the BRIDGE-02B.1 verifier and r
 - Mandatory Chief authorization evidence for assignments (and for implementation/correction). Reviews require SKIPPY review evidence. Verification is fail-closed: any outcome other than `verified` (or any exception) rejects the reservation.
 - Exhaustive identity matching for duplicates: all matching rows are examined. A duplicate is returned only when exactly one reservation exists and every required identity field matches exactly (including `RESERVED` state). Any conflicting, multiple, or ambiguous match is rejected.
 - Concurrent reservation attempts use the same transaction isolation; identical concurrent reservations yield exactly one reserved and one duplicate; conflicting ones yield one reserved and one rejected. Neither bypasses identity checks.
-- Storage failures (connection, query, transaction, commit) are fail-closed and raise `AdmissionError`. No successful admission is returned on storage error.
+- Split-key collisions across distinct existing reservations are rejected as ambiguous or conflicting.
+- Storage failures (connection, query, transaction, commit, including during initialization) are fail-closed and raise `AdmissionError`. No successful admission is returned on storage error.
+- Unexpected HALT-probe exceptions are fail-closed and reject admission.
 
 ## Remaining limitations
 - No operational Chief authorization or SKIPPY review. Evidence is synthetic.
