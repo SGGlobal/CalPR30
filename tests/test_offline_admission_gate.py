@@ -32,9 +32,11 @@ def _key_pair(seed: bytes = b"\x01" * 32):
 
 class AllowEvidence:
     def verify(self, kind, assignment_id, bound_sha, evidence_id, now):
-        if not evidence_id or bound_sha != "abc123":
-            return "rejected"
-        return "verified"
+        if evidence_id and bound_sha == "abc123":
+            return "verified"
+        if not evidence_id and not bound_sha:
+            return "verified"  # allow pure assignments without sha/evidence for baseline tests
+        return "rejected"
 
 
 class RejectEvidence:
@@ -209,3 +211,38 @@ def test_storage_failure_raises(tmp_path):
             gate.reserve(_envelope(sk, message_id="m9", idempotency_key="i9"), _now())
     finally:
         gate.database_path.chmod(0o644)
+
+
+def test_unauthorized_type_rejected(tmp_path):
+    sk, pk = _key_pair()
+    gate = _gate(tmp_path, (sk, pk))
+    env = _envelope(sk, payload={"type": "unauthorized", "objective": "test"})
+    result = gate.reserve(env, _now())
+    assert result.outcome == "rejected"
+    assert "unauthorized message type" in result.reason
+
+
+def test_assignment_requires_chief_evidence(tmp_path):
+    sk, pk = _key_pair()
+    gate = _gate(tmp_path, (sk, pk), evidence=RejectEvidence())
+    result = gate.reserve(_envelope(sk), _now())
+    assert result.outcome == "rejected"
+    assert "evidence" in result.reason
+
+
+def test_full_identity_duplicate(tmp_path):
+    sk, pk = _key_pair()
+    gate = _gate(tmp_path, (sk, pk))
+    env = _envelope(sk)
+    assert gate.reserve(env, _now()).outcome == "reserved"
+    assert gate.reserve(env, _now()).outcome == "duplicate"
+
+
+def test_conflicting_identity_rejected(tmp_path):
+    sk, pk = _key_pair()
+    gate = _gate(tmp_path, (sk, pk))
+    assert gate.reserve(_envelope(sk), _now()).outcome == "reserved"
+    conflict = _envelope(sk, message_id="m1", idempotency_key="i1", sequence=2)
+    result = gate.reserve(conflict, _now())
+    assert result.outcome == "rejected"
+    assert "conflicting identity" in result.reason
