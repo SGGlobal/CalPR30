@@ -54,6 +54,11 @@ class UnavailableHalt:
         return "unavailable"
 
 
+class RaisingHalt:
+    def read(self):
+        raise RuntimeError("probe failure")
+
+
 def _envelope(signing_key, **overrides):
     defaults = dict(
         schema_version=1,
@@ -172,6 +177,14 @@ def test_unavailable_halt_rejected(tmp_path):
     assert "HALT" in result.reason
 
 
+def test_halt_probe_exception_rejected(tmp_path):
+    sk, pk = _key_pair()
+    gate = _gate(tmp_path, (sk, pk), halt=RaisingHalt())
+    result = gate.reserve(_envelope(sk), _now())
+    assert result.outcome == "rejected"
+    assert "HALT probe failed closed" in result.reason
+
+
 def test_pending_blocks_after_restart(tmp_path):
     sk, pk = _key_pair()
     gate = _gate(tmp_path, (sk, pk))
@@ -232,6 +245,42 @@ def test_concurrent_conflicting_identity(tmp_path):
         t.join()
     assert results.count("reserved") == 1
     assert results.count("rejected") == 1
+
+
+def test_split_key_collision_rejected(tmp_path):
+    sk, pk = _key_pair()
+    gate = _gate(tmp_path, (sk, pk))
+    # Create two distinct reservations
+    env_a = _envelope(sk, message_id="ma", idempotency_key="ia", sequence=1)
+    assert gate.reserve(env_a, _now()).outcome == "reserved"
+    env_b = _envelope(sk, message_id="mb", idempotency_key="ib", sequence=2)
+    assert gate.reserve(env_b, _now()).outcome == "reserved"
+    # Attempt that collides on both keys with different records
+    collision = _envelope(sk, message_id="ma", idempotency_key="ib", sequence=3)
+    result = gate.reserve(collision, _now())
+    assert result.outcome == "rejected"
+    assert "ambiguous" in result.reason or "conflicting" in result.reason
+
+
+def test_init_connection_failure_raises(tmp_path):
+    sk, pk = _key_pair()
+    # Force connect failure by making path unwritable / mock
+    bad_path = tmp_path / "no_write" / "admit.db"
+    bad_path.parent.mkdir(mode=0o444, exist_ok=True)
+    try:
+        with pytest.raises(AdmissionError):
+            root = load_trust_root(
+                [KeyEntry("k1", "chief", "chief", pk, "active", _now() + timedelta(days=30))],
+                version=1,
+            )
+            OfflineAdmissionGate(
+                bad_path,
+                root,
+                AllowEvidence(),
+                ClearHalt(),
+            )
+    finally:
+        bad_path.parent.chmod(0o755)
 
 
 def test_storage_failure_raises(tmp_path):
