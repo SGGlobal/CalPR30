@@ -123,7 +123,10 @@ class OfflineAdmissionGate:
     def reserve(self, envelope: SignedEnvelope, now: datetime) -> ReservationResult:
         self._block_if_unresolved()
 
-        halt = self.halt_probe.read()
+        try:
+            halt = self.halt_probe.read()
+        except Exception:
+            return ReservationResult("rejected", "HALT probe failed closed")
         if halt != "clear":
             return ReservationResult("rejected", f"HALT state {halt}")
 
