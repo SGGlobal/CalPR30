@@ -77,7 +77,9 @@ class OfflineAdmissionGate:
         return connection
 
     def _init_db(self) -> None:
-        with self._connect() as connection:
+        connection = None
+        try:
+            connection = self._connect()
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS reservations (
@@ -108,6 +110,12 @@ class OfflineAdmissionGate:
                 ON reservations(project_id, task_id, idempotency_key)
                 """
             )
+            connection.commit()
+        except sqlite3.Error as exc:
+            raise AdmissionError(f"storage failure during initialization: {exc}") from exc
+        finally:
+            if connection is not None:
+                connection.close()
 
     def _block_if_unresolved(self) -> None:
         try:
