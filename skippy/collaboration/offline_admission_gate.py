@@ -25,6 +25,8 @@ from skippy.collaboration.offline_signature_verifier import (
     verify_signature,
 )
 
+ALLOWED_TYPES = frozenset({"assignment", "implementation", "correction", "review"})
+
 
 class AdmissionError(Exception):
     """Fail-closed admission error."""
@@ -132,25 +134,34 @@ class OfflineAdmissionGate:
         if verdict != "cryptographically_valid":
             return ReservationResult("rejected", "signature not valid")
 
+        msg_type = envelope.payload.get("type")
+        if msg_type not in ALLOWED_TYPES:
+            return ReservationResult("rejected", "unauthorized message type")
+
         bound_sha = str(envelope.payload.get("implementation_sha", ""))
         evidence_id = str(envelope.payload.get("evidence_id", ""))
-        if envelope.payload.get("type") in ("implementation", "correction", "review"):
+        evidence_kind = "skippy_review" if msg_type == "review" else "chief_authorization"
+        try:
             evidence = self.evidence_verifier.verify(
-                "skippy_review" if envelope.payload.get("type") == "review" else "chief_authorization",
+                evidence_kind,
                 envelope.assignment_id,
                 bound_sha,
                 evidence_id,
                 now,
             )
-            if evidence != "verified":
-                return ReservationResult("rejected", f"evidence {evidence}")
+        except Exception:
+            return ReservationResult("rejected", "evidence verification failed closed")
+        if evidence != "verified":
+            return ReservationResult("rejected", f"evidence {evidence}")
 
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
             existing = connection.execute(
                 """
-                SELECT sender, assignment_id, payload_digest, state
+                SELECT project_id, task_id, checkpoint_id, assignment_id,
+                       message_id, idempotency_key, sender, payload_digest,
+                       sequence, state
                 FROM reservations
                 WHERE project_id = ? AND task_id = ?
                   AND (message_id = ? OR idempotency_key = ?)
@@ -163,11 +174,21 @@ class OfflineAdmissionGate:
                 ),
             ).fetchone()
             if existing:
-                sender, assignment, digest, state = existing
+                (
+                    proj, task, ckpt, assign,
+                    mid, idem, sender, digest,
+                    seq, state,
+                ) = existing
                 if (
-                    sender == envelope.sender
-                    and assignment == envelope.assignment_id
+                    proj == envelope.project_id
+                    and task == envelope.task_id
+                    and ckpt == envelope.checkpoint_id
+                    and assign == envelope.assignment_id
+                    and mid == envelope.message_id
+                    and idem == envelope.idempotency_key
+                    and sender == envelope.sender
                     and digest == envelope.payload_digest
+                    and seq == envelope.sequence
                     and state == "RESERVED"
                 ):
                     connection.rollback()
