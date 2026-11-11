@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -86,7 +87,7 @@ class OfflineAuthenticatedAdapter:
         CREATE TABLE IF NOT EXISTS does not migrate an old table. Inspect
         actual indices and fail closed if uniqueness is missing.
         """
-        with sqlite3.connect(self.database_path) as connection:
+        with closing(sqlite3.connect(self.database_path)) as connection, connection:
             tables = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='intent_journal'"
             ).fetchall()
@@ -117,7 +118,7 @@ class OfflineAuthenticatedAdapter:
         without a matching ledger event fails closed. Never auto-recovers.
         """
         try:
-            with self.ledger._connect() as ledger_conn:
+            with closing(self.ledger._connect()) as ledger_conn, ledger_conn:
                 ledger_events = ledger_conn.execute(
                     "SELECT message_id, idempotency_key, project_id, task_id, checkpoint_id, actor, payload FROM events ORDER BY revision"
                 ).fetchall()
@@ -144,7 +145,7 @@ class OfflineAuthenticatedAdapter:
             raise OfflineAdapterError(f"Ledger unreadable during reconciliation: {exc}") from exc
 
         try:
-            with sqlite3.connect(self.database_path) as connection:
+            with closing(sqlite3.connect(self.database_path)) as connection, connection:
                 unresolved = connection.execute(
                     "SELECT message_id, state FROM intent_journal WHERE state IN ('PENDING', 'UNCERTAIN')"
                 ).fetchall()
@@ -256,7 +257,7 @@ class OfflineAuthenticatedAdapter:
                 raise OfflineAdapterError(f"Orphan sequence state for {stream}")
 
     def _init_receipts(self):
-        with sqlite3.connect(self.database_path) as connection:
+        with closing(sqlite3.connect(self.database_path)) as connection, connection:
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS audit_receipts (
@@ -341,14 +342,14 @@ class OfflineAuthenticatedAdapter:
             )
 
     def _seen_ids(self) -> tuple[set[str], set[str]]:
-        with sqlite3.connect(self.database_path) as connection:
+        with closing(sqlite3.connect(self.database_path)) as connection, connection:
             rows = connection.execute(
                 "SELECT message_id, idempotency_key FROM audit_receipts WHERE outcome = 'accepted'"
             ).fetchall()
         return {r[0] for r in rows}, {r[1] for r in rows}
 
     def _expected_sequence(self, stream_key: str) -> int:
-        with sqlite3.connect(self.database_path) as connection:
+        with closing(sqlite3.connect(self.database_path)) as connection, connection:
             row = connection.execute(
                 "SELECT next_sequence FROM sequence_state WHERE stream_key = ?",
                 (stream_key,),
@@ -356,7 +357,7 @@ class OfflineAuthenticatedAdapter:
         return row[0] if row else 1
 
     def _advance_sequence(self, stream_key: str, next_seq: int) -> None:
-        with sqlite3.connect(self.database_path) as connection:
+        with closing(sqlite3.connect(self.database_path)) as connection, connection:
             connection.execute(
                 """
                 INSERT INTO sequence_state (stream_key, next_sequence)
@@ -402,7 +403,7 @@ class OfflineAuthenticatedAdapter:
         reason: str | None,
         now: datetime,
     ) -> None:
-        with sqlite3.connect(self.database_path) as connection:
+        with closing(sqlite3.connect(self.database_path)) as connection, connection:
             connection.execute(
                 """
                 INSERT INTO audit_receipts (
@@ -445,7 +446,7 @@ class OfflineAuthenticatedAdapter:
             self._reconcile()
 
             # Persistent fail-stop gate and exclusive admission
-            with sqlite3.connect(self.database_path) as connection:
+            with closing(sqlite3.connect(self.database_path)) as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
                 row = connection.execute(
                     "SELECT stopped, reason FROM fail_stop WHERE singleton = 1"
@@ -568,7 +569,7 @@ class OfflineAuthenticatedAdapter:
                 self._after_pending_commit()
 
                 # Derive actual ledger revision
-                with self.ledger._connect() as ledger_conn:
+                with closing(self.ledger._connect()) as ledger_conn, ledger_conn:
                     current_rev = self.ledger._current_revision(ledger_conn)
 
                 try:

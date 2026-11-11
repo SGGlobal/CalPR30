@@ -13,6 +13,7 @@ execution_enabled remains False. External transport remains disabled.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -123,7 +124,7 @@ class OfflineAdmissionGate:
 
     def _block_if_unresolved(self) -> None:
         try:
-            with self._connect() as connection:
+            with closing(self._connect()) as connection, connection:
                 row = connection.execute(
                     "SELECT state FROM reservations WHERE state IN ('PENDING', 'UNCERTAIN') LIMIT 1"
                 ).fetchone()
