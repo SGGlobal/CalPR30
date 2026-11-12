@@ -13,6 +13,12 @@ SECURITY NOTES:
 - Sequence is enforced durably per stream, separate from ledger revision.
 - Review and implementation SHA evidence is preserved and bound.
 - Partial writes are reported as UNCERTAIN. No cross-database atomicity.
+- Reconciliation collects the receipts view and the ledger view while one
+  receipts BEGIN IMMEDIATE lock is held (coordinated reads under the
+  W1 PENDING -> W2 ledger -> W3 ACCEPTED protocol, not cross-database
+  atomic commits). One receipts database serves the adapter-origin events
+  in a ledger; two receipts databases writing adapter-origin events into
+  one ledger are outside this guarantee.
 - HALT is derived from authoritative state, not a caller flag.
 execution_enabled remains False.
 """
@@ -108,14 +114,13 @@ class OfflineAuthenticatedAdapter:
                     "Legacy intent_journal lacks independent non-partial single-column UNIQUE constraints on message_id and idempotency_key; migration required"
                 )
 
-    def _reconcile(self) -> None:
+    def _read_adapter_ledger_view(self) -> dict:
         """
-        Scoped reconciliation of adapter-originated events.
+        Collect adapter-origin ledger events for reconciliation.
 
-        Compares only ledger events that carry the adapter origin marker
-        against the intent journal. Independent BRIDGE-01 events are ignored.
-        Any PENDING intent is ambiguous and fails closed. Any ACCEPTED intent
-        without a matching ledger event fails closed. Never auto-recovers.
+        Opens and closes its own ledger connection; never touches the
+        receipts connection. Called only while the receipts BEGIN IMMEDIATE
+        lock is held, after the receipts view has been collected.
         """
         try:
             with closing(self.ledger._connect()) as ledger_conn, ledger_conn:
@@ -143,29 +148,41 @@ class OfflineAuthenticatedAdapter:
                     }
         except Exception as exc:
             raise OfflineAdapterError(f"Ledger unreadable during reconciliation: {exc}") from exc
+        return adapter_ledger
 
+    def _collect_reconcile_views(self, connection):
+        """
+        Collect the receipts view, then the ledger view.
+
+        ``connection`` is a receipts connection already inside BEGIN
+        IMMEDIATE. The four receipts queries run in that one transaction and
+        the ledger view is read while that lock is still held. This method
+        never begins, commits, rolls back or closes ``connection``.
+
+        Returns None only for the legacy fresh-store case (journal file
+        absent and no adapter ledger events).
+        """
         try:
-            with closing(sqlite3.connect(self.database_path)) as connection, connection:
-                unresolved = connection.execute(
-                    "SELECT message_id, state FROM intent_journal WHERE state IN ('PENDING', 'UNCERTAIN')"
-                ).fetchall()
-                accepted = connection.execute(
-                    """
-                    SELECT message_id, idempotency_key, project_id, task_id,
-                           checkpoint_id, assignment_id, payload_digest, sequence
-                    FROM intent_journal WHERE state = 'ACCEPTED'
-                    """
-                ).fetchall()
-                receipts = connection.execute(
-                    """
-                    SELECT message_id, idempotency_key, project_id, task_id,
-                           checkpoint_id, assignment_id, sender
-                    FROM audit_receipts WHERE outcome = 'accepted'
-                    """
-                ).fetchall()
-                seq_rows = connection.execute(
-                    "SELECT stream_key, next_sequence FROM sequence_state"
-                ).fetchall()
+            unresolved = connection.execute(
+                "SELECT message_id, state FROM intent_journal WHERE state IN ('PENDING', 'UNCERTAIN')"
+            ).fetchall()
+            accepted = connection.execute(
+                """
+                SELECT message_id, idempotency_key, project_id, task_id,
+                       checkpoint_id, assignment_id, payload_digest, sequence
+                FROM intent_journal WHERE state = 'ACCEPTED'
+                """
+            ).fetchall()
+            receipts = connection.execute(
+                """
+                SELECT message_id, idempotency_key, project_id, task_id,
+                       checkpoint_id, assignment_id, sender
+                FROM audit_receipts WHERE outcome = 'accepted'
+                """
+            ).fetchall()
+            seq_rows = connection.execute(
+                "SELECT stream_key, next_sequence FROM sequence_state"
+            ).fetchall()
             unresolved_ids = {r[0] for r in unresolved}
             accepted_rows = {r[0]: r for r in accepted}
             receipt_rows = {r[0]: r for r in receipts}
@@ -185,11 +202,70 @@ class OfflineAuthenticatedAdapter:
                 raise OfflineAdapterError(
                     f"Intent journal unreadable: {exc}"
                 ) from exc
-            if adapter_ledger:
+            if self._read_adapter_ledger_view():
                 raise OfflineAdapterError(
                     f"Intent journal unreadable and adapter ledger events exist: {exc}"
                 ) from exc
+            return None
+
+        # Ledger view is collected while the receipts lock is still held.
+        adapter_ledger = self._read_adapter_ledger_view()
+        return adapter_ledger, unresolved_ids, accepted_rows, receipt_rows, receipt_ids, seq_map
+
+    def _reconcile(self, connection: sqlite3.Connection | None = None) -> None:
+        """
+        Scoped reconciliation of adapter-originated events.
+
+        Compares only ledger events that carry the adapter origin marker
+        against the intent journal. Independent BRIDGE-01 events are ignored.
+        Any PENDING intent is ambiguous and fails closed. Any ACCEPTED intent
+        without a matching ledger event fails closed. Never auto-recovers.
+
+        Locking protocol: the four receipts queries run inside one receipts
+        BEGIN IMMEDIATE transaction, the ledger view is read while that lock
+        is still held, and the lock is released only after both views are
+        collected. Adapters write a ledger event only after committing its
+        PENDING intent (W1 -> W2 -> W3), so an in-flight admission is seen
+        as PENDING (Unresolved) and cannot produce a torn cross-database
+        view. These are coordinated reads, not a cross-database atomic
+        commit.
+
+        connection is None (constructor path): this call owns its receipts
+        connection: open, BEGIN IMMEDIATE, collect both views, ROLLBACK (it
+        writes nothing), close. On failure it rolls back only if a
+        transaction exists and always closes before propagating.
+
+        connection given (accept path): borrowed. The caller has executed
+        BEGIN IMMEDIATE and is the sole owner of commit, rollback and close.
+        This call never begins, commits, rolls back or closes it, on success
+        or failure.
+        """
+        if connection is not None:
+            if not connection.in_transaction:
+                raise OfflineAdapterError(
+                    "Reconciliation requires the caller's open receipts transaction"
+                )
+            views = self._collect_reconcile_views(connection)
+        else:
+            try:
+                owned = sqlite3.connect(self.database_path)
+            except Exception as exc:
+                raise OfflineAdapterError(f"Intent journal unreadable: {exc}") from exc
+            try:
+                try:
+                    owned.execute("BEGIN IMMEDIATE")
+                except Exception as exc:
+                    raise OfflineAdapterError(f"Intent journal unreadable: {exc}") from exc
+                views = self._collect_reconcile_views(owned)
+            finally:
+                try:
+                    if owned.in_transaction:
+                        owned.rollback()
+                finally:
+                    owned.close()
+        if views is None:
             return
+        adapter_ledger, unresolved_ids, accepted_rows, receipt_rows, receipt_ids, seq_map = views
 
         # PENDING or UNCERTAIN is always unresolved — fail closed
         if unresolved_ids:
@@ -442,12 +518,16 @@ class OfflineAuthenticatedAdapter:
         now = now or datetime.now(timezone.utc)
 
         with self._lock:
-            # Reconciliation gate before any admission
-            self._reconcile()
-
-            # Persistent fail-stop gate and exclusive admission
+            # Persistent fail-stop gate and exclusive admission. accept() is the
+            # sole owner of this receipts connection: commit, rollback, close.
             with closing(sqlite3.connect(self.database_path)) as connection, connection:
                 connection.execute("BEGIN IMMEDIATE")
+
+                # Reconciliation gate before any admission, inside this same
+                # receipts transaction (borrowed; never committed, rolled back
+                # or closed by _reconcile).
+                self._reconcile(connection)
+
                 row = connection.execute(
                     "SELECT stopped, reason FROM fail_stop WHERE singleton = 1"
                 ).fetchone()
