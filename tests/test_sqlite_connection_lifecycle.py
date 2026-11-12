@@ -173,10 +173,10 @@ def _insert_pending(db_path):
                 """
                 INSERT INTO reservations (
                     project_id, task_id, checkpoint_id, assignment_id,
-                    message_id, idempotency_key, sender, payload_digest,
+                    message_id, idempotency_key, sender, recipient, role, payload_digest,
                     sequence, state, recorded_at
-                ) VALUES ('QLA','t1','c1','a1','old','oldk','chief',?,1,'PENDING',
-                          '2026-11-08T12:00:00')
+                ) VALUES ('QLA','t1','c1','a1','old','oldk','chief','jason','chief',?,1,
+                          'PENDING', '2026-11-08T12:00:00')
                 """,
                 (b"\x00" * 32,),
             )
