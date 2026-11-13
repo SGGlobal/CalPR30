@@ -6,6 +6,7 @@ No BRIDGE-02A ledger, network transport, production keys, or trading involved.
 import ast
 import sqlite3
 import threading
+import urllib.request
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,6 +14,8 @@ from pathlib import Path
 import pytest
 from nacl.signing import SigningKey
 
+from skippy.collaboration.checkpoint_ledger import CheckpointLedger
+from skippy.collaboration.github_http_transport import ProductionHTTPTransport
 from skippy.collaboration.offline_admission_gate import AdmissionError, OfflineAdmissionGate
 from skippy.collaboration.offline_signature_verifier import (
     KeyEntry, SignedEnvelope, load_trust_root,
@@ -20,6 +23,8 @@ from skippy.collaboration.offline_signature_verifier import (
 from skippy.collaboration.offline_bridge02b2_contract import SyntheticContractError
 from skippy.collaboration.offline_bridge02b2_simulator import SyntheticBridgeSimulator
 from test_offline_bridge02b2_contract import NOW, BASE, IMPLEMENTATION, CORRECTION, msg
+
+import polymarket.orders as polymarket_orders
 
 
 class FixturePolicy:
@@ -80,6 +85,24 @@ def simulator(tmp_path, *, policy=None, evidence=None, halt=None, revoked_actor=
         halt_probe=halt or FixtureHalt(),
         fixture_policy=policy or FixturePolicy(),
     )
+
+
+def install_protected_entry_sentinels(monkeypatch):
+    """Wrap existing protected entrypoints. Names are not invented."""
+    counts = {"ledger.record_event": 0, "transport.__call__": 0,
+              "urllib.request.urlopen": 0, "place_limit_order": 0}
+
+    def _sentinel(name):
+        def wrapped(*args, **kwargs):
+            counts[name] += 1
+            raise AssertionError(f"protected entrypoint invoked: {name}")
+        return wrapped
+
+    monkeypatch.setattr(CheckpointLedger, "record_event", _sentinel("ledger.record_event"))
+    monkeypatch.setattr(ProductionHTTPTransport, "__call__", _sentinel("transport.__call__"))
+    monkeypatch.setattr(urllib.request, "urlopen", _sentinel("urllib.request.urlopen"))
+    monkeypatch.setattr(polymarket_orders, "place_limit_order", _sentinel("place_limit_order"))
+    return counts
 
 
 def test_complete_workflow_reserves_only(tmp_path):
@@ -157,6 +180,7 @@ def test_reject_legacy_and_unauthorized_transition_before_gate(tmp_path, monkeyp
 
 
 def test_storage_exception_invalidates_fixture_and_denies_restart(tmp_path, monkeypatch):
+    """Exception-before-write coverage only: reserve is replaced so no row is committed."""
     sim = simulator(tmp_path)
     def fail(*a, **kw):
         raise AdmissionError("indeterminate commit")
@@ -165,6 +189,38 @@ def test_storage_exception_invalidates_fixture_and_denies_restart(tmp_path, monk
         sim.simulate(msg(), now=NOW)
     assert sim.simulate(msg(), now=NOW).outcome == "rejected"
     sim.invalidate_for_restart()
+    assert sim.simulate(msg(), now=NOW).outcome == "rejected"
+    with pytest.raises(SyntheticContractError, match="new disposable"):
+        simulator(tmp_path)
+
+
+def test_reserve_then_raise_invalidates_and_refuses_reopen(tmp_path, monkeypatch):
+    sim = simulator(tmp_path)
+    genuine_reserve = sim._gate.reserve
+
+    def reserve_then_raise(envelope, now):
+        result = genuine_reserve(envelope, now)
+        assert result.outcome == "reserved"
+        with sqlite3.connect(tmp_path / "synthetic-reservations.db") as con:
+            assert con.execute(
+                "SELECT COUNT(*) FROM reservations WHERE state='RESERVED'"
+            ).fetchone()[0] == 1
+        raise AdmissionError("indeterminate after committed reservation")
+
+    monkeypatch.setattr(sim._gate, "reserve", reserve_then_raise)
+    snapshot_before = sim.snapshot
+    with pytest.raises(AdmissionError, match="indeterminate after committed reservation"):
+        sim.simulate(msg(), now=NOW)
+    assert sim.snapshot == snapshot_before
+    assert sim.snapshot.stage == "EMPTY"
+    with sqlite3.connect(tmp_path / "synthetic-reservations.db") as con:
+        assert con.execute(
+            "SELECT COUNT(*) FROM reservations WHERE state='RESERVED'"
+        ).fetchone()[0] == 1
+
+    def fail(*a, **kw):
+        raise AssertionError("gate must not be invoked after invalidation")
+    monkeypatch.setattr(sim._gate, "reserve", fail)
     assert sim.simulate(msg(), now=NOW).outcome == "rejected"
     with pytest.raises(SyntheticContractError, match="new disposable"):
         simulator(tmp_path)
@@ -189,18 +245,34 @@ def test_unresolved_pending_or_uncertain_denies_gate_reopen(tmp_path):
 
 
 def test_concurrent_same_input_at_most_once(tmp_path):
+    """Same-instance threading against one simulator RLock, not cross-process exclusion."""
     sim = simulator(tmp_path)
     barrier = threading.Barrier(2)
     outcomes = []
+    exceptions = []
+    lock = threading.Lock()
+
     def attempt():
-        barrier.wait()
         try:
-            outcomes.append(sim.simulate(msg(), now=NOW).outcome)
-        except AdmissionError:
-            outcomes.append("failclosed")
+            barrier.wait(timeout=10)
+            try:
+                outcome = sim.simulate(msg(), now=NOW).outcome
+            except AdmissionError:
+                outcome = "failclosed"
+            with lock:
+                outcomes.append(outcome)
+        except Exception as exc:
+            with lock:
+                exceptions.append(exc)
+
     threads = [threading.Thread(target=attempt) for _ in range(2)]
-    for t in threads: t.start()
-    for t in threads: t.join()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert all(not t.is_alive() for t in threads)
+    assert exceptions == []
+    assert len(outcomes) == 2
     assert outcomes.count("reserved") == 1
     assert set(outcomes) <= {"reserved", "duplicate", "failclosed"}
     with sqlite3.connect(tmp_path / "synthetic-reservations.db") as con:
@@ -208,6 +280,7 @@ def test_concurrent_same_input_at_most_once(tmp_path):
 
 
 def test_no_protected_adapter_or_transport_imports_in_simulator():
+    """Supplementary AST import check; runtime sentinels are in a separate test."""
     source = Path(__file__).resolve().parents[1] / "skippy/collaboration/offline_bridge02b2_simulator.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     modules = set()
@@ -220,3 +293,15 @@ def test_no_protected_adapter_or_transport_imports_in_simulator():
                  "skippy.collaboration.checkpoint_ledger",
                  "skippy.collaboration.github_http_transport"}
     assert not (modules & forbidden)
+
+
+def test_runtime_sentinels_zero_invocations_on_positive_and_negative_paths(tmp_path, monkeypatch):
+    counts = install_protected_entry_sentinels(monkeypatch)
+    sim = simulator(tmp_path)
+    assert sim.simulate(msg(), now=NOW).outcome == "reserved"
+    assert sim.simulate(msg(), now=NOW).outcome == "duplicate"
+    assert sim.simulate(msg("implementation", 1), now=NOW).outcome == "rejected"
+    (tmp_path / "neg").mkdir()
+    sim_neg = simulator(tmp_path / "neg", evidence=FixtureEvidence("rejected"))
+    assert sim_neg.simulate(msg(), now=NOW).outcome == "rejected"
+    assert all(value == 0 for value in counts.values()), counts
