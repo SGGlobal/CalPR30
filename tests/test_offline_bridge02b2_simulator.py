@@ -1472,3 +1472,312 @@ def test_separate_process_contention_one_reserved_one_sequence_rejected(tmp_path
         json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
     assert evidence["start_method"] == "spawn"
     assert evidence["forced_cleanup"] == [] and evidence["leftovers"] == []
+
+
+# --- Work order 6846823630 item 1: CHARACTERIZATION of CURRENT invalidation behavior. ---
+# Finding 6846379683. These tests RECORD the current, unresolved behavior of
+# invalidate_for_restart() over the authentic B2.1 OfflineAdmissionGate. They are
+# characterization tests: a pass proves only that the observed interleaving
+# reproduces. It is NOT a safety property, NOT a fix and NOT the proposed
+# serialized-close semantics in the design doc. At this source
+# invalidate_for_restart() writes the flag without taking the simulator lock, and
+# simulate() reads the flag once, at the start of _simulate_locked, so an
+# invalidation that lands after that read does not stop the active call. The
+# expectations below were first observed on authentic Windows and then asserted.
+# Coordination uses finite Events and finite joins only; no ordering relies on
+# sleep. Only started threads are joined. Worker exceptions are captured.
+
+CHAR_WAIT = 10.0
+CHAR_RESERVED_REASON = "synthetic reservation only; no ledger append"
+CHAR_INVALIDATED_REASON = "simulation invalidated; no crash/restart continuation"
+CHAR_POINTS = ("policy", "halt", "evidence")
+# Calls already made when the callback pauses or invalidates. The fixture policy
+# runs before signing (pre-sign). The HALT probe and evidence verifier run inside
+# the authentic gate.reserve, after signing and before the gate's locked
+# BEGIN IMMEDIATE / INSERT (in-reserve).
+CHAR_CALLS_AT_POINT = {
+    "policy": {"plan": 1, "sign": 0, "reserve": 0},
+    "halt": {"plan": 1, "sign": 1, "reserve": 1},
+    "evidence": {"plan": 1, "sign": 1, "reserve": 1},
+}
+CHAR_ONE_CALL_EACH = {"plan": 1, "sign": 1, "reserve": 1}
+
+
+class _OneShotPause:
+    """Pauses the first callback invocation on finite coordination events."""
+
+    def _init_pause(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.fired = False
+        self.released_in_time = None
+
+    def _pause(self):
+        if self.fired:
+            return True
+        self.fired = True
+        self.entered.set()
+        self.released_in_time = self.release.wait(timeout=CHAR_WAIT)
+        return self.released_in_time
+
+
+class PausingPolicy(FixturePolicy, _OneShotPause):
+    def __init__(self):
+        super().__init__()
+        self._init_pause()
+
+    def check(self, message, now):
+        result = super().check(message, now)
+        return result if self._pause() else "rejected"
+
+
+class PausingHalt(FixtureHalt, _OneShotPause):
+    def __init__(self):
+        super().__init__()
+        self._init_pause()
+
+    def read(self):
+        state = super().read()
+        return state if self._pause() else "halted"
+
+
+class PausingEvidence(FixtureEvidence, _OneShotPause):
+    def __init__(self):
+        super().__init__()
+        self._init_pause()
+
+    def verify(self, kind, assignment_id, bound_sha, evidence_id, now):
+        verdict = super().verify(kind, assignment_id, bound_sha, evidence_id, now)
+        return verdict if self._pause() else "rejected"
+
+
+class _OneShotInvalidate:
+    """Calls sim.invalidate_for_restart() once, on the simulate() thread."""
+
+    def _init_invalidate(self):
+        self.sim = None
+        self.calls = None
+        self.fired = False
+        self.returned = []
+        self.flag_after = None
+        self.in_progress_at = None
+        self.calls_at = None
+
+    def _invalidate(self):
+        if self.sim is None or self.fired:
+            return
+        self.fired = True
+        self.in_progress_at = self.sim._in_progress
+        self.calls_at = dict(self.calls)
+        self.returned.append(self.sim.invalidate_for_restart())
+        self.flag_after = self.sim._invalidated
+
+
+class InvalidatingPolicy(FixturePolicy, _OneShotInvalidate):
+    def __init__(self):
+        super().__init__()
+        self._init_invalidate()
+
+    def check(self, message, now):
+        self._invalidate()
+        return super().check(message, now)
+
+
+class InvalidatingHalt(FixtureHalt, _OneShotInvalidate):
+    def __init__(self):
+        super().__init__()
+        self._init_invalidate()
+
+    def read(self):
+        self._invalidate()
+        return super().read()
+
+
+class InvalidatingEvidence(FixtureEvidence, _OneShotInvalidate):
+    def __init__(self):
+        super().__init__()
+        self._init_invalidate()
+
+    def verify(self, kind, assignment_id, bound_sha, evidence_id, now):
+        self._invalidate()
+        return super().verify(kind, assignment_id, bound_sha, evidence_id, now)
+
+
+CHAR_PAUSING = {"policy": PausingPolicy, "halt": PausingHalt, "evidence": PausingEvidence}
+CHAR_INVALIDATING = {
+    "policy": InvalidatingPolicy, "halt": InvalidatingHalt, "evidence": InvalidatingEvidence}
+
+
+def characterization_reference(tmp_path, messages):
+    """The same messages on a separate, never-invalidated simulator and fresh store."""
+    ref_dir = tmp_path / "characterization-reference"
+    ref_dir.mkdir()
+    ref = simulator(ref_dir)
+    results = [(r.outcome, r.reason) for r in (ref.simulate(m, now=NOW) for m in messages)]
+    return results, full_reservation_rows(ref_dir / DB_NAME), ref.snapshot
+
+
+def _char_json(value):
+    return value.hex() if isinstance(value, bytes) else repr(value)
+
+
+def _char_finish(obs, tmp_path, sim, calls, outer):
+    """Record the outer result, full rows, snapshot, counts and subsequent-call denial."""
+    db = tmp_path / DB_NAME
+    obs["outer"] = None if outer is None else (outer.outcome, outer.reason)
+    obs["calls_after_outer"] = dict(calls)
+    obs["rows_after_outer"] = full_reservation_rows(db)
+    obs["snapshot_after_outer"] = sim.snapshot
+    obs["in_progress_after_outer"] = sim._in_progress
+    obs["invalidated_flag_after_outer"] = sim._invalidated
+    obs["follow_up"] = None
+    if not obs["alive"]:
+        follow = sim.simulate(msg("implementation", 2), now=NOW)
+        obs["follow_up"] = (follow.outcome, follow.reason)
+    obs["calls_after_follow_up"] = dict(calls)
+    obs["rows_after_follow_up"] = full_reservation_rows(db)
+    obs["snapshot_after_follow_up"] = sim.snapshot
+    ref_results, ref_rows, ref_snapshot = characterization_reference(tmp_path, [msg()])
+    obs["reference_results"] = ref_results
+    obs["reference_rows"] = ref_rows
+    obs["reference_snapshot"] = ref_snapshot
+    (tmp_path / f"characterization-{obs['mode']}-{obs['point']}.json").write_text(
+        json.dumps(obs, indent=2, sort_keys=True, default=_char_json), encoding="utf-8")
+    return obs
+
+
+def observe_cross_thread_invalidation(tmp_path, monkeypatch, point):
+    """Thread A pauses in a callback; thread B invalidates and signals its return
+    BEFORE the parent releases A. Records what currently happens."""
+    callback = CHAR_PAUSING[point]()
+    sim = simulator(tmp_path, **{point: callback})
+    calls = count_plan_sign_and_gate(monkeypatch, sim)
+    results, errors = {}, []
+    invalidate_returned = threading.Event()
+
+    def run_simulate():
+        try:
+            results["simulate"] = sim.simulate(msg(), now=NOW)
+        except BaseException:  # noqa: BLE001 - reported through the observation
+            errors.append(("simulate", traceback.format_exc()))
+
+    def run_invalidate():
+        try:
+            results["invalidate_returned"] = sim.invalidate_for_restart()
+            results["flag_after_invalidate"] = sim._invalidated
+            invalidate_returned.set()
+        except BaseException:  # noqa: BLE001 - reported through the observation
+            errors.append(("invalidate", traceback.format_exc()))
+
+    worker = threading.Thread(target=run_simulate, name=f"b2b2-char-{point}-simulate")
+    invalidator = threading.Thread(target=run_invalidate, name=f"b2b2-char-{point}-invalidate")
+    obs = {"mode": "cross_thread", "point": point, "paused": False,
+           "invalidate_returned_before_release": False}
+    started = []
+    try:
+        worker.start()
+        started.append(worker)
+        obs["paused"] = callback.entered.wait(timeout=CHAR_WAIT)
+        if obs["paused"]:
+            invalidator.start()
+            started.append(invalidator)
+            obs["invalidate_returned_before_release"] = invalidate_returned.wait(timeout=CHAR_WAIT)
+            obs["calls_at_invalidate"] = dict(calls)
+            obs["rows_at_invalidate"] = full_reservation_rows(tmp_path / DB_NAME)
+            obs["in_progress_at_invalidate"] = sim._in_progress
+            obs["simulate_alive_at_release"] = worker.is_alive()
+    finally:
+        callback.release.set()
+        for thread in started:
+            thread.join(timeout=CHAR_WAIT)
+    obs["alive"] = [thread.name for thread in started if thread.is_alive()]
+    obs["errors"] = errors
+    obs["released_in_time"] = callback.released_in_time
+    obs["invalidate_returned"] = (
+        [results["invalidate_returned"]] if "invalidate_returned" in results else [])
+    obs["flag_after_invalidate"] = results.get("flag_after_invalidate")
+    return _char_finish(obs, tmp_path, sim, calls, results.get("simulate"))
+
+
+def observe_same_thread_invalidation(tmp_path, monkeypatch, point):
+    """A one-shot callback invalidates on the simulate() thread. Records what currently happens."""
+    callback = CHAR_INVALIDATING[point]()
+    sim = simulator(tmp_path, **{point: callback})
+    calls = count_plan_sign_and_gate(monkeypatch, sim)
+    callback.sim, callback.calls = sim, calls
+    obs = {"mode": "same_thread", "point": point, "alive": [], "errors": []}
+    outer = None
+    try:
+        outer = sim.simulate(msg(), now=NOW)
+    except BaseException:  # noqa: BLE001 - reported through the observation
+        obs["errors"].append(("simulate", traceback.format_exc()))
+    obs["fired"] = callback.fired
+    obs["invalidate_returned"] = list(callback.returned)
+    obs["flag_after_invalidate"] = callback.flag_after
+    obs["in_progress_at_invalidate"] = callback.in_progress_at
+    obs["calls_at_invalidate"] = callback.calls_at
+    return _char_finish(obs, tmp_path, sim, calls, outer)
+
+def _assert_current_invalidation_race_reproduced(obs, point):
+    """CURRENT behavior as first observed on authentic Windows (characterization, not safety)."""
+    assert obs["alive"] == [] and obs["errors"] == [], obs
+    assert obs["invalidate_returned"] == [None], obs
+    assert obs["flag_after_invalidate"] is True, obs
+    assert obs["in_progress_at_invalidate"] is True, obs
+    assert obs["calls_at_invalidate"] == CHAR_CALLS_AT_POINT[point], obs
+    # The active call is NOT stopped: it signs, reserves and advances the snapshot.
+    assert obs["outer"] == ("reserved", CHAR_RESERVED_REASON), obs
+    assert obs["calls_after_outer"] == CHAR_ONE_CALL_EACH, obs
+    rows = obs["rows_after_outer"]
+    assert len(rows) == 1 and rows == obs["reference_rows"], (rows, obs["reference_rows"])
+    assert rows[0][5:7] + rows[0][11:14] == (
+        msg().message_id, msg().idempotency_key, 1, "RESERVED", NOW.isoformat()), rows
+    assert obs["reference_results"] == [("reserved", CHAR_RESERVED_REASON)], obs
+    assert obs["snapshot_after_outer"] == obs["reference_snapshot"], obs
+    assert obs["snapshot_after_outer"].stage == "AWAIT_IMPLEMENTATION", obs
+    assert obs["invalidated_flag_after_outer"] is True, obs
+    assert obs["in_progress_after_outer"] is False, obs
+    # Only LATER public calls are denied, before planning, signing or reserve.
+    assert obs["follow_up"] == ("rejected", CHAR_INVALIDATED_REASON), obs
+    assert obs["calls_after_follow_up"] == CHAR_ONE_CALL_EACH, obs
+    assert obs["rows_after_follow_up"] == rows, obs
+    assert obs["snapshot_after_follow_up"] == obs["snapshot_after_outer"], obs
+
+
+@pytest.mark.parametrize("point", CHAR_POINTS)
+def test_characterization_cross_thread_invalidate_during_paused_callback_does_not_stop_active_call(
+        tmp_path, monkeypatch, protected_entry_sentinels, point):
+    """CHARACTERIZATION of current unresolved behavior (finding 6846379683), NOT safety.
+
+    (a) point=policy: pre-sign pause in the fixture policy. (b) point=halt or
+    point=evidence: in-reserve pause in an authentic gate callback, after signing
+    and before the gate's locked insert. Thread B's invalidate_for_restart()
+    returns None while thread A is paused and before any reservation row exists;
+    after release thread A still reserves. A pass reproduces the race; it is not
+    the proposed serialized-close semantics and not a fix.
+    """
+    obs = observe_cross_thread_invalidation(tmp_path, monkeypatch, point)
+    assert obs["paused"] is True, "callback never paused within the finite wait"
+    assert obs["invalidate_returned_before_release"] is True, obs
+    assert obs["released_in_time"] is True, obs
+    assert obs["simulate_alive_at_release"] is True, obs
+    assert obs["rows_at_invalidate"] == [], obs
+    _assert_current_invalidation_race_reproduced(obs, point)
+    assert all(value == 0 for value in protected_entry_sentinels.values()), protected_entry_sentinels
+
+
+@pytest.mark.parametrize("point", CHAR_POINTS)
+def test_characterization_same_thread_callback_invalidate_does_not_stop_active_call(
+        tmp_path, monkeypatch, protected_entry_sentinels, point):
+    """CHARACTERIZATION of current unresolved behavior (finding 6846379683), NOT safety.
+
+    (c) point=policy: a one-shot fixture policy invalidates on the simulate()
+    thread before signing. (d) point=halt or point=evidence: a one-shot authentic
+    gate callback invalidates on the same thread inside reserve. The RLock is
+    already held by that thread, so nothing refuses or defers the invalidation and
+    the active call still reserves. A pass reproduces current behavior only.
+    """
+    obs = observe_same_thread_invalidation(tmp_path, monkeypatch, point)
+    assert obs["fired"] is True, obs
+    _assert_current_invalidation_race_reproduced(obs, point)
+    assert all(value == 0 for value in protected_entry_sentinels.values()), protected_entry_sentinels
