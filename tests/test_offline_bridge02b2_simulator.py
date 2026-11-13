@@ -32,6 +32,7 @@ from skippy.collaboration.github_http_transport import ProductionHTTPTransport
 from skippy.collaboration.offline_admission_gate import AdmissionError, OfflineAdmissionGate
 from skippy.collaboration.offline_signature_verifier import (
     KeyEntry, SignedEnvelope, _canonical_json, canonical_bytes, load_trust_root,
+    verify_signature,
 )
 from skippy.collaboration.offline_bridge02b2_contract import SyntheticContractError, _fingerprint
 from skippy.collaboration.offline_bridge02b2_simulator import (
@@ -157,6 +158,15 @@ def test_review_correction_workflow(tmp_path, protected_entry_sentinels):
     approved.payload["implementation_sha"] = CORRECTION
     assert sim.simulate(approved, now=NOW).outcome == "reserved"
     assert sim.snapshot.stage == "CLOSED"
+    # Work order 6865542697 item 2: exactly five RESERVED rows, no intent_journal.
+    with closing(sqlite3.connect(tmp_path / "synthetic-reservations.db")) as con:
+        assert con.execute("SELECT COUNT(*) FROM reservations").fetchone()[0] == 5
+        assert con.execute(
+            "SELECT COUNT(*) FROM reservations WHERE state='RESERVED'").fetchone()[0] == 5
+        assert [r[0] for r in con.execute(
+            "SELECT sequence FROM reservations ORDER BY sequence")] == [1, 2, 3, 4, 5]
+        assert con.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='intent_journal'").fetchone()[0] == 0
     assert set(protected_entry_sentinels) == {"ledger.record_event", "transport.__call__",
                                               "urllib.request.urlopen", "place_limit_order"}
     assert all(value == 0 for value in protected_entry_sentinels.values()), protected_entry_sentinels
@@ -518,6 +528,19 @@ def corrupt_store(db, how):
 
 # ---- Simulator: legacy object, absent fields, wrong actor (rejected before gate) ----
 
+def count_signing(monkeypatch, sim):
+    """Counting wrapper around the simulator's real signing step (install after setup)."""
+    calls = []
+    original = sim._sign_message
+
+    def wrapped(message):
+        calls.append(message)
+        return original(message)
+
+    monkeypatch.setattr(sim, "_sign_message", wrapped)
+    return calls
+
+
 @pytest.mark.parametrize("kind,seq,stage_kind", [
     ("assignment", 1, "assignment"),
     ("implementation", 2, "implementation"),
@@ -527,13 +550,19 @@ def test_simulator_rejects_authentic_legacy_envelope_before_gate(tmp_path, monke
     sim = simulator(tmp_path)
     reserve_prerequisites(sim, stage_kind)
     snapshot, rows = sim.snapshot, count_rows(tmp_path / DB_NAME)
+    full_rows = full_reservation_rows(tmp_path / DB_NAME)
+    assert len(full_rows) == rows == len(prerequisite_messages(stage_kind))
+    # Work order 6865542697 item 3: both counters are installed AFTER prerequisite setup.
     calls = forbid_gate(monkeypatch, sim)
+    sign_calls = count_signing(monkeypatch, sim)
     legacy = legacy_envelope(kind, seq)
     assert type(legacy) is AuthenticatedEnvelope
     result = sim.simulate(legacy, now=NOW)
     assert result.outcome == "rejected" and "only exact synthetic input" in result.reason
     assert calls == [] and sim.snapshot == snapshot
+    assert sign_calls == [] and sim.snapshot is snapshot
     assert count_rows(tmp_path / DB_NAME) == rows
+    assert full_reservation_rows(tmp_path / DB_NAME) == full_rows
 
 
 @pytest.mark.parametrize("kind", KINDS)
@@ -2784,3 +2813,233 @@ def test_close_result_rejects_str_subclass_reason_and_is_frozen():
     with pytest.raises(dataclasses.FrozenInstanceError):
         result.reason = "y"
     assert result.outcome is CloseOutcome.CLOSED and result.reason == "x"
+
+
+# --- Work order 6865542697 item 1: same-checkpoint different-digest identity conflicts. ---
+# Direct authentic OfflineAdmissionGate + B1 verifier, no simulator. One valid
+# checkpoint-S sequence-1 assignment is reserved first. Each conflicting candidate
+# is validly test-signed, uses the admissible NEXT sequence (2) in the SAME
+# checkpoint with valid type/evidence/SHA and a deliberately different payload
+# digest from the reserved row. The fresh-ID positive control is field-for-field
+# identical to the candidate except message_id/idempotency_key (and therefore the
+# signature), and it reserves on the same store afterwards. T25's checkpoint-B
+# sequence-1 control is deliberately NOT reused in this populated checkpoint.
+
+SAME_CKPT_DB = "same-checkpoint-direct-gate.db"
+SAME_CKPT = "ckpt-S"
+SAME_S1 = ("same-S-msg-1", "same-S-idem-1")
+SAME_FRESH = ("same-S-msg-fresh", "same-S-idem-fresh")
+SAME_CKPT_CONFLICTS = {
+    "reused_message_id": (SAME_S1[0], "same-S-idem-new"),
+    "reused_idempotency_key": ("same-S-msg-new", SAME_S1[1]),
+    "reused_both": SAME_S1,
+}
+# Exact reason returned, unchanged, by OfflineAdmissionGate.reserve for one
+# matching non-identical row: `return _rejected("conflicting identity")`.
+GATE_IDENTITY_CONFLICT_REASON = "conflicting identity"
+
+
+def same_checkpoint_candidate(kind, message_id, idempotency_key):
+    """Admissible next-sequence (2) checkpoint-S input with a payload unlike row 1."""
+    message = t25_message(kind, 2, message_id, idempotency_key, checkpoint_id=SAME_CKPT)
+    if kind == "assignment":
+        message.payload["objective"] = "Synthetic validation, different signed payload"
+    return message
+
+
+def same_checkpoint_store(tmp_path):
+    db = tmp_path / SAME_CKPT_DB
+    root, signers = make_test_keys()
+    gate = OfflineAdmissionGate(db, root, FixtureEvidence(), FixtureHalt())
+    first = sign_direct(t25_message("assignment", 1, *SAME_S1, checkpoint_id=SAME_CKPT), signers)
+    result = gate.reserve(first, NOW)
+    assert (result.outcome, result.reason) == ("reserved", "ok"), result
+    rows = full_reservation_rows(db)
+    assert [r[1:13] for r in rows] == [(
+        "QLA", "task-test", SAME_CKPT, "assign-test", *SAME_S1, "chief", "jason", "chief",
+        first.payload_digest, 1, "RESERVED")]
+    return db, gate, root, signers, rows
+
+
+def test_gate_identity_conflict_reason_is_the_unchanged_gate_source_string():
+    source = inspect.getsource(OfflineAdmissionGate.reserve)
+    assert f'return _rejected("{GATE_IDENTITY_CONFLICT_REASON}")' in source
+
+
+@pytest.mark.parametrize("kind", ["assignment", "implementation"])
+@pytest.mark.parametrize("case", sorted(SAME_CKPT_CONFLICTS))
+def test_same_checkpoint_different_digest_identity_reuse_rejected(tmp_path, case, kind):
+    db, gate, root, signers, rows_before = same_checkpoint_store(tmp_path)
+    candidate = same_checkpoint_candidate(kind, *SAME_CKPT_CONFLICTS[case])
+    control = same_checkpoint_candidate(kind, *SAME_FRESH)
+    # Identical checkpoint, next sequence, payload, actor/type and every other field.
+    assert replace(candidate, message_id=control.message_id,
+                   idempotency_key=control.idempotency_key) == control
+    assert (candidate.checkpoint_id, candidate.sequence) == (SAME_CKPT, 2)
+    candidate_env, control_env = sign_direct(candidate, signers), sign_direct(control, signers)
+    differing = {f.name for f in dataclasses.fields(SignedEnvelope)
+                 if getattr(candidate_env, f.name) != getattr(control_env, f.name)}
+    assert differing == {"message_id", "idempotency_key", "signature"}, differing
+    # Deliberately different digest from the reserved row; identical to the control.
+    assert candidate_env.payload_digest == control_env.payload_digest
+    assert candidate_env.payload_digest != rows_before[0][10]
+    # The candidate is validly test-signed under the same trust root (B1 verifier).
+    assert verify_signature(candidate_env, root, NOW) == "cryptographically_valid"
+    assert verify_signature(control_env, root, NOW) == "cryptographically_valid"
+
+    result = gate.reserve(candidate_env, NOW)
+    assert result.outcome != "duplicate", result
+    assert (result.outcome, result.reason) == ("rejected", GATE_IDENTITY_CONFLICT_REASON), result
+    assert full_reservation_rows(db) == rows_before
+
+    # Fresh-ID control on the SAME gate and store: sequence 2, assignment binding,
+    # signature, evidence and HALT are admissible, so only identity reuse rejected.
+    result = gate.reserve(control_env, NOW)
+    assert (result.outcome, result.reason) == ("reserved", "ok"), result
+    rows_after = full_reservation_rows(db)
+    assert rows_after[:1] == rows_before and len(rows_after) == 2
+    assert rows_after[1][1:13] == (
+        "QLA", "task-test", SAME_CKPT, "assign-test", *SAME_FRESH,
+        control.sender, control.recipient, control.role, control_env.payload_digest, 2, "RESERVED")
+
+
+# --- Work order 6865542697 item 4: simulator-layer workflow denials. ---
+# Each case builds valid prerequisites, then one candidate that violates exactly
+# one workflow contract rule with fresh identities (never a duplicate or identity
+# path). Counters are installed AFTER setup: planning runs once, signing and the
+# gate never run, and the snapshot object and every column of every row are
+# unchanged. A positive control then reserves: on the same simulator with the
+# denied candidate's own identities (proving no receipt was written), or, for the
+# CLOSED stream, the identical candidate on a separate reference simulator whose
+# prerequisites differ only in the final review verdict.
+
+WF_IDS = ("wf-denied-msg", "wf-denied-idem")
+
+
+def _wf(kind, seq, **payload):
+    message = msg(kind, seq, message_id=WF_IDS[0], idempotency_key=WF_IDS[1])
+    message.payload.update(payload)
+    return message
+
+
+def _review(seq, verdict="approved", sha=IMPLEMENTATION):
+    message = msg("review", seq)
+    message.payload.update(verdict=verdict, implementation_sha=sha)
+    return message
+
+
+def _prereqs(*names):
+    built = {
+        "A1": lambda: msg("assignment", 1),
+        "I2": lambda: msg("implementation", 2),
+        "R3_approved": lambda: _review(3),
+        "R3_changes_requested": lambda: _review(3, "changes_requested"),
+        "C4": lambda: msg("correction", 4),
+    }
+    return [built[name]() for name in names]
+
+
+# case -> (prerequisites, candidate, exact contract reason, control, reference prerequisites)
+WORKFLOW_DENIALS = {
+    "review_before_implementation": lambda: (
+        _prereqs("A1"), _wf("review", 2), "invalid workflow transition",
+        _wf("implementation", 2), None),
+    "correction_without_changes_requested": lambda: (
+        _prereqs("A1", "I2"), _wf("correction", 3), "invalid workflow transition",
+        _wf("review", 3, verdict="changes_requested"), None),
+    "new_event_after_closed": lambda: (
+        _prereqs("A1", "I2", "R3_approved"), _wf("correction", 4), "invalid workflow transition",
+        _wf("correction", 4), _prereqs("A1", "I2", "R3_changes_requested")),
+    "stale_review_sha": lambda: (
+        _prereqs("A1", "I2", "R3_changes_requested", "C4"),
+        _wf("review", 5, implementation_sha=IMPLEMENTATION),
+        "review SHA does not match latest implementation",
+        _wf("review", 5, implementation_sha=CORRECTION), None),
+    "reused_correction_sha_implementation": lambda: (
+        _prereqs("A1", "I2", "R3_changes_requested"),
+        _wf("correction", 4, implementation_sha=IMPLEMENTATION), "correction SHA must be new",
+        _wf("correction", 4, implementation_sha=CORRECTION), None),
+    "reused_correction_sha_base": lambda: (
+        _prereqs("A1", "I2", "R3_changes_requested"),
+        _wf("correction", 4, implementation_sha=BASE), "correction SHA must be new",
+        _wf("correction", 4, implementation_sha=CORRECTION), None),
+    "checkpoint_mismatch": lambda: (
+        _prereqs("A1"), replace(_wf("implementation", 2), checkpoint_id="check-other"),
+        "stream or assignment binding mismatch", _wf("implementation", 2), None),
+    "skipped_sequence": lambda: (
+        _prereqs("A1"), _wf("implementation", 3), "sequence 3 != 2",
+        replace(_wf("implementation", 3), sequence=2), None),
+    "reused_sequence_previous": lambda: (
+        _prereqs("A1", "I2"), _wf("review", 2), "sequence 2 != 3",
+        replace(_wf("review", 2), sequence=3), None),
+    "reused_sequence_first": lambda: (
+        _prereqs("A1"), _wf("implementation", 1), "sequence 1 != 2",
+        replace(_wf("implementation", 1), sequence=2), None),
+}
+
+RESERVED = ("reserved", "synthetic reservation only; no ledger append")
+
+
+def _reserve_all(sim, messages):
+    for message in messages:
+        result = sim.simulate(message, now=NOW)
+        assert (result.outcome, result.reason) == RESERVED, result
+
+
+def _assert_control_row(row, control):
+    assert row[1:7] == (control.project_id, control.task_id, control.checkpoint_id,
+                        control.assignment_id, control.message_id, control.idempotency_key)
+    assert row[7:10] == (control.sender, control.recipient, control.role)
+    assert row[11:13] == (control.sequence, "RESERVED")
+
+
+@pytest.mark.parametrize("case", sorted(WORKFLOW_DENIALS))
+def test_simulator_workflow_denial_isolated_before_signing_and_gate(tmp_path, monkeypatch, case):
+    prerequisites, candidate, reason, control, reference_prerequisites = WORKFLOW_DENIALS[case]()
+    sim = simulator(tmp_path)
+    _reserve_all(sim, prerequisites)
+    db = tmp_path / DB_NAME
+    rows_before, snapshot_before = full_reservation_rows(db), sim.snapshot
+    assert len(rows_before) == len(prerequisites)
+    # Fresh identities: no duplicate-candidate or identity-conflict path is possible.
+    assert all(row[5] != candidate.message_id and row[6] != candidate.idempotency_key
+               for row in rows_before)
+    assert all(receipt[0] != candidate.message_id and receipt[1] != candidate.idempotency_key
+               for receipt in snapshot_before.receipts)
+
+    calls = count_plan_sign_and_gate(monkeypatch, sim)
+    result = sim.simulate(candidate, now=NOW)
+    assert (result.outcome, result.reason) == ("rejected", reason), result
+    assert calls == {"plan": 1, "sign": 0, "reserve": 0}, calls
+    assert sim.snapshot is snapshot_before
+    assert full_reservation_rows(db) == rows_before
+
+    if reference_prerequisites is None:
+        # Same simulator and store: the surrounding inputs are admissible.
+        result = sim.simulate(control, now=NOW)
+        assert (result.outcome, result.reason) == RESERVED, result
+        assert calls == {"plan": 2, "sign": 1, "reserve": 1}, calls
+        rows_after = full_reservation_rows(db)
+        assert rows_after[:-1] == rows_before and len(rows_after) == len(rows_before) + 1
+        _assert_control_row(rows_after[-1], control)
+        assert sim.snapshot.next_sequence == control.sequence + 1
+    else:
+        # Identical candidate on a reference store whose stream is not CLOSED.
+        assert control == candidate
+        ref_dir = tmp_path / "reference"
+        ref_dir.mkdir()
+        ref = simulator(ref_dir)
+        _reserve_all(ref, reference_prerequisites)
+        ref_db = ref_dir / DB_NAME
+        ref_rows = full_reservation_rows(ref_db)
+        ref_calls = count_plan_sign_and_gate(monkeypatch, ref)
+        result = ref.simulate(control, now=NOW)
+        assert (result.outcome, result.reason) == RESERVED, result
+        assert (ref_calls["sign"], ref_calls["reserve"]) == (1, 1), ref_calls
+        ref_after = full_reservation_rows(ref_db)
+        assert ref_after[:-1] == ref_rows and len(ref_after) == len(ref_rows) + 1
+        _assert_control_row(ref_after[-1], control)
+        # The denied session is untouched by the reference run.
+        assert sim.snapshot is snapshot_before
+        assert full_reservation_rows(db) == rows_before
+        assert (calls["sign"], calls["reserve"]) == (0, 0), calls
