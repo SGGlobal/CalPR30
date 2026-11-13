@@ -46,11 +46,13 @@ SyntheticBridgeSimulator requires an injected matching test-only TrustRoot and s
 
 The existing B2.1 EvidenceVerifier interface accepts only kind, assignment_id, bound_sha, evidence_id, and now. It does not authenticate project/task/action/sender/role as a production proof. An injected string of verified is a synthetic test result, **not** real Chief or SKIPPY authorization.
 
+The fixture policy is given a separate scalar-only copy of the validated input, never the internal plan payload object. Callback-visible field or payload changes are detected and rejected before signing or gate reservation. next_snapshot and the receipt fingerprint stay bound to those unchanged internally validated fields. Altered policy input is never authorized and is never used to recompute a plan.
+
 B2.1 OfflineAdmissionGate.reserve verifies freshly signed messages, the sender matrix, evidence, SHA and sequence, and persists RESERVED only. RESERVED is **not** ACCEPTED, ledger appended, dispatched, deployed, or traded. The simulator must never import or call OfflineAuthenticatedAdapter.accept, protected ledger writers, network transports, or order execution.
 
 ## Failure and restart model
 
-The workflow tracker is in-memory only. Simulated process restart invalidates it. Creating a new simulator requires a fresh disposable SQLite database; existing state is not resumed as authority. Gate errors, including indeterminate commit, invalidate the session without replay. Existing PENDING or UNCERTAIN reservations deny B2.1 initialization; they are not evidence that a ledger write was absent.
+The workflow tracker is in-memory only. Simulated process restart invalidates it. Creating a new simulator requires a fresh disposable SQLite database; existing state is not resumed as authority. The pre-construction exists()/wal/shm freshness check is not an atomic cross-process exclusive store-creation lock and must not be treated as cross-process exclusivity. invalidate_for_restart does not acquire the simulator lock, so a concurrent invalidation can race an in-flight simulate() call; that is not operational recovery or crash-safe session control. Gate errors, including indeterminate commit, invalidate the session without replay. Existing PENDING or UNCERTAIN reservations deny B2.1 initialization; they are not evidence that a ledger write was absent.
 
 This phase performs **zero ledger appends**. Real post-ledger-append crashes, cross-store reconciliation, manual recovery and authoritative HALT/ledger atomicity must be studied in a different, separately authorized security milestone. The injected HALT probe has an unresolved probe-to-commit race. SQLite reservations are not a tamper-evident audit ledger.
 

@@ -305,3 +305,78 @@ def test_runtime_sentinels_zero_invocations_on_positive_and_negative_paths(tmp_p
     sim_neg = simulator(tmp_path / "neg", evidence=FixtureEvidence("rejected"))
     assert sim_neg.simulate(msg(), now=NOW).outcome == "rejected"
     assert all(value == 0 for value in counts.values()), counts
+
+
+class MutatingPolicy(FixturePolicy):
+    def __init__(self, field, value, kinds=None):
+        super().__init__()
+        self.field = field
+        self.value = value
+        self.kinds = kinds
+
+    def check(self, message, now):
+        result = super().check(message, now)
+        if self.kinds is None or message.payload.get("type") in self.kinds:
+            message.payload[self.field] = self.value
+        return result
+
+
+MUTATED_SHA = "0123456789abcdef0123456789abcdef01234567"
+
+
+def test_mutating_policy_on_assignment_is_rejected(tmp_path, monkeypatch):
+    sim = simulator(tmp_path, policy=MutatingPolicy("base_sha", MUTATED_SHA))
+    snapshot_before = sim.snapshot
+    signed = []
+    original_sign = sim._sign_message
+    def wrap_sign(message):
+        signed.append(dict(message.payload))
+        return original_sign(message)
+    monkeypatch.setattr(sim, "_sign_message", wrap_sign)
+    gate_calls = []
+    original_reserve = sim._gate.reserve
+    def wrap_reserve(*args, **kwargs):
+        gate_calls.append(True)
+        return original_reserve(*args, **kwargs)
+    monkeypatch.setattr(sim._gate, "reserve", wrap_reserve)
+    result = sim.simulate(msg(), now=NOW)
+    assert result.outcome == "rejected"
+    assert "mutated" in result.reason
+    assert sim.snapshot == snapshot_before
+    assert signed == []
+    assert gate_calls == []
+    db = tmp_path / "synthetic-reservations.db"
+    if db.exists():
+        with sqlite3.connect(db) as con:
+            assert con.execute("SELECT COUNT(*) FROM reservations").fetchone()[0] == 0
+
+
+def test_mutating_policy_on_implementation_is_rejected(tmp_path, monkeypatch):
+    policy = MutatingPolicy("implementation_sha", MUTATED_SHA, kinds={"implementation"})
+    sim = simulator(tmp_path, policy=policy)
+    assert sim.simulate(msg(), now=NOW).outcome == "reserved"
+    snapshot_after_assignment = sim.snapshot
+    assert snapshot_after_assignment.stage == "AWAIT_IMPLEMENTATION"
+    with sqlite3.connect(tmp_path / "synthetic-reservations.db") as con:
+        reservations_before = con.execute("SELECT COUNT(*) FROM reservations").fetchone()[0]
+    assert reservations_before == 1
+    signed = []
+    original_sign = sim._sign_message
+    def wrap_sign(message):
+        signed.append(dict(message.payload))
+        return original_sign(message)
+    monkeypatch.setattr(sim, "_sign_message", wrap_sign)
+    gate_calls = []
+    original_reserve = sim._gate.reserve
+    def wrap_reserve(*args, **kwargs):
+        gate_calls.append(True)
+        return original_reserve(*args, **kwargs)
+    monkeypatch.setattr(sim._gate, "reserve", wrap_reserve)
+    result = sim.simulate(msg("implementation", 2), now=NOW)
+    assert result.outcome == "rejected"
+    assert "mutated" in result.reason
+    assert sim.snapshot == snapshot_after_assignment
+    assert signed == []
+    assert gate_calls == []
+    with sqlite3.connect(tmp_path / "synthetic-reservations.db") as con:
+        assert con.execute("SELECT COUNT(*) FROM reservations").fetchone()[0] == reservations_before

@@ -20,7 +20,8 @@ from skippy.collaboration.offline_signature_verifier import (
     SignedEnvelope, TrustRoot, _canonical_json, canonical_bytes,
 )
 from skippy.collaboration.offline_bridge02b2_contract import (
-    MATRIX, SyntheticContractError, SyntheticInput, WorkflowSnapshot, plan_transition,
+    MATRIX, SyntheticContractError, SyntheticInput, WorkflowSnapshot,
+    plan_transition, policy_inspection_copy, _fingerprint,
 )
 
 
@@ -125,9 +126,21 @@ class SyntheticBridgeSimulator:
         try:
             # Mandatory explicit contextual test oracle. Real admission authority
             # cannot be supplied by a caller-controlled string or fixture.
-            if self._fixture_policy.check(plan.message, now) != "synthetic_verified":
+            # Policy receives a separate scalar-only copy, never the internal
+            # validated payload. Mutation is rejected before signing or reserve.
+            validated = plan.message
+            expected = _fingerprint(validated)
+            policy_view = policy_inspection_copy(validated)
+            policy_result = self._fixture_policy.check(policy_view, now)
+            if (
+                _fingerprint(validated) != expected
+                or _fingerprint(policy_view) != expected
+                or policy_view.payload is validated.payload
+            ):
+                return SimulationResult("rejected", "synthetic fixture policy mutated validated input")
+            if policy_result != "synthetic_verified":
                 return SimulationResult("rejected", "synthetic fixture policy denied")
-            envelope = self._sign_message(plan.message)
+            envelope = self._sign_message(validated)
         except Exception:
             return SimulationResult("rejected", "synthetic signing/policy failed closed")
         try:

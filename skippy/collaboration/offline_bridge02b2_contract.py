@@ -109,6 +109,22 @@ def _fingerprint(message: SyntheticInput) -> str:
     return hashlib.sha256(data.encode("utf-8")).hexdigest()
 
 
+def policy_inspection_copy(message: SyntheticInput) -> SyntheticInput:
+    """Scalar-only copy for fixture policy. Never alias the internal validated payload."""
+    if type(message) is not SyntheticInput or type(message.payload) is not dict:
+        raise SyntheticContractError("only exact synthetic input and plain payload permitted")
+    try:
+        payload = dict(message.payload)
+        if any(type(k) is not str for k in payload) or any(type(v) is not str for v in payload.values()):
+            raise ValueError("non-scalar payload")
+    except (TypeError, ValueError, RuntimeError) as exc:
+        raise SyntheticContractError("malformed synthetic payload") from exc
+    copy = replace(message, payload=payload)
+    if copy.payload is message.payload:
+        raise SyntheticContractError("policy copy must not alias validated payload")
+    return copy
+
+
 def plan_transition(message: SyntheticInput, snapshot: WorkflowSnapshot) -> TransitionPlan:
     """Classify a *simulation* transition. Always require B2.1 gate validation later."""
     if type(snapshot) is not WorkflowSnapshot:
