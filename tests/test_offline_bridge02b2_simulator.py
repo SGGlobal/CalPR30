@@ -4,7 +4,9 @@ No BRIDGE-02A ledger, network transport, production keys, or trading involved.
 """
 
 import ast
+import dataclasses
 import hashlib
+import inspect
 import json
 import multiprocessing
 import os
@@ -13,9 +15,12 @@ import threading
 import time
 import traceback
 import urllib.request
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from enum import Enum
+from fractions import Fraction
 from pathlib import Path
 
 import pytest
@@ -29,7 +34,9 @@ from skippy.collaboration.offline_signature_verifier import (
     KeyEntry, SignedEnvelope, _canonical_json, canonical_bytes, load_trust_root,
 )
 from skippy.collaboration.offline_bridge02b2_contract import SyntheticContractError, _fingerprint
-from skippy.collaboration.offline_bridge02b2_simulator import SyntheticBridgeSimulator
+from skippy.collaboration.offline_bridge02b2_simulator import (
+    CloseOutcome, CloseResult, SyntheticBridgeSimulator,
+)
 import skippy.collaboration.offline_bridge02b2_simulator as simulator_module
 from test_offline_bridge02b2_contract import (
     NOW, BASE, IMPLEMENTATION, CORRECTION, KINDS, NEXT_SEQUENCE, SHA_FIELD,
@@ -214,7 +221,12 @@ def test_storage_exception_invalidates_fixture_and_denies_restart(tmp_path, monk
     with pytest.raises(AdmissionError, match="indeterminate"):
         sim.simulate(msg(), now=NOW)
     assert sim.simulate(msg(), now=NOW).outcome == "rejected"
-    sim.invalidate_for_restart()
+    # Caller migrated by work order 6847721660: the legacy name now returns the
+    # typed result of close_session(timeout=None). This idle session was already
+    # internally invalidated by the gate exception, so it is ALREADY_CLOSED.
+    result = sim.invalidate_for_restart()
+    assert type(result) is CloseResult and type(result.outcome) is CloseOutcome
+    assert result.outcome is CloseOutcome.ALREADY_CLOSED
     assert sim.simulate(msg(), now=NOW).outcome == "rejected"
     with pytest.raises(SyntheticContractError, match="new disposable"):
         simulator(tmp_path)
@@ -1474,26 +1486,42 @@ def test_separate_process_contention_one_reserved_one_sequence_rejected(tmp_path
     assert evidence["forced_cleanup"] == [] and evidence["leftovers"] == []
 
 
-# --- Work order 6846823630 item 1: CHARACTERIZATION of CURRENT invalidation behavior. ---
-# Finding 6846379683. These tests RECORD the current, unresolved behavior of
-# invalidate_for_restart() over the authentic B2.1 OfflineAdmissionGate. They are
-# characterization tests: a pass proves only that the observed interleaving
-# reproduces. It is NOT a safety property, NOT a fix and NOT the proposed
-# serialized-close semantics in the design doc. At this source
-# invalidate_for_restart() writes the flag without taking the simulator lock, and
-# simulate() reads the flag once, at the start of _simulate_locked, so an
-# invalidation that lands after that read does not stop the active call. The
-# expectations below were first observed on authentic Windows and then asserted.
-# Coordination uses finite Events and finite joins only; no ordering relies on
-# sleep. Only started threads are joined. Worker exceptions are captured.
+# --- Work order 6847721660: serialized session close (finding 6846379683). ---
+# History: work order 6846823630 (commit dfa7e6f444ba70eadf0be9bc3eded8fdee79fe3c,
+# evidence issue #23 comment 6847090955) added six CHARACTERIZATION tests that
+# recorded the pre-fix race: an unlocked invalidate_for_restart() returned None and
+# did not stop an active transition. Those six cases are deliberately REPLACED
+# here, in the same commit as the implementation, by the named acceptance
+# regressions below (old->new mapping in the design doc); the pre-fix record is
+# preserved in the design doc, not re-asserted. The tests implement acceptance
+# specifications 1-16 of the reviewed design (review 6847713787).
+#
+# Rules kept from the characterization harness: the authentic B2.1 gate runs
+# unchanged (plan/sign/reserve counters wrap and still call the real
+# plan_transition, signing and gate.reserve); the four named zero-invocation
+# sentinels run for every case (autouse teardown plus inline assertions); every
+# Event/Barrier wait and every join is finite; worker exceptions are captured as
+# formatted tracebacks; only started threads are joined; cleanup never raises, so
+# an original failure is preserved. A timed join cannot kill a stuck thread: it
+# only reports it (workers are daemon threads so a stuck one cannot block
+# interpreter exit). Results are finite observations of the arranged orderings,
+# NOT scheduling, fairness or latency proofs. Private flags are read only after
+# the threads involved are joined, on the thread running the transition (inside
+# its own callback), or while the test itself holds the lock. Recording lock
+# wrappers are test instrumentation installed on one simulator instance, not
+# production locks.
 
 CHAR_WAIT = 10.0
+CLOSE_WAIT = CHAR_WAIT
+CLOSE_EARLY_OBSERVATION = 0.3
+CLOSE_SHORT_TIMEOUT = 0.25
 CHAR_RESERVED_REASON = "synthetic reservation only; no ledger append"
 CHAR_INVALIDATED_REASON = "simulation invalidated; no crash/restart continuation"
 CHAR_POINTS = ("policy", "halt", "evidence")
-# Calls already made when the callback pauses or invalidates. The fixture policy
-# runs before signing (pre-sign). The HALT probe and evidence verifier run inside
-# the authentic gate.reserve, after signing and before the gate's locked
+GATE_POINTS = ("halt", "evidence")
+# Calls already made when the callback runs. The fixture policy runs before
+# signing (pre-sign). The HALT probe and evidence verifier run inside the
+# authentic gate.reserve, after signing and before the gate's locked
 # BEGIN IMMEDIATE / INSERT (in-reserve).
 CHAR_CALLS_AT_POINT = {
     "policy": {"plan": 1, "sign": 0, "reserve": 0},
@@ -1501,6 +1529,8 @@ CHAR_CALLS_AT_POINT = {
     "evidence": {"plan": 1, "sign": 1, "reserve": 1},
 }
 CHAR_ONE_CALL_EACH = {"plan": 1, "sign": 1, "reserve": 1}
+NO_CALLS = {"plan": 0, "sign": 0, "reserve": 0}
+SYNTHETIC_GATE_FAILURE = "synthetic gate failure after authentic reserve"
 
 
 class _OneShotPause:
@@ -1517,23 +1547,32 @@ class _OneShotPause:
             return True
         self.fired = True
         self.entered.set()
-        self.released_in_time = self.release.wait(timeout=CHAR_WAIT)
+        self.released_in_time = self.release.wait(timeout=CLOSE_WAIT)
         return self.released_in_time
 
 
 class PausingPolicy(FixturePolicy, _OneShotPause):
-    def __init__(self):
+    """after: verified (normal) | denied (policy denial) | raise (policy exception)."""
+
+    def __init__(self, after="verified"):
         super().__init__()
         self._init_pause()
+        self.after = after
 
     def check(self, message, now):
         result = super().check(message, now)
-        return result if self._pause() else "rejected"
+        if not self._pause():
+            return "rejected"
+        if self.after == "denied":
+            return "rejected"
+        if self.after == "raise":
+            raise RuntimeError("synthetic paused policy failure")
+        return result
 
 
 class PausingHalt(FixtureHalt, _OneShotPause):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, state="clear"):
+        super().__init__(state)
         self._init_pause()
 
     def read(self):
@@ -1542,8 +1581,8 @@ class PausingHalt(FixtureHalt, _OneShotPause):
 
 
 class PausingEvidence(FixtureEvidence, _OneShotPause):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, verdict="verified"):
+        super().__init__(verdict)
         self._init_pause()
 
     def verify(self, kind, assignment_id, bound_sha, evidence_id, now):
@@ -1551,233 +1590,1157 @@ class PausingEvidence(FixtureEvidence, _OneShotPause):
         return verdict if self._pause() else "rejected"
 
 
-class _OneShotInvalidate:
-    """Calls sim.invalidate_for_restart() once, on the simulate() thread."""
+CHAR_PAUSING = {"policy": PausingPolicy, "halt": PausingHalt, "evidence": PausingEvidence}
 
-    def _init_invalidate(self):
+
+class _OneShotCallbackAction:
+    """Runs ``self.action(sim)`` once, on the simulate() thread, inside a callback."""
+
+    def _init_action(self, action):
         self.sim = None
         self.calls = None
+        self.action = action
         self.fired = False
-        self.returned = []
-        self.flag_after = None
-        self.in_progress_at = None
-        self.calls_at = None
+        self.record = {}
 
-    def _invalidate(self):
+    def _act(self):
         if self.sim is None or self.fired:
             return
         self.fired = True
-        self.in_progress_at = self.sim._in_progress
-        self.calls_at = dict(self.calls)
-        self.returned.append(self.sim.invalidate_for_restart())
-        self.flag_after = self.sim._invalidated
+        self.record["calls_at"] = None if self.calls is None else dict(self.calls)
+        self.action(self.sim, self.record)
 
 
-class InvalidatingPolicy(FixturePolicy, _OneShotInvalidate):
-    def __init__(self):
+class ActingPolicy(FixturePolicy, _OneShotCallbackAction):
+    def __init__(self, action):
         super().__init__()
-        self._init_invalidate()
+        self._init_action(action)
 
     def check(self, message, now):
-        self._invalidate()
+        self._act()
         return super().check(message, now)
 
 
-class InvalidatingHalt(FixtureHalt, _OneShotInvalidate):
-    def __init__(self):
+class ActingHalt(FixtureHalt, _OneShotCallbackAction):
+    def __init__(self, action):
         super().__init__()
-        self._init_invalidate()
+        self._init_action(action)
 
     def read(self):
-        self._invalidate()
+        self._act()
         return super().read()
 
 
-class InvalidatingEvidence(FixtureEvidence, _OneShotInvalidate):
-    def __init__(self):
+class ActingEvidence(FixtureEvidence, _OneShotCallbackAction):
+    def __init__(self, action):
         super().__init__()
-        self._init_invalidate()
+        self._init_action(action)
 
     def verify(self, kind, assignment_id, bound_sha, evidence_id, now):
-        self._invalidate()
+        self._act()
         return super().verify(kind, assignment_id, bound_sha, evidence_id, now)
 
 
-CHAR_PAUSING = {"policy": PausingPolicy, "halt": PausingHalt, "evidence": PausingEvidence}
-CHAR_INVALIDATING = {
-    "policy": InvalidatingPolicy, "halt": InvalidatingHalt, "evidence": InvalidatingEvidence}
+CLOSE_ACTING = {"policy": ActingPolicy, "halt": ActingHalt, "evidence": ActingEvidence}
 
 
-def characterization_reference(tmp_path, messages):
-    """The same messages on a separate, never-invalidated simulator and fresh store."""
-    ref_dir = tmp_path / "characterization-reference"
+class RecordingLock:
+    """Test instrumentation wrapping the simulator's own RLock; not a production lock."""
+
+    def __init__(self, inner, *, acquire_error=None):
+        self.inner = inner
+        self.acquire_error = acquire_error
+        self.calls = []
+
+    def acquire(self, *args, **kwargs):
+        self.calls.append(("acquire", args, kwargs))
+        if self.acquire_error is not None:
+            raise self.acquire_error
+        return self.inner.acquire(*args, **kwargs)
+
+    def release(self):
+        self.calls.append(("release",))
+        self.inner.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.release()
+        return False
+
+
+class Workers:
+    """Started-only, finite-join worker threads with captured exceptions."""
+
+    def __init__(self, label):
+        self.label = label
+        self.started = []
+        self.results = {}
+        self.errors = []
+        self.done = {}
+
+    def start(self, name, target, *args, entering=None):
+        done = threading.Event()
+        self.done[name] = done
+
+        def run():
+            try:
+                if entering is not None:
+                    entering.set()
+                self.results[name] = target(*args)
+            except BaseException:  # noqa: BLE001 - surfaced by the assertions
+                self.errors.append((name, traceback.format_exc()))
+            finally:
+                done.set()
+
+        thread = threading.Thread(target=run, name=f"b2b2-{self.label}-{name}", daemon=True)
+        thread.start()
+        self.started.append(thread)
+        return thread
+
+    def join(self, timeout=CLOSE_WAIT):
+        """Never raises, so an original failure in the test body is preserved."""
+        for thread in self.started:
+            thread.join(timeout=timeout)
+        return [thread.name for thread in self.started if thread.is_alive()]
+
+
+GENUINE_PLAN_TRANSITION = simulator_module.plan_transition
+
+
+@contextmanager
+def genuine_plan_transition():
+    """Reference runs use the genuine plan_transition, so the module-level plan
+    counter of the case under test is not incremented by its reference. Used only
+    after the case's worker threads are joined."""
+    patched = simulator_module.plan_transition
+    simulator_module.plan_transition = GENUINE_PLAN_TRANSITION
+    try:
+        yield
+    finally:
+        simulator_module.plan_transition = patched
+
+
+def no_close_reference(tmp_path, messages, *, label="reference", reserve_then_raise=False, **callbacks):
+    """The same messages on a separate simulator and fresh store, without any close.
+
+    Callbacks passed here are pre-released pausing callbacks of the same class and
+    configuration as the case under test, so only the close differs.
+    """
+    ref_dir = tmp_path / label
     ref_dir.mkdir()
-    ref = simulator(ref_dir)
-    results = [(r.outcome, r.reason) for r in (ref.simulate(m, now=NOW) for m in messages)]
+    ref = simulator(ref_dir, **callbacks)
+    if reserve_then_raise:
+        install_reserve_then_raise(monkeypatch=None, sim=ref)
+    results = []
+    with genuine_plan_transition():
+        for message in messages:
+            try:
+                r = ref.simulate(message, now=NOW)
+                results.append(("result", r.outcome, r.reason))
+            except Exception as exc:  # noqa: BLE001 - compared with the case under test
+                results.append(("raised", type(exc), str(exc)))
     return results, full_reservation_rows(ref_dir / DB_NAME), ref.snapshot
 
 
-def _char_json(value):
-    return value.hex() if isinstance(value, bytes) else repr(value)
+def install_reserve_then_raise(monkeypatch, sim):
+    """Authentic gate.reserve runs (callbacks, BEGIN IMMEDIATE/INSERT/commit), then a
+    synthetic AdmissionError models an indeterminate post-commit gate error."""
+    genuine = sim._gate.reserve
+
+    def reserve_then_raise(envelope, now):
+        genuine(envelope, now)
+        raise AdmissionError(SYNTHETIC_GATE_FAILURE)
+
+    if monkeypatch is None:
+        sim._gate.reserve = reserve_then_raise
+    else:
+        monkeypatch.setattr(sim._gate, "reserve", reserve_then_raise)
 
 
-def _char_finish(obs, tmp_path, sim, calls, outer):
-    """Record the outer result, full rows, snapshot, counts and subsequent-call denial."""
-    db = tmp_path / DB_NAME
-    obs["outer"] = None if outer is None else (outer.outcome, outer.reason)
-    obs["calls_after_outer"] = dict(calls)
-    obs["rows_after_outer"] = full_reservation_rows(db)
-    obs["snapshot_after_outer"] = sim.snapshot
-    obs["in_progress_after_outer"] = sim._in_progress
-    obs["invalidated_flag_after_outer"] = sim._invalidated
-    obs["follow_up"] = None
-    if not obs["alive"]:
-        follow = sim.simulate(msg("implementation", 2), now=NOW)
-        obs["follow_up"] = (follow.outcome, follow.reason)
-    obs["calls_after_follow_up"] = dict(calls)
-    obs["rows_after_follow_up"] = full_reservation_rows(db)
-    obs["snapshot_after_follow_up"] = sim.snapshot
-    ref_results, ref_rows, ref_snapshot = characterization_reference(tmp_path, [msg()])
-    obs["reference_results"] = ref_results
-    obs["reference_rows"] = ref_rows
-    obs["reference_snapshot"] = ref_snapshot
-    (tmp_path / f"characterization-{obs['mode']}-{obs['point']}.json").write_text(
-        json.dumps(obs, indent=2, sort_keys=True, default=_char_json), encoding="utf-8")
-    return obs
+def _outcome(result):
+    return ("result", result.outcome, result.reason)
 
 
-def observe_cross_thread_invalidation(tmp_path, monkeypatch, point):
-    """Thread A pauses in a callback; thread B invalidates and signals its return
-    BEFORE the parent releases A. Records what currently happens."""
-    callback = CHAR_PAUSING[point]()
+def assert_close(result, outcome):
+    assert type(result) is CloseResult, result
+    assert type(result.outcome) is CloseOutcome, result
+    assert result.outcome is outcome, result
+    assert type(result.reason) is str and result.reason, result
+
+
+def assert_denied_without_calls(sim, calls, db):
+    """A later public simulate() is denied before planning, signing or reserve."""
+    before_calls, before_rows, before_snapshot = dict(calls), full_reservation_rows(db), sim.snapshot
+    follow = sim.simulate(msg("implementation", 2), now=NOW)
+    assert (follow.outcome, follow.reason) == ("rejected", CHAR_INVALIDATED_REASON), follow
+    assert calls == before_calls, (calls, before_calls)
+    assert full_reservation_rows(db) == before_rows
+    assert sim.snapshot is before_snapshot
+
+
+def assert_sentinels_zero(counts):
+    assert all(value == 0 for value in counts.values()), counts
+
+
+def _write_close_evidence(tmp_path, name, data):
+    (tmp_path / f"close-{name}.json").write_text(
+        json.dumps(data, indent=2, sort_keys=True, default=repr), encoding="utf-8")
+
+
+def run_external_close_during_pause(tmp_path, monkeypatch, point, *, closer, callback=None,
+                                    reserve_then_raise=False):
+    """A transition pauses in ``point``; ``closer(sim)`` runs on a second thread.
+
+    Returns an observation: whether the close returned before release (finite
+    0.3 s observation only), the outer result or exception, counts and rows.
+    """
+    callback = callback if callback is not None else CHAR_PAUSING[point]()
     sim = simulator(tmp_path, **{point: callback})
+    if reserve_then_raise:
+        install_reserve_then_raise(monkeypatch, sim)
     calls = count_plan_sign_and_gate(monkeypatch, sim)
-    results, errors = {}, []
-    invalidate_returned = threading.Event()
-
-    def run_simulate():
-        try:
-            results["simulate"] = sim.simulate(msg(), now=NOW)
-        except BaseException:  # noqa: BLE001 - reported through the observation
-            errors.append(("simulate", traceback.format_exc()))
-
-    def run_invalidate():
-        try:
-            results["invalidate_returned"] = sim.invalidate_for_restart()
-            results["flag_after_invalidate"] = sim._invalidated
-            invalidate_returned.set()
-        except BaseException:  # noqa: BLE001 - reported through the observation
-            errors.append(("invalidate", traceback.format_exc()))
-
-    worker = threading.Thread(target=run_simulate, name=f"b2b2-char-{point}-simulate")
-    invalidator = threading.Thread(target=run_invalidate, name=f"b2b2-char-{point}-invalidate")
-    obs = {"mode": "cross_thread", "point": point, "paused": False,
-           "invalidate_returned_before_release": False}
-    started = []
+    workers = Workers(f"close-{point}")
+    close_entering = threading.Event()
+    obs = {"paused": False, "close_entering": False, "close_done_before_release": None}
     try:
-        worker.start()
-        started.append(worker)
-        obs["paused"] = callback.entered.wait(timeout=CHAR_WAIT)
+        workers.start("simulate", lambda: sim.simulate(msg(), now=NOW))
+        obs["paused"] = callback.entered.wait(timeout=CLOSE_WAIT)
         if obs["paused"]:
-            invalidator.start()
-            started.append(invalidator)
-            obs["invalidate_returned_before_release"] = invalidate_returned.wait(timeout=CHAR_WAIT)
-            obs["calls_at_invalidate"] = dict(calls)
-            obs["rows_at_invalidate"] = full_reservation_rows(tmp_path / DB_NAME)
-            obs["in_progress_at_invalidate"] = sim._in_progress
-            obs["simulate_alive_at_release"] = worker.is_alive()
+            workers.start("close", closer, sim, entering=close_entering)
+            obs["close_entering"] = close_entering.wait(timeout=CLOSE_WAIT)
+            obs["close_done_before_release"] = workers.done["close"].wait(
+                timeout=CLOSE_EARLY_OBSERVATION)
+            obs["calls_while_paused"] = dict(calls)
+            obs["rows_while_paused"] = full_reservation_rows(tmp_path / DB_NAME)
     finally:
         callback.release.set()
-        for thread in started:
-            thread.join(timeout=CHAR_WAIT)
-    obs["alive"] = [thread.name for thread in started if thread.is_alive()]
-    obs["errors"] = errors
+        alive = workers.join()
+    obs["alive"] = alive
+    obs["errors"] = workers.errors
     obs["released_in_time"] = callback.released_in_time
-    obs["invalidate_returned"] = (
-        [results["invalidate_returned"]] if "invalidate_returned" in results else [])
-    obs["flag_after_invalidate"] = results.get("flag_after_invalidate")
-    return _char_finish(obs, tmp_path, sim, calls, results.get("simulate"))
+    obs["results"] = dict(workers.results)
+    return sim, calls, obs
 
 
-def observe_same_thread_invalidation(tmp_path, monkeypatch, point):
-    """A one-shot callback invalidates on the simulate() thread. Records what currently happens."""
-    callback = CHAR_INVALIDATING[point]()
+def _assert_clean_pause(obs):
+    assert obs["paused"] is True, "callback never paused within the finite wait"
+    assert obs["close_entering"] is True, obs
+    assert obs["alive"] == [], obs
+    assert obs["released_in_time"] is True, obs
+
+
+# Acceptance 1 and 2 (replaces the cross-thread characterization cases).
+@pytest.mark.parametrize("point", CHAR_POINTS)
+def test_close_external_waits_for_paused_transition_then_closes(
+        tmp_path, monkeypatch, protected_entry_sentinels, point):
+    """External close_session() during a paused policy (1) or authentic gate HALT /
+    evidence callback (2) does not return while the pause holds (finite observation,
+    not a latency proof), the active call completes exactly like a no-close
+    reference, the close returns CLOSED and the next simulate() is denied with zero
+    plan/sign/reserve calls and no new row."""
+    sim, calls, obs = run_external_close_during_pause(
+        tmp_path, monkeypatch, point, closer=lambda s: s.close_session())
+    _assert_clean_pause(obs)
+    assert obs["errors"] == [], obs["errors"]
+    assert obs["close_done_before_release"] is False, obs
+    assert obs["calls_while_paused"] == CHAR_CALLS_AT_POINT[point], obs
+    assert obs["rows_while_paused"] == [], obs
+    ref_results, ref_rows, ref_snapshot = no_close_reference(tmp_path, [msg()])
+    assert ref_results == [("result", "reserved", CHAR_RESERVED_REASON)]
+    assert _outcome(obs["results"]["simulate"]) == ref_results[0]
+    assert calls == CHAR_ONE_CALL_EACH, calls
+    rows = full_reservation_rows(tmp_path / DB_NAME)
+    assert len(rows) == 1 and rows == ref_rows, (rows, ref_rows)
+    assert sim.snapshot == ref_snapshot and sim.snapshot.stage == "AWAIT_IMPLEMENTATION"
+    assert_close(obs["results"]["close"], CloseOutcome.CLOSED)
+    assert sim._invalidated is True and sim._in_progress is False  # threads joined
+    assert_denied_without_calls(sim, calls, tmp_path / DB_NAME)
+    assert_close(sim.close_session(), CloseOutcome.ALREADY_CLOSED)
+    _write_close_evidence(tmp_path, f"external-{point}", obs)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+def _same_thread_close_action(timeout):
+    def action(sim, record):
+        record["flags_before"] = (sim._invalidated, sim._in_progress)
+        record["result"] = sim.close_session(timeout)
+        record["flags_after"] = (sim._invalidated, sim._in_progress)
+    return action
+
+
+# Acceptance 3 (replaces the same-thread characterization cases).
+@pytest.mark.parametrize("timeout", [None, 0, CLOSE_SHORT_TIMEOUT], ids=["none", "zero", "bounded"])
+@pytest.mark.parametrize("point", CHAR_POINTS)
+def test_close_same_thread_callback_refused_active_transition(
+        tmp_path, monkeypatch, protected_entry_sentinels, point, timeout):
+    """A close from the policy, HALT or evidence callback on the transition's own
+    thread acquires the reentrant RLock at once and is refused deterministically.
+    The close itself changes neither flag (compared immediately before and after the
+    call, on the lock-holding thread); _in_progress still clears legitimately when
+    the outer simulate() exits. Outer outcome, full rows and snapshot equal a
+    reference run without the close; a later external close returns CLOSED."""
+    callback = CLOSE_ACTING[point](_same_thread_close_action(timeout))
     sim = simulator(tmp_path, **{point: callback})
     calls = count_plan_sign_and_gate(monkeypatch, sim)
     callback.sim, callback.calls = sim, calls
-    obs = {"mode": "same_thread", "point": point, "alive": [], "errors": []}
-    outer = None
+    outer = sim.simulate(msg(), now=NOW)
+    record = callback.record
+    assert callback.fired is True
+    assert record["calls_at"] == CHAR_CALLS_AT_POINT[point], record
+    assert_close(record["result"], CloseOutcome.REFUSED_ACTIVE_TRANSITION)
+    assert record["flags_before"] == (False, True), record
+    assert record["flags_after"] == record["flags_before"], record
+    ref_results, ref_rows, ref_snapshot = no_close_reference(tmp_path, [msg()])
+    assert [_outcome(outer)] == ref_results == [("result", "reserved", CHAR_RESERVED_REASON)]
+    assert calls == CHAR_ONE_CALL_EACH, calls
+    assert full_reservation_rows(tmp_path / DB_NAME) == ref_rows and len(ref_rows) == 1
+    assert sim.snapshot == ref_snapshot
+    assert sim._invalidated is False and sim._in_progress is False
+    assert_close(sim.close_session(), CloseOutcome.CLOSED)
+    assert_denied_without_calls(sim, calls, tmp_path / DB_NAME)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+def _synthetic_invalidate_hook(close):
+    def action(sim, record):
+        # EXPLICITLY SYNTHETIC test hook, not a real operational path: it models an
+        # internal invalidation having set the terminal flag while the transition
+        # is still active. Written on the lock-holding thread.
+        sim._invalidated = True
+        record["flags_after_hook"] = (sim._invalidated, sim._in_progress)
+        if close:
+            record["result"] = sim.close_session()
+            record["flags_after_close"] = (sim._invalidated, sim._in_progress)
+    return action
+
+
+def _run_hook(tmp_path, monkeypatch, point, *, close, label):
+    root = tmp_path / label
+    root.mkdir()
+    callback = CLOSE_ACTING[point](_synthetic_invalidate_hook(close))
+    sim = simulator(root, **{point: callback})
+    calls = count_plan_sign_and_gate(monkeypatch, sim) if close else None
+    callback.sim, callback.calls = sim, calls
     try:
-        outer = sim.simulate(msg(), now=NOW)
-    except BaseException:  # noqa: BLE001 - reported through the observation
-        obs["errors"].append(("simulate", traceback.format_exc()))
-    obs["fired"] = callback.fired
-    obs["invalidate_returned"] = list(callback.returned)
-    obs["flag_after_invalidate"] = callback.flag_after
-    obs["in_progress_at_invalidate"] = callback.in_progress_at
-    obs["calls_at_invalidate"] = callback.calls_at
-    return _char_finish(obs, tmp_path, sim, calls, outer)
+        if close:
+            outer = _outcome(sim.simulate(msg(), now=NOW))
+        else:
+            with genuine_plan_transition():
+                outer = _outcome(sim.simulate(msg(), now=NOW))
+    except Exception as exc:  # noqa: BLE001 - compared between the two runs
+        outer = ("raised", type(exc), str(exc))
+    return sim, calls, callback.record, outer, full_reservation_rows(root / DB_NAME), root
 
-def _assert_current_invalidation_race_reproduced(obs, point):
-    """CURRENT behavior as first observed on authentic Windows (characterization, not safety)."""
-    assert obs["alive"] == [] and obs["errors"] == [], obs
-    assert obs["invalidate_returned"] == [None], obs
-    assert obs["flag_after_invalidate"] is True, obs
-    assert obs["in_progress_at_invalidate"] is True, obs
-    assert obs["calls_at_invalidate"] == CHAR_CALLS_AT_POINT[point], obs
-    # The active call is NOT stopped: it signs, reserves and advances the snapshot.
-    assert obs["outer"] == ("reserved", CHAR_RESERVED_REASON), obs
-    assert obs["calls_after_outer"] == CHAR_ONE_CALL_EACH, obs
-    rows = obs["rows_after_outer"]
-    assert len(rows) == 1 and rows == obs["reference_rows"], (rows, obs["reference_rows"])
-    assert rows[0][5:7] + rows[0][11:14] == (
-        msg().message_id, msg().idempotency_key, 1, "RESERVED", NOW.isoformat()), rows
-    assert obs["reference_results"] == [("reserved", CHAR_RESERVED_REASON)], obs
-    assert obs["snapshot_after_outer"] == obs["reference_snapshot"], obs
-    assert obs["snapshot_after_outer"].stage == "AWAIT_IMPLEMENTATION", obs
-    assert obs["invalidated_flag_after_outer"] is True, obs
-    assert obs["in_progress_after_outer"] is False, obs
-    # Only LATER public calls are denied, before planning, signing or reserve.
-    assert obs["follow_up"] == ("rejected", CHAR_INVALIDATED_REASON), obs
-    assert obs["calls_after_follow_up"] == CHAR_ONE_CALL_EACH, obs
-    assert obs["rows_after_follow_up"] == rows, obs
-    assert obs["snapshot_after_follow_up"] == obs["snapshot_after_outer"], obs
+
+# Acceptance 4.
+@pytest.mark.parametrize("point", CHAR_POINTS)
+def test_close_same_thread_refused_while_already_invalidated_but_active(
+        tmp_path, monkeypatch, protected_entry_sentinels, point):
+    """Active-before-terminal ordering: with the terminal flag already True while
+    _in_progress is True, a same-thread close returns REFUSED_ACTIVE_TRANSITION, not
+    ALREADY_CLOSED; the flag stays True, _in_progress stays True until the outer
+    transition ends, and outer behavior equals the same hook without the close."""
+    sim, calls, record, outer, rows, root = _run_hook(
+        tmp_path, monkeypatch, point, close=True, label="with-close")
+    ref_sim, ref_calls, ref_record, ref_outer, ref_rows, _ = _run_hook(
+        tmp_path, monkeypatch, point, close=False, label="hook-only")
+    assert_close(record["result"], CloseOutcome.REFUSED_ACTIVE_TRANSITION)
+    assert record["flags_after_hook"] == (True, True), record
+    assert record["flags_after_close"] == (True, True), record
+    assert outer == ref_outer, (outer, ref_outer)
+    assert rows == ref_rows, (rows, ref_rows)
+    assert sim.snapshot == ref_sim.snapshot
+    assert outer == ("result", "reserved", CHAR_RESERVED_REASON), outer
+    assert calls == CHAR_ONE_CALL_EACH, calls
+    assert sim._in_progress is False and sim._invalidated is True
+    assert_close(sim.close_session(), CloseOutcome.ALREADY_CLOSED)
+    assert_denied_without_calls(sim, calls, root / DB_NAME)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+# Acceptance 5.
+def test_close_repeated_closed_then_already_closed(tmp_path, protected_entry_sentinels):
+    sim = simulator(tmp_path)
+    assert_close(sim.close_session(), CloseOutcome.CLOSED)
+    for timeout in (None, 0, CLOSE_SHORT_TIMEOUT, None, 0.0):
+        assert_close(sim.close_session(timeout), CloseOutcome.ALREADY_CLOSED)
+    assert sim._invalidated is True and sim._in_progress is False
+    assert full_reservation_rows(tmp_path / DB_NAME) == []
+    assert sim.simulate(msg(), now=NOW).reason == CHAR_INVALIDATED_REASON
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+def test_close_after_internal_invalidation_never_returns_closed(
+        tmp_path, monkeypatch, protected_entry_sentinels):
+    sim = simulator(tmp_path)
+    install_reserve_then_raise(monkeypatch, sim)
+    with pytest.raises(AdmissionError, match=SYNTHETIC_GATE_FAILURE):
+        sim.simulate(msg(), now=NOW)
+    results = [sim.close_session(t) for t in (None, 0, CLOSE_SHORT_TIMEOUT, None)]
+    for result in results:
+        assert_close(result, CloseOutcome.ALREADY_CLOSED)
+    assert not any(r.outcome is CloseOutcome.CLOSED for r in results)
+    assert len(full_reservation_rows(tmp_path / DB_NAME)) == 1
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+def _competing_closes(sim, count):
+    barrier = threading.Barrier(count)
+    workers = Workers("competing-close")
+
+    def close_after_barrier():
+        barrier.wait(timeout=CLOSE_WAIT)
+        return sim.close_session(timeout=None)
+
+    try:
+        for index in range(count):
+            workers.start(f"closer-{index}", close_after_barrier)
+    finally:
+        alive = workers.join()
+    return workers, alive
+
+
+# Acceptance 6.
+def test_competing_closes_precondition_exactly_one_closed(tmp_path, protected_entry_sentinels):
+    """Precondition satisfied: fresh open session, no transition, timeout=None for
+    every closer, released together by a finite barrier. Order is unspecified."""
+    sim = simulator(tmp_path)
+    workers, alive = _competing_closes(sim, 8)
+    assert alive == [] and workers.errors == [], (alive, workers.errors)
+    results = list(workers.results.values())
+    assert len(results) == 8
+    for result in results:
+        assert type(result.outcome) is CloseOutcome
+    closed = [r for r in results if r.outcome is CloseOutcome.CLOSED]
+    already = [r for r in results if r.outcome is CloseOutcome.ALREADY_CLOSED]
+    assert len(closed) == 1 and len(already) == 7, results
+    assert sim._invalidated is True and sim._in_progress is False
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+@pytest.mark.parametrize("point", GATE_POINTS)
+def test_competing_closes_without_precondition_at_most_one_closed(
+        tmp_path, monkeypatch, protected_entry_sentinels, point):
+    """Precondition NOT satisfied: a transition paused in an authentic gate callback
+    ends in a gate exception (internal invalidation). Contract assertion: at most
+    one CLOSED. Arranged-order observation: the closers start only after the pause
+    is observed while the transition holds the lock, so here the internal
+    invalidation linearizes first and every closer returns ALREADY_CLOSED."""
+    callback = CHAR_PAUSING[point]()
+    sim = simulator(tmp_path, **{point: callback})
+    install_reserve_then_raise(monkeypatch, sim)
+    outer = Workers("transition")
+    closers, closer_alive, raised = None, None, []
+
+    def run_transition():
+        try:
+            sim.simulate(msg(), now=NOW)
+        except AdmissionError as exc:
+            raised.append(str(exc))
+
+    try:
+        outer.start("simulate", run_transition)
+        assert callback.entered.wait(timeout=CLOSE_WAIT), "callback never paused"
+        closers = Workers("competing-close-blocked")
+        for index in range(4):
+            closers.start(f"closer-{index}", sim.close_session)
+    finally:
+        callback.release.set()
+        outer_alive = outer.join()
+        if closers is not None:
+            closer_alive = closers.join()
+    assert outer_alive == [] and closer_alive == [], (outer_alive, closer_alive)
+    assert outer.errors == [] and closers.errors == [], (outer.errors, closers.errors)
+    assert raised == [SYNTHETIC_GATE_FAILURE]
+    results = list(closers.results.values())
+    assert len(results) == 4
+    assert sum(r.outcome is CloseOutcome.CLOSED for r in results) <= 1
+    for result in results:
+        assert_close(result, CloseOutcome.ALREADY_CLOSED)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+# Acceptance 7.
+@pytest.mark.parametrize("point", CHAR_POINTS)
+def test_close_waiting_on_gate_exception_preserves_exception_then_already_closed(
+        tmp_path, monkeypatch, protected_entry_sentinels, point):
+    """The released transition raises from the gate after the authentic reserve: the
+    outer simulate() raises the same exception type and message as a no-close
+    reference; the waiting close returns ALREADY_CLOSED and raises nothing."""
+    sim, calls, obs = run_external_close_during_pause(
+        tmp_path, monkeypatch, point, closer=lambda s: s.close_session(timeout=None),
+        reserve_then_raise=True)
+    _assert_clean_pause(obs)
+    assert obs["close_done_before_release"] is False, obs
+    simulate_errors = [e for e in obs["errors"] if e[0] == "simulate"]
+    assert [e for e in obs["errors"] if e[0] != "simulate"] == [], obs["errors"]
+    assert len(simulate_errors) == 1 and "simulate" not in obs["results"]
+    ref_callback = CHAR_PAUSING[point]()
+    ref_callback.release.set()
+    ref_results, ref_rows, ref_snapshot = no_close_reference(
+        tmp_path, [msg()], reserve_then_raise=True, **{point: ref_callback})
+    assert ref_results == [("raised", AdmissionError, SYNTHETIC_GATE_FAILURE)]
+    assert SYNTHETIC_GATE_FAILURE in simulate_errors[0][1], simulate_errors
+    assert full_reservation_rows(tmp_path / DB_NAME) == ref_rows and len(ref_rows) == 1
+    assert sim.snapshot == ref_snapshot
+    assert_close(obs["results"]["close"], CloseOutcome.ALREADY_CLOSED)
+    assert_denied_without_calls(sim, calls, tmp_path / DB_NAME)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+def _gate_exception_type_and_message(tmp_path, monkeypatch, point):
+    """Same type/message check without traceback text: direct capture on a worker."""
+    callback = CHAR_PAUSING[point]()
+    sim = simulator(tmp_path, **{point: callback})
+    install_reserve_then_raise(monkeypatch, sim)
+    captured, workers = [], Workers("gate-exception-capture")
+
+    def run():
+        try:
+            sim.simulate(msg(), now=NOW)
+        except BaseException as exc:  # noqa: BLE001 - compared below
+            captured.append((type(exc), str(exc)))
+
+    try:
+        workers.start("simulate", run)
+        assert callback.entered.wait(timeout=CLOSE_WAIT), "callback never paused"
+        workers.start("close", sim.close_session)
+    finally:
+        callback.release.set()
+        alive = workers.join()
+    return sim, captured, workers, alive
 
 
 @pytest.mark.parametrize("point", CHAR_POINTS)
-def test_characterization_cross_thread_invalidate_during_paused_callback_does_not_stop_active_call(
+def test_close_waiting_on_gate_exception_exact_type_and_message(
         tmp_path, monkeypatch, protected_entry_sentinels, point):
-    """CHARACTERIZATION of current unresolved behavior (finding 6846379683), NOT safety.
+    sim, captured, workers, alive = _gate_exception_type_and_message(tmp_path, monkeypatch, point)
+    assert alive == [] and workers.errors == [], (alive, workers.errors)
+    ref_callback = CHAR_PAUSING[point]()
+    ref_callback.release.set()
+    ref_results, _, _ = no_close_reference(
+        tmp_path, [msg()], reserve_then_raise=True, **{point: ref_callback})
+    assert [("raised",) + item for item in captured] == ref_results
+    assert_close(workers.results["close"], CloseOutcome.ALREADY_CLOSED)
+    assert_sentinels_zero(protected_entry_sentinels)
 
-    (a) point=policy: pre-sign pause in the fixture policy. (b) point=halt or
-    point=evidence: in-reserve pause in an authentic gate callback, after signing
-    and before the gate's locked insert. Thread B's invalidate_for_restart()
-    returns None while thread A is paused and before any reservation row exists;
-    after release thread A still reserves. A pass reproduces the race; it is not
-    the proposed serialized-close semantics and not a fix.
-    """
-    obs = observe_cross_thread_invalidation(tmp_path, monkeypatch, point)
-    assert obs["paused"] is True, "callback never paused within the finite wait"
-    assert obs["invalidate_returned_before_release"] is True, obs
-    assert obs["released_in_time"] is True, obs
-    assert obs["simulate_alive_at_release"] is True, obs
-    assert obs["rows_at_invalidate"] == [], obs
-    _assert_current_invalidation_race_reproduced(obs, point)
-    assert all(value == 0 for value in protected_entry_sentinels.values()), protected_entry_sentinels
+
+# Acceptance 8.
+@pytest.mark.parametrize("point,make", [
+    ("policy", lambda: PausingPolicy(after="denied")),
+    ("policy", lambda: PausingPolicy(after="raise")),
+    ("halt", lambda: PausingHalt(state="halted")),
+    ("evidence", lambda: PausingEvidence(verdict="rejected")),
+], ids=["policy-denial", "policy-exception", "gate-rejection-halt", "gate-rejection-evidence"])
+def test_close_waiting_on_denied_or_rejected_transition_then_closed(
+        tmp_path, monkeypatch, protected_entry_sentinels, point, make):
+    sim, calls, obs = run_external_close_during_pause(
+        tmp_path, monkeypatch, point, closer=lambda s: s.close_session(), callback=make())
+    _assert_clean_pause(obs)
+    assert obs["errors"] == [], obs["errors"]
+    assert obs["close_done_before_release"] is False, obs
+    ref_callback = make()
+    ref_callback.release.set()
+    ref_results, ref_rows, ref_snapshot = no_close_reference(
+        tmp_path, [msg()], **{point: ref_callback})
+    outer = _outcome(obs["results"]["simulate"])
+    assert [outer] == ref_results and outer[1] == "rejected", (outer, ref_results)
+    assert full_reservation_rows(tmp_path / DB_NAME) == ref_rows == []
+    assert sim.snapshot == ref_snapshot and sim.snapshot.stage == "EMPTY"
+    assert_close(obs["results"]["close"], CloseOutcome.CLOSED)
+    assert_denied_without_calls(sim, calls, tmp_path / DB_NAME)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+# Acceptance 9.
+@pytest.mark.parametrize("point", CHAR_POINTS)
+def test_close_timeout_while_another_closer_changes_state(
+        tmp_path, monkeypatch, protected_entry_sentinels, point):
+    """Closer A waits with timeout=None; closer B (bounded) returns the neutral
+    LOCK_TIMEOUT while the pause holds. B performed no close: A later returns
+    CLOSED, which it could not if B had written the terminal flag. B's result
+    carries no state claim. Not every interleaving is established."""
+    callback = CHAR_PAUSING[point]()
+    sim = simulator(tmp_path, **{point: callback})
+    workers = Workers(f"timeout-other-closer-{point}")
+    b_result = None
+    try:
+        workers.start("simulate", lambda: sim.simulate(msg(), now=NOW))
+        assert callback.entered.wait(timeout=CLOSE_WAIT), "callback never paused"
+        a_entering = threading.Event()
+        workers.start("closer-a", sim.close_session, None, entering=a_entering)
+        assert a_entering.wait(timeout=CLOSE_WAIT)
+        b_result = sim.close_session(timeout=CLOSE_SHORT_TIMEOUT)
+        a_done_early = workers.done["closer-a"].is_set()
+    finally:
+        callback.release.set()
+        alive = workers.join()
+    assert alive == [] and workers.errors == [], (alive, workers.errors)
+    assert_close(b_result, CloseOutcome.LOCK_TIMEOUT)
+    assert a_done_early is False
+    assert workers.results["simulate"].outcome == "reserved"
+    assert_close(workers.results["closer-a"], CloseOutcome.CLOSED)
+    assert_close(sim.close_session(), CloseOutcome.ALREADY_CLOSED)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+# Acceptance 10.
+@pytest.mark.parametrize("point", GATE_POINTS)
+def test_close_timeout_while_internal_invalidation_changes_state(
+        tmp_path, monkeypatch, protected_entry_sentinels, point):
+    """LOCK_TIMEOUT is not a promise that the session is open: after it, the
+    released transition raises from the gate, internally invalidates, and a later
+    close returns ALREADY_CLOSED."""
+    callback = CHAR_PAUSING[point]()
+    sim = simulator(tmp_path, **{point: callback})
+    install_reserve_then_raise(monkeypatch, sim)
+    workers, raised = Workers(f"timeout-internal-{point}"), []
+    timeout_result = None
+
+    def run_transition():
+        try:
+            sim.simulate(msg(), now=NOW)
+        except AdmissionError as exc:
+            raised.append(str(exc))
+
+    try:
+        workers.start("simulate", run_transition)
+        assert callback.entered.wait(timeout=CLOSE_WAIT), "callback never paused"
+        timeout_result = sim.close_session(timeout=CLOSE_SHORT_TIMEOUT)
+    finally:
+        callback.release.set()
+        alive = workers.join()
+    assert alive == [] and workers.errors == [], (alive, workers.errors)
+    assert_close(timeout_result, CloseOutcome.LOCK_TIMEOUT)
+    assert raised == [SYNTHETIC_GATE_FAILURE]
+    assert sim._invalidated is True and sim._in_progress is False
+    assert_close(sim.close_session(), CloseOutcome.ALREADY_CLOSED)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+def _hold_lock_in_thread(sim):
+    """A test thread holds the simulator lock with no transition active."""
+    held, release, checked = threading.Event(), threading.Event(), {}
+    workers = Workers("lock-holder")
+
+    def hold():
+        with sim._lock:
+            checked["in_progress_while_held"] = sim._in_progress
+            checked["invalidated_while_held"] = sim._invalidated
+            held.set()
+            release.wait(timeout=CLOSE_WAIT)
+            checked["owned_by_holder_at_release"] = sim._lock._is_owned()
+            checked["in_progress_at_release"] = sim._in_progress
+            checked["invalidated_at_release"] = sim._invalidated
+
+    workers.start("holder", hold)
+    return workers, held, release, checked
+
+
+# Acceptance 11.
+def test_close_zero_timeout_idle_returns_closed(tmp_path, protected_entry_sentinels):
+    sim = simulator(tmp_path)
+    assert_close(sim.close_session(timeout=0), CloseOutcome.CLOSED)
+    assert sim._invalidated is True and sim._in_progress is False
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+@pytest.mark.parametrize("timeout", [0, CLOSE_SHORT_TIMEOUT], ids=["zero", "bounded"])
+def test_close_contended_by_lock_holder_without_transition(
+        tmp_path, protected_entry_sentinels, timeout):
+    sim = simulator(tmp_path)
+    workers, held, release, checked = _hold_lock_in_thread(sim)
+    result, elapsed = None, None
+    try:
+        assert held.wait(timeout=CLOSE_WAIT), "holder never acquired the lock"
+        start = time.monotonic()
+        result = sim.close_session(timeout=timeout)
+        elapsed = time.monotonic() - start
+        owned_by_closer = sim._lock._is_owned()
+    finally:
+        release.set()
+        alive = workers.join()
+    assert alive == [] and workers.errors == [], (alive, workers.errors)
+    assert_close(result, CloseOutcome.LOCK_TIMEOUT)
+    assert owned_by_closer is False
+    assert checked["owned_by_holder_at_release"] is True, checked
+    assert checked["in_progress_while_held"] is False and checked["invalidated_while_held"] is False
+    # Read by the lock holder itself after the timed-out close: flags unchanged.
+    assert checked["in_progress_at_release"] is False and checked["invalidated_at_release"] is False
+    if timeout:
+        # Finite observation that a bounded wait happened; not a latency bound.
+        assert elapsed >= CLOSE_SHORT_TIMEOUT / 2, elapsed
+    assert_close(sim.close_session(timeout=0), CloseOutcome.CLOSED)
+    assert_sentinels_zero(protected_entry_sentinels)
 
 
 @pytest.mark.parametrize("point", CHAR_POINTS)
-def test_characterization_same_thread_callback_invalidate_does_not_stop_active_call(
+def test_close_zero_timeout_contended_by_paused_transition(
         tmp_path, monkeypatch, protected_entry_sentinels, point):
-    """CHARACTERIZATION of current unresolved behavior (finding 6846379683), NOT safety.
+    callback = CHAR_PAUSING[point]()
+    sim = simulator(tmp_path, **{point: callback})
+    workers, result = Workers(f"zero-paused-{point}"), None
+    try:
+        workers.start("simulate", lambda: sim.simulate(msg(), now=NOW))
+        assert callback.entered.wait(timeout=CLOSE_WAIT), "callback never paused"
+        result = sim.close_session(timeout=0)
+    finally:
+        callback.release.set()
+        alive = workers.join()
+    assert alive == [] and workers.errors == [], (alive, workers.errors)
+    assert_close(result, CloseOutcome.LOCK_TIMEOUT)
+    assert workers.results["simulate"].outcome == "reserved"
+    assert sim._invalidated is False and sim._in_progress is False  # joined
+    assert_close(sim.close_session(timeout=0), CloseOutcome.CLOSED)
+    assert_sentinels_zero(protected_entry_sentinels)
 
-    (c) point=policy: a one-shot fixture policy invalidates on the simulate()
-    thread before signing. (d) point=halt or point=evidence: a one-shot authentic
-    gate callback invalidates on the same thread inside reserve. The RLock is
-    already held by that thread, so nothing refuses or defers the invalidation and
-    the active call still reserves. A pass reproduces current behavior only.
-    """
-    obs = observe_same_thread_invalidation(tmp_path, monkeypatch, point)
-    assert obs["fired"] is True, obs
-    _assert_current_invalidation_race_reproduced(obs, point)
-    assert all(value == 0 for value in protected_entry_sentinels.values()), protected_entry_sentinels
+
+# Acceptance 12.
+class _ProtocolCalls:
+    def _record(self, name):
+        self.protocol_calls.append(name)
+
+
+class InstrumentedInt(int, _ProtocolCalls):
+    def __new__(cls, value):
+        obj = super().__new__(cls, value)
+        obj.protocol_calls = []
+        return obj
+
+    def __index__(self):
+        self._record("__index__")
+        return int.__index__(self)
+
+    def __int__(self):
+        self._record("__int__")
+        return int.__int__(self)
+
+    def __float__(self):
+        self._record("__float__")
+        return int.__float__(self)
+
+    def __lt__(self, other):
+        self._record("__lt__")
+        return int.__lt__(self, other)
+
+    def __le__(self, other):
+        self._record("__le__")
+        return int.__le__(self, other)
+
+    def __gt__(self, other):
+        self._record("__gt__")
+        return int.__gt__(self, other)
+
+    def __ge__(self, other):
+        self._record("__ge__")
+        return int.__ge__(self, other)
+
+    def __eq__(self, other):
+        self._record("__eq__")
+        return int.__eq__(self, other)
+
+    def __bool__(self):
+        self._record("__bool__")
+        return int.__bool__(self)
+
+    __hash__ = int.__hash__
+
+
+class InstrumentedFloat(float, _ProtocolCalls):
+    def __new__(cls, value):
+        obj = super().__new__(cls, value)
+        obj.protocol_calls = []
+        return obj
+
+    def __float__(self):
+        self._record("__float__")
+        return float.__float__(self)
+
+    def __lt__(self, other):
+        self._record("__lt__")
+        return float.__lt__(self, other)
+
+    def __le__(self, other):
+        self._record("__le__")
+        return float.__le__(self, other)
+
+    def __gt__(self, other):
+        self._record("__gt__")
+        return float.__gt__(self, other)
+
+    def __ge__(self, other):
+        self._record("__ge__")
+        return float.__ge__(self, other)
+
+    def __eq__(self, other):
+        self._record("__eq__")
+        return float.__eq__(self, other)
+
+    def __bool__(self):
+        self._record("__bool__")
+        return float.__bool__(self)
+
+    __hash__ = float.__hash__
+
+
+class NumericProtocolObject(_ProtocolCalls):
+    def __init__(self):
+        self.protocol_calls = []
+
+    def __index__(self):
+        self._record("__index__")
+        return 1
+
+    def __int__(self):
+        self._record("__int__")
+        return 1
+
+    def __float__(self):
+        self._record("__float__")
+        return 1.0
+
+    def __lt__(self, other):
+        self._record("__lt__")
+        return False
+
+    def __le__(self, other):
+        self._record("__le__")
+        return True
+
+    def __gt__(self, other):
+        self._record("__gt__")
+        return False
+
+    def __ge__(self, other):
+        self._record("__ge__")
+        return True
+
+    def __bool__(self):
+        self._record("__bool__")
+        return True
+
+
+INVALID_TIMEOUTS = [
+    ("true", lambda: True, TypeError),
+    ("false", lambda: False, TypeError),
+    ("int-subclass", lambda: InstrumentedInt(1), TypeError),
+    ("float-subclass", lambda: InstrumentedFloat(0.5), TypeError),
+    ("str", lambda: "1", TypeError),
+    ("decimal", lambda: Decimal("1"), TypeError),
+    ("fraction", lambda: Fraction(1, 2), TypeError),
+    ("numeric-protocol-object", NumericProtocolObject, TypeError),
+    ("minus-one", lambda: -1, ValueError),
+    ("minus-half", lambda: -0.5, ValueError),
+    ("nan", lambda: float("nan"), ValueError),
+    ("inf", lambda: float("inf"), ValueError),
+    ("minus-inf", lambda: float("-inf"), ValueError),
+    ("huge-int", lambda: 10 ** 1000, ValueError),
+    ("twice-timeout-max", lambda: threading.TIMEOUT_MAX * 2, ValueError),
+    ("int-timeout-max-plus-one", lambda: int(threading.TIMEOUT_MAX) + 1, ValueError),
+]
+
+
+@pytest.fixture
+def close_result_constructions(monkeypatch):
+    """Counts CloseResult constructions (instrumented __post_init__)."""
+    count = {"n": 0}
+    original = CloseResult.__post_init__
+
+    def counting(self):
+        count["n"] += 1
+        original(self)
+
+    monkeypatch.setattr(CloseResult, "__post_init__", counting)
+    return count
+
+
+@pytest.mark.parametrize("name,make,error", INVALID_TIMEOUTS, ids=[c[0] for c in INVALID_TIMEOUTS])
+def test_close_invalid_timeout_rejected_without_lock_or_state_effects(
+        tmp_path, protected_entry_sentinels, close_result_constructions, name, make, error):
+    sim = simulator(tmp_path)
+    recorder = RecordingLock(sim._lock)
+    sim._lock = recorder
+    value = make()
+    with pytest.raises(error) as excinfo:
+        sim.close_session(value)
+    assert type(excinfo.value) is error  # 10**1000 is ValueError, never OverflowError
+    assert recorder.calls == []
+    assert close_result_constructions["n"] == 0
+    assert getattr(value, "protocol_calls", []) == []
+    assert sim._invalidated is False and sim._in_progress is False
+    assert_close(sim.close_session(), CloseOutcome.CLOSED)
+    assert sim.simulate(msg(), now=NOW).reason == CHAR_INVALIDATED_REASON
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+def _invalid_timeouts_action(sim, record):
+    recorder = sim._lock
+    record["rejections"] = []
+    for name, make, error in INVALID_TIMEOUTS:
+        value = make()
+        before_calls = len(recorder.calls)
+        before_flags = (sim._invalidated, sim._in_progress)
+        try:
+            sim.close_session(value)
+            raised = None
+        except Exception as exc:  # noqa: BLE001 - the callback catches it itself
+            raised = type(exc)
+        record["rejections"].append((
+            name, raised is error, len(recorder.calls) - before_calls,
+            (sim._invalidated, sim._in_progress) == before_flags,
+            getattr(value, "protocol_calls", [])))
+
+
+@pytest.mark.parametrize("point", CHAR_POINTS)
+def test_close_invalid_timeout_rejected_inside_same_thread_callback(
+        tmp_path, monkeypatch, protected_entry_sentinels, close_result_constructions, point):
+    callback = CLOSE_ACTING[point](_invalid_timeouts_action)
+    sim = simulator(tmp_path, **{point: callback})
+    sim._lock = RecordingLock(sim._lock)
+    calls = count_plan_sign_and_gate(monkeypatch, sim)
+    callback.sim, callback.calls = sim, calls
+    outer = sim.simulate(msg(), now=NOW)
+    assert callback.fired is True
+    assert callback.record["rejections"] == [
+        (name, True, 0, True, []) for name, _, _ in INVALID_TIMEOUTS], callback.record
+    assert close_result_constructions["n"] == 0
+    ref_results, ref_rows, ref_snapshot = no_close_reference(tmp_path, [msg()])
+    assert [_outcome(outer)] == ref_results
+    assert full_reservation_rows(tmp_path / DB_NAME) == ref_rows
+    assert sim.snapshot == ref_snapshot
+    assert sim._invalidated is False and sim._in_progress is False
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+@pytest.mark.parametrize("timeout", [0, 0.0, -0.0, threading.TIMEOUT_MAX, int(threading.TIMEOUT_MAX), 1],
+                         ids=["int-zero", "float-zero", "negative-zero", "timeout-max",
+                              "int-timeout-max", "one"])
+def test_close_boundary_timeouts_accepted(tmp_path, protected_entry_sentinels, timeout):
+    sim = simulator(tmp_path)
+    sim._lock = recorder = RecordingLock(sim._lock)
+    assert_close(sim.close_session(timeout), CloseOutcome.CLOSED)
+    assert_close(sim.close_session(timeout), CloseOutcome.ALREADY_CLOSED)
+    expected_acquire = (((), {"blocking": False}) if timeout == 0
+                        else ((), {"timeout": timeout}))
+    assert recorder.calls == [("acquire",) + expected_acquire, ("release",)] * 2
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+def test_close_none_timeout_uses_unbounded_blocking_acquire(tmp_path):
+    sim = simulator(tmp_path)
+    sim._lock = recorder = RecordingLock(sim._lock)
+    assert_close(sim.close_session(), CloseOutcome.CLOSED)
+    assert_close(sim.close_session(None), CloseOutcome.ALREADY_CLOSED)
+    assert recorder.calls == [("acquire", (), {}), ("release",)] * 2
+
+
+# Acceptance 13.
+@pytest.mark.parametrize("exc", [KeyboardInterrupt(), RuntimeError("synthetic acquire failure")],
+                         ids=["keyboard-interrupt", "runtime-error"])
+def test_close_acquisition_error_propagates_without_release(
+        tmp_path, protected_entry_sentinels, close_result_constructions, exc):
+    sim = simulator(tmp_path)
+    sim._lock = recorder = RecordingLock(sim._lock, acquire_error=exc)
+    with pytest.raises(type(exc)) as excinfo:
+        sim.close_session(timeout=None)
+    assert excinfo.value is exc
+    assert [call[0] for call in recorder.calls] == ["acquire"]
+    assert close_result_constructions["n"] == 0
+    assert sim._invalidated is False and sim._in_progress is False
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+def test_close_forced_locked_section_error_still_releases(
+        tmp_path, monkeypatch, protected_entry_sentinels):
+    sim = simulator(tmp_path)
+    sim._lock = recorder = RecordingLock(sim._lock)
+
+    def forced(*args, **kwargs):
+        raise RuntimeError("synthetic locked-section failure")
+
+    monkeypatch.setattr(sim, "_close_locked", forced)
+    with pytest.raises(RuntimeError, match="synthetic locked-section failure"):
+        sim.close_session(timeout=None)
+    assert [call[0] for call in recorder.calls] == ["acquire", "release"]
+    assert recorder.inner._is_owned() is False
+    # Another thread can take the lock, so it was really released.
+    acquired_elsewhere = {}
+    workers = Workers("release-check")
+
+    def try_acquire():
+        ok = recorder.inner.acquire(blocking=False)
+        acquired_elsewhere["ok"] = ok
+        if ok:
+            recorder.inner.release()
+
+    try:
+        workers.start("other", try_acquire)
+    finally:
+        alive = workers.join()
+    assert alive == [] and workers.errors == [] and acquired_elsewhere == {"ok": True}
+    assert sim._invalidated is False and sim._in_progress is False
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+# Acceptance 14.
+@pytest.mark.parametrize("repetition", range(5))
+def test_close_racing_simulate_only_permitted_orderings(
+        tmp_path, monkeypatch, protected_entry_sentinels, repetition):
+    """Two permitted orderings, no fairness assertion: simulate first (reserved,
+    one row, then CLOSED) or close first (simulate denied with zero
+    plan/sign/reserve calls and no row; CLOSED)."""
+    sim = simulator(tmp_path)
+    calls = count_plan_sign_and_gate(monkeypatch, sim)
+    barrier = threading.Barrier(2)
+    workers = Workers("close-vs-simulate")
+
+    def after_barrier(fn):
+        barrier.wait(timeout=CLOSE_WAIT)
+        return fn()
+
+    try:
+        workers.start("simulate", after_barrier, lambda: sim.simulate(msg(), now=NOW))
+        workers.start("close", after_barrier, sim.close_session)
+    finally:
+        alive = workers.join()
+    assert alive == [] and workers.errors == [], (alive, workers.errors)
+    assert_close(workers.results["close"], CloseOutcome.CLOSED)
+    sim_result = workers.results["simulate"]
+    rows = full_reservation_rows(tmp_path / DB_NAME)
+    if sim_result.outcome == "reserved":
+        ordering = "simulate-first"
+        assert sim_result.reason == CHAR_RESERVED_REASON
+        assert calls == CHAR_ONE_CALL_EACH and len(rows) == 1
+    else:
+        ordering = "close-first"
+        assert (sim_result.outcome, sim_result.reason) == ("rejected", CHAR_INVALIDATED_REASON)
+        assert calls == NO_CALLS and rows == []
+    _write_close_evidence(tmp_path, f"race-{repetition}", {"ordering": ordering})
+    assert_denied_without_calls(sim, calls, tmp_path / DB_NAME)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+# Acceptance 15: legacy alias migration.
+def test_invalidate_for_restart_delegates_to_close_session_with_none_timeout(tmp_path, monkeypatch):
+    sim = simulator(tmp_path)
+    assert list(inspect.signature(sim.invalidate_for_restart).parameters) == []
+    original = sim.close_session
+    seen = []
+
+    def recording(*args, **kwargs):
+        result = original(*args, **kwargs)
+        seen.append((args, kwargs, result))
+        return result
+
+    monkeypatch.setattr(sim, "close_session", recording)
+    first = sim.invalidate_for_restart()
+    second = sim.invalidate_for_restart()
+    assert [(a, k) for a, k, _ in seen] == [((), {"timeout": None})] * 2
+    assert first is seen[0][2] and second is seen[1][2]
+    assert_close(first, CloseOutcome.CLOSED)
+    assert_close(second, CloseOutcome.ALREADY_CLOSED)
+
+
+# Replaces the cross-thread characterization cases (legacy name, blocking).
+@pytest.mark.parametrize("point", CHAR_POINTS)
+def test_invalidate_for_restart_cross_thread_waits_for_paused_transition(
+        tmp_path, monkeypatch, protected_entry_sentinels, point):
+    sim, calls, obs = run_external_close_during_pause(
+        tmp_path, monkeypatch, point, closer=lambda s: s.invalidate_for_restart())
+    _assert_clean_pause(obs)
+    assert obs["errors"] == [], obs["errors"]
+    assert obs["close_done_before_release"] is False, obs
+    assert obs["rows_while_paused"] == [] and obs["calls_while_paused"] == CHAR_CALLS_AT_POINT[point]
+    assert obs["results"]["simulate"].outcome == "reserved"
+    assert len(full_reservation_rows(tmp_path / DB_NAME)) == 1
+    assert_close(obs["results"]["close"], CloseOutcome.CLOSED)
+    assert_denied_without_calls(sim, calls, tmp_path / DB_NAME)
+    assert_close(sim.invalidate_for_restart(), CloseOutcome.ALREADY_CLOSED)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+def _legacy_alias_action(sim, record):
+    record["flags_before"] = (sim._invalidated, sim._in_progress)
+    record["result"] = sim.invalidate_for_restart()
+    record["flags_after"] = (sim._invalidated, sim._in_progress)
+
+
+# Replaces the same-thread characterization cases (legacy name, refused).
+@pytest.mark.parametrize("point", CHAR_POINTS)
+def test_invalidate_for_restart_same_thread_callback_refused(
+        tmp_path, monkeypatch, protected_entry_sentinels, point):
+    callback = CLOSE_ACTING[point](_legacy_alias_action)
+    sim = simulator(tmp_path, **{point: callback})
+    calls = count_plan_sign_and_gate(monkeypatch, sim)
+    callback.sim, callback.calls = sim, calls
+    outer = sim.simulate(msg(), now=NOW)
+    record = callback.record
+    assert_close(record["result"], CloseOutcome.REFUSED_ACTIVE_TRANSITION)
+    assert record["flags_before"] == record["flags_after"] == (False, True), record
+    ref_results, ref_rows, ref_snapshot = no_close_reference(tmp_path, [msg()])
+    assert [_outcome(outer)] == ref_results
+    assert full_reservation_rows(tmp_path / DB_NAME) == ref_rows
+    assert sim.snapshot == ref_snapshot
+    assert_close(sim.invalidate_for_restart(), CloseOutcome.CLOSED)
+    assert_denied_without_calls(sim, calls, tmp_path / DB_NAME)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+# Nested simulate after a refused close (reentrancy guard unchanged).
+@pytest.mark.parametrize("point", CHAR_POINTS)
+def test_nested_simulate_after_refused_close_still_rejected_as_reentrant(
+        tmp_path, monkeypatch, protected_entry_sentinels, point):
+    def action(sim, record):
+        record["close"] = sim.close_session(0)
+        record["nested"] = sim.simulate(msg("implementation", 2), now=NOW)
+
+    callback = CLOSE_ACTING[point](action)
+    sim = simulator(tmp_path, **{point: callback})
+    calls = count_plan_sign_and_gate(monkeypatch, sim)
+    callback.sim, callback.calls = sim, calls
+    outer = sim.simulate(msg(), now=NOW)
+    assert_close(callback.record["close"], CloseOutcome.REFUSED_ACTIVE_TRANSITION)
+    nested = callback.record["nested"]
+    assert nested.outcome == "rejected" and REENTRANT_REASON in nested.reason
+    assert outer.outcome == "reserved" and calls == CHAR_ONE_CALL_EACH
+    assert len(full_reservation_rows(tmp_path / DB_NAME)) == 1
+    assert_close(sim.close_session(), CloseOutcome.CLOSED)
+    assert_sentinels_zero(protected_entry_sentinels)
+
+
+# Typed result contract.
+def test_close_outcome_is_closed_str_enum():
+    assert issubclass(CloseOutcome, str) and issubclass(CloseOutcome, Enum)
+    assert [(m.name, m.value) for m in CloseOutcome] == [
+        ("CLOSED", "CLOSED"), ("ALREADY_CLOSED", "ALREADY_CLOSED"),
+        ("REFUSED_ACTIVE_TRANSITION", "REFUSED_ACTIVE_TRANSITION"),
+        ("LOCK_TIMEOUT", "LOCK_TIMEOUT")]
+    with pytest.raises(ValueError):
+        CloseOutcome("closed")
+
+
+@pytest.mark.parametrize("outcome,reason", [
+    ("CLOSED", "x"), (None, "x"), (1, "x"), (CloseOutcome.CLOSED, None),
+    (CloseOutcome.CLOSED, b"x"), (CloseOutcome.CLOSED, 1),
+], ids=["plain-string-outcome", "none-outcome", "int-outcome", "none-reason",
+        "bytes-reason", "int-reason"])
+def test_close_result_rejects_untyped_fields(outcome, reason):
+    with pytest.raises(TypeError):
+        CloseResult(outcome, reason)
+
+
+def test_close_result_rejects_str_subclass_reason_and_is_frozen():
+    class Reason(str):
+        pass
+
+    with pytest.raises(TypeError):
+        CloseResult(CloseOutcome.CLOSED, Reason("x"))
+    result = CloseResult(CloseOutcome.CLOSED, "x")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.outcome = CloseOutcome.LOCK_TIMEOUT
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.reason = "y"
+    assert result.outcome is CloseOutcome.CLOSED and result.reason == "x"

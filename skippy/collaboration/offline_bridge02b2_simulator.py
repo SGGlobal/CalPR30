@@ -7,8 +7,11 @@ operational evidence or resume-after-crash capability. Never use in production.
 from __future__ import annotations
 
 import hashlib
+import math
+import threading
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from threading import RLock
 from typing import Protocol
@@ -36,6 +39,67 @@ class SyntheticFixturePolicy(Protocol):
 class SimulationResult:
     outcome: str  # reserved | duplicate | rejected
     reason: str
+
+
+class CloseOutcome(str, Enum):
+    """Closed outcome set of close_session() (work order 6847721660).
+
+    Only CLOSED and ALREADY_CLOSED are successful closes. REFUSED_ACTIVE_TRANSITION
+    and LOCK_TIMEOUT mean only that this call did not close the session. Because
+    members compare equal to their string values, compare by identity and check
+    ``type(result.outcome) is CloseOutcome``; never compare by string.
+    """
+
+    CLOSED = "CLOSED"
+    ALREADY_CLOSED = "ALREADY_CLOSED"
+    REFUSED_ACTIVE_TRANSITION = "REFUSED_ACTIVE_TRANSITION"
+    LOCK_TIMEOUT = "LOCK_TIMEOUT"
+
+
+@dataclass(frozen=True)
+class CloseResult:
+    """Typed close result. Frozen is a fixture-consistency property, not a sandbox."""
+
+    outcome: CloseOutcome
+    reason: str
+
+    def __post_init__(self) -> None:
+        if type(self.outcome) is not CloseOutcome:
+            raise TypeError("CloseResult.outcome must be a CloseOutcome member")
+        if type(self.reason) is not str:
+            raise TypeError("CloseResult.reason must be a str")
+
+
+CLOSE_REASONS = {
+    CloseOutcome.CLOSED: "synthetic session closed; every later transition is denied",
+    CloseOutcome.ALREADY_CLOSED: "synthetic session already closed or internally invalidated",
+    CloseOutcome.REFUSED_ACTIVE_TRANSITION:
+        "close refused while a transition is active on this thread",
+    CloseOutcome.LOCK_TIMEOUT:
+        "close lock not acquired; no close performed; session state unknown to this call",
+}
+
+
+def _validate_close_timeout(timeout: object) -> None:
+    """Exact built-in validation; no coercion and no numeric protocol method is invoked.
+
+    Runs before any lock acquisition or session-state access. None means an
+    unbounded wait. Only exact int or exact float is accepted (bool, subclasses,
+    str, Decimal, Fraction and __index__/__int__/__float__ objects raise
+    TypeError). A float must be finite. The original exact int or float is then
+    compared with 0 and threading.TIMEOUT_MAX; Python compares int and float
+    exactly without converting the int, so a huge int is rejected with
+    ValueError here and never reaches a float conversion (OverflowError).
+    """
+    if timeout is None:
+        return
+    kind = type(timeout)
+    if kind is not int and kind is not float:
+        raise TypeError("timeout must be None, an exact int or an exact float")
+    if kind is float and not math.isfinite(timeout):
+        raise ValueError("timeout must be finite")
+    if not (0 <= timeout <= threading.TIMEOUT_MAX):
+        raise ValueError("timeout must satisfy 0 <= timeout <= threading.TIMEOUT_MAX")
 
 
 class SyntheticBridgeSimulator:
@@ -92,9 +156,58 @@ class SyntheticBridgeSimulator:
     def snapshot(self) -> WorkflowSnapshot:
         return self._snapshot
 
-    def invalidate_for_restart(self) -> None:
-        """A restarted simulation cannot reconstruct workflow authority."""
-        self._invalidated = True
+    def close_session(self, timeout: object = None) -> CloseResult:
+        """Serialized, non-cancelling session close (work order 6847721660).
+
+        The timeout is validated first; an invalid value raises TypeError or
+        ValueError without touching the lock or either flag. None waits without
+        bound, 0 makes one nonblocking attempt and a positive value bounds only
+        the lock wait (not an end-to-end deadline). A failed acquisition returns
+        the neutral LOCK_TIMEOUT without reading any session state: the session
+        may already have been closed or internally invalidated meanwhile.
+        Acquisition exceptions propagate unchanged. After a successful
+        acquisition the lock is always released in finally.
+        """
+        _validate_close_timeout(timeout)
+        lock = self._lock
+        if timeout is None:
+            acquired = lock.acquire()
+        elif timeout == 0:
+            acquired = lock.acquire(blocking=False)
+        else:
+            acquired = lock.acquire(timeout=timeout)
+        if not acquired:
+            return CloseResult(CloseOutcome.LOCK_TIMEOUT, CLOSE_REASONS[CloseOutcome.LOCK_TIMEOUT])
+        try:
+            return self._close_locked()
+        finally:
+            lock.release()
+
+    def _close_locked(self) -> CloseResult:
+        """Decision under the acquired lock: active transition BEFORE terminal state.
+
+        A lock holder that observes _in_progress True is necessarily the thread
+        running the active transition (RLock reentrancy), so this is the
+        same-thread path; it changes neither flag and does not affect the outer
+        transition. Nothing here cancels a transition or clears the terminal flag.
+        """
+        if self._in_progress:
+            outcome = CloseOutcome.REFUSED_ACTIVE_TRANSITION
+        elif self._invalidated:
+            outcome = CloseOutcome.ALREADY_CLOSED
+        else:
+            self._invalidated = True
+            outcome = CloseOutcome.CLOSED
+        return CloseResult(outcome, CLOSE_REASONS[outcome])
+
+    def invalidate_for_restart(self) -> CloseResult:
+        """Legacy name: a restarted simulation cannot reconstruct workflow authority.
+
+        Delegates to close_session(timeout=None) and returns its typed result, so
+        it blocks while another thread holds the lock and is refused on the
+        thread running an active transition.
+        """
+        return self.close_session(timeout=None)
 
     def _sign_message(self, message: SyntheticInput) -> SignedEnvelope:
         """Create a *new* test signature from copied typed fields, never a legacy upgrade."""
@@ -122,7 +235,9 @@ class SyntheticBridgeSimulator:
         # outer call then continues with its own plan and policy result. A plain
         # non-reentrant lock is deliberately not used: same-thread recursion would
         # deadlock. This is a fixture consistency control, not a sandbox against
-        # arbitrary in-process code.
+        # arbitrary in-process code. close_session() shares this lock and this
+        # flag: it waits for (never cancels) an active transition, and a
+        # same-thread close from a callback is refused (work order 6847721660).
         with self._lock:
             if self._in_progress:
                 return SimulationResult(
