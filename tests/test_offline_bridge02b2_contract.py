@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from skippy.collaboration.authenticated_envelope import AuthenticatedEnvelope, build_envelope
 from skippy.collaboration.offline_bridge02b2_contract import (
     SyntheticContractError, SyntheticInput, WorkflowSnapshot, plan_transition,
 )
@@ -174,3 +175,129 @@ def test_reject_legacy_shape_non_plain_payload_and_non_utc():
         plan_transition(replace(msg(), payload={"type": ["assignment"]}), WorkflowSnapshot())
     with pytest.raises(SyntheticContractError, match="UTC-aware"):
         plan_transition(replace(msg(), timestamp=datetime(2026, 11, 12)), WorkflowSnapshot())
+
+
+# --- Work order 6845134418: explicit pure-contract coverage (no I/O). ---
+
+KINDS = ("assignment", "implementation", "review", "correction")
+NEXT_SEQUENCE = {"assignment": 1, "implementation": 2, "review": 3, "correction": 4}
+SHA_FIELD = {"assignment": "base_sha", "implementation": "implementation_sha",
+             "review": "implementation_sha", "correction": "implementation_sha"}
+ACTORS = {"assignment": ("chief", "chief", "jason"),
+          "implementation": ("jason", "implementer", "skippy"),
+          "correction": ("jason", "implementer", "skippy"),
+          "review": ("skippy", "reviewer", "jason")}
+CANDIDATE_ACTORS = ("chief", "jason", "skippy", "bridge")
+WRONG_SENDER = {"assignment": "skippy", "implementation": "chief",
+                "review": "jason", "correction": "skippy"}
+WRONG_RECIPIENT = {"assignment": "skippy", "implementation": "chief",
+                   "review": "chief", "correction": "jason"}
+
+
+def prerequisite_messages(kind):
+    """Valid messages that move one empty stream to the stage accepting `kind`."""
+    messages = []
+    if kind in ("implementation", "review", "correction"):
+        messages.append(msg("assignment", 1))
+    if kind in ("review", "correction"):
+        messages.append(msg("implementation", 2))
+    if kind == "correction":
+        request = msg("review", 3)
+        request.payload["verdict"] = "changes_requested"
+        messages.append(request)
+    return messages
+
+
+def snapshot_ready_for(kind):
+    snapshot = WorkflowSnapshot()
+    for message in prerequisite_messages(kind):
+        snapshot = plan_transition(message, snapshot).next_snapshot
+    return snapshot
+
+
+def legacy_envelope(kind="assignment", seq=1):
+    """Authentic BRIDGE-02A AuthenticatedEnvelope built by its own build_envelope()."""
+    sender, role, recipient = {
+        "assignment": ("chief", "chief", "jason"),
+        "implementation": ("jason", "implementer", "skippy"),
+        "correction_request": ("skippy", "reviewer", "jason"),
+    }[kind]
+    payload = {"assignment": {"type": "assignment", "objective": "Synthetic validation"},
+               "implementation": {"type": "implementation", "sha": IMPLEMENTATION},
+               "correction_request": {"type": "correction_request", "findings": "fixture"}}[kind]
+    return build_envelope(
+        project_id="QLA", task_id="task-test", checkpoint_id="check-test",
+        assignment_id="assign-test", message_id=f"msg-{seq}", idempotency_key=f"idem-{seq}",
+        sender=sender, recipient=recipient, role=role, payload=payload,
+        timestamp=NOW, expiry=NOW + timedelta(hours=1), sequence=seq,
+    )
+
+
+@pytest.mark.parametrize("kind,seq,stage_kind", [
+    ("assignment", 1, "assignment"),
+    ("implementation", 2, "implementation"),
+    ("correction_request", 3, "correction"),
+])
+def test_actual_legacy_authenticated_envelope_instance_rejected(kind, seq, stage_kind):
+    legacy = legacy_envelope(kind, seq)
+    assert type(legacy) is AuthenticatedEnvelope
+    snapshot = snapshot_ready_for(stage_kind)
+    with pytest.raises(SyntheticContractError, match="only exact synthetic input"):
+        plan_transition(legacy, snapshot)
+    # The legacy payload shape (sha alias, correction_request) is not translated
+    # when wrapped in a synthetic input either.
+    template = msg(stage_kind, NEXT_SEQUENCE[stage_kind])
+    with pytest.raises(SyntheticContractError):
+        plan_transition(replace(template, payload=legacy.payload), snapshot)
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_absent_required_sha_is_distinct_from_none(kind):
+    snapshot = snapshot_ready_for(kind)
+    field = SHA_FIELD[kind]
+    absent = msg(kind, NEXT_SEQUENCE[kind])
+    del absent.payload[field]
+    assert field not in absent.payload
+    with pytest.raises(SyntheticContractError, match="unknown or missing signed payload fields"):
+        plan_transition(absent, snapshot)
+    none_value = msg(kind, NEXT_SEQUENCE[kind])
+    none_value.payload[field] = None
+    assert field in none_value.payload
+    with pytest.raises(SyntheticContractError, match="malformed synthetic payload"):
+        plan_transition(none_value, snapshot)
+
+
+def test_absent_review_verdict_rejected():
+    snapshot = snapshot_ready_for("review")
+    review = msg("review", 3)
+    del review.payload["verdict"]
+    with pytest.raises(SyntheticContractError, match="unknown or missing signed payload fields"):
+        plan_transition(review, snapshot)
+    assert snapshot.stage == "AWAIT_REVIEW"
+
+
+@pytest.mark.parametrize("kind", KINDS)
+def test_absent_evidence_id_rejected(kind):
+    snapshot = snapshot_ready_for(kind)
+    m = msg(kind, NEXT_SEQUENCE[kind])
+    del m.payload["evidence_id"]
+    with pytest.raises(SyntheticContractError, match="unknown or missing signed payload fields"):
+        plan_transition(m, snapshot)
+
+
+@pytest.mark.parametrize("kind,actor", [
+    (kind, actor) for kind in KINDS for actor in CANDIDATE_ACTORS if actor != ACTORS[kind][0]
+])
+def test_wrong_sender_rejected(kind, actor):
+    m = msg(kind, NEXT_SEQUENCE[kind])
+    with pytest.raises(SyntheticContractError, match="unauthorized"):
+        plan_transition(replace(m, sender=actor), snapshot_ready_for(kind))
+
+
+@pytest.mark.parametrize("kind,actor", [
+    (kind, actor) for kind in KINDS for actor in CANDIDATE_ACTORS if actor != ACTORS[kind][2]
+])
+def test_wrong_recipient_rejected(kind, actor):
+    m = msg(kind, NEXT_SEQUENCE[kind])
+    with pytest.raises(SyntheticContractError, match="unauthorized"):
+        plan_transition(replace(m, recipient=actor), snapshot_ready_for(kind))

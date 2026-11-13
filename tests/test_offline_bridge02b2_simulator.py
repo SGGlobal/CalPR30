@@ -4,9 +4,12 @@ No BRIDGE-02A ledger, network transport, production keys, or trading involved.
 """
 
 import ast
+import hashlib
 import sqlite3
 import threading
+import time
 import urllib.request
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -14,15 +17,19 @@ from pathlib import Path
 import pytest
 from nacl.signing import SigningKey
 
+from skippy.collaboration.authenticated_envelope import AuthenticatedEnvelope
 from skippy.collaboration.checkpoint_ledger import CheckpointLedger
 from skippy.collaboration.github_http_transport import ProductionHTTPTransport
 from skippy.collaboration.offline_admission_gate import AdmissionError, OfflineAdmissionGate
 from skippy.collaboration.offline_signature_verifier import (
-    KeyEntry, SignedEnvelope, load_trust_root,
+    KeyEntry, SignedEnvelope, _canonical_json, canonical_bytes, load_trust_root,
 )
 from skippy.collaboration.offline_bridge02b2_contract import SyntheticContractError
 from skippy.collaboration.offline_bridge02b2_simulator import SyntheticBridgeSimulator
-from test_offline_bridge02b2_contract import NOW, BASE, IMPLEMENTATION, CORRECTION, msg
+from test_offline_bridge02b2_contract import (
+    NOW, BASE, IMPLEMENTATION, CORRECTION, KINDS, NEXT_SEQUENCE, SHA_FIELD,
+    WRONG_RECIPIENT, WRONG_SENDER, legacy_envelope, msg, prerequisite_messages,
+)
 
 import polymarket.orders as polymarket_orders
 
@@ -105,7 +112,15 @@ def install_protected_entry_sentinels(monkeypatch):
     return counts
 
 
-def test_complete_workflow_reserves_only(tmp_path):
+@pytest.fixture(autouse=True)
+def protected_entry_sentinels(monkeypatch):
+    """Named zero-invocation runtime sentinels for EVERY simulator-module test."""
+    counts = install_protected_entry_sentinels(monkeypatch)
+    yield counts
+    assert all(value == 0 for value in counts.values()), counts
+
+
+def test_complete_workflow_reserves_only(tmp_path, protected_entry_sentinels):
     sim = simulator(tmp_path)
     for kind, seq in [("assignment", 1), ("implementation", 2), ("review", 3)]:
         assert sim.simulate(msg(kind, seq), now=NOW).outcome == "reserved"
@@ -113,9 +128,12 @@ def test_complete_workflow_reserves_only(tmp_path):
     with sqlite3.connect(tmp_path / "synthetic-reservations.db") as con:
         assert con.execute("SELECT COUNT(*) FROM reservations WHERE state='RESERVED'").fetchone()[0] == 3
         assert con.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='intent_journal'").fetchone()[0] == 0
+    assert set(protected_entry_sentinels) == {"ledger.record_event", "transport.__call__",
+                                              "urllib.request.urlopen", "place_limit_order"}
+    assert all(value == 0 for value in protected_entry_sentinels.values()), protected_entry_sentinels
 
 
-def test_review_correction_workflow(tmp_path):
+def test_review_correction_workflow(tmp_path, protected_entry_sentinels):
     sim = simulator(tmp_path)
     for kind, seq in [("assignment", 1), ("implementation", 2)]:
         assert sim.simulate(msg(kind, seq), now=NOW).outcome == "reserved"
@@ -127,6 +145,9 @@ def test_review_correction_workflow(tmp_path):
     approved.payload["implementation_sha"] = CORRECTION
     assert sim.simulate(approved, now=NOW).outcome == "reserved"
     assert sim.snapshot.stage == "CLOSED"
+    assert set(protected_entry_sentinels) == {"ledger.record_event", "transport.__call__",
+                                              "urllib.request.urlopen", "place_limit_order"}
+    assert all(value == 0 for value in protected_entry_sentinels.values()), protected_entry_sentinels
 
 
 def test_exact_duplicate_is_reverified_and_nonwriting(tmp_path):
@@ -380,3 +401,455 @@ def test_mutating_policy_on_implementation_is_rejected(tmp_path, monkeypatch):
     assert gate_calls == []
     with sqlite3.connect(tmp_path / "synthetic-reservations.db") as con:
         assert con.execute("SELECT COUNT(*) FROM reservations").fetchone()[0] == reservations_before
+
+
+# --- Work order 6845134418: explicit simulator and direct-gate coverage. ---
+# Simulator tests drive SyntheticBridgeSimulator over the authentic B2.1 gate.
+# Direct-gate tests drive the authentic OfflineAdmissionGate and B1 verifier with
+# test-signed SignedEnvelope values and no simulator. Pure-contract evidence stays
+# in test_offline_bridge02b2_contract.py. All runs use disposable tmp_path stores.
+
+DB_NAME = "synthetic-reservations.db"
+TAMPERED_SHA = CORRECTION
+UNKNOWN_KEY_ID = "test-b2b2-unknown"
+UNKNOWN_SEED = b"\x34" * 32
+
+
+def count_rows(db, where=""):
+    with closing(sqlite3.connect(db)) as con:
+        return con.execute("SELECT COUNT(*) FROM reservations" + where).fetchone()[0]
+
+
+def forbid_gate(monkeypatch, sim):
+    calls = []
+
+    def fail(*args, **kwargs):
+        calls.append(True)
+        raise AssertionError("gate must not be invoked")
+
+    monkeypatch.setattr(sim._gate, "reserve", fail)
+    return calls
+
+
+def reserve_prerequisites(sim, kind):
+    for message in prerequisite_messages(kind):
+        assert sim.simulate(message, now=NOW).outcome == "reserved"
+
+
+def trust_root_variant(*, revoked=None, expired=None, removed=None):
+    """Authentic load_trust_root() variant over the same synthetic test seeds."""
+    actors = {"chief": ("chief", b"\x31" * 32),
+              "jason": ("implementer", b"\x32" * 32),
+              "skippy": ("reviewer", b"\x33" * 32)}
+    entries = []
+    for actor, (role, seed) in actors.items():
+        if actor == removed:
+            continue
+        entries.append(KeyEntry(
+            "test-b2b2-" + actor, actor, role, SigningKey(seed).verify_key.encode(),
+            "revoked" if actor == revoked else "active",
+            NOW if actor == expired else NOW + timedelta(days=30),
+        ))
+    return load_trust_root(entries, version=2)
+
+
+def direct_gate(tmp_path, *, evidence=None, halt=None):
+    root, signers = make_test_keys()
+    gate = OfflineAdmissionGate(tmp_path / "direct-gate.db", root,
+                                evidence or FixtureEvidence(), halt or FixtureHalt())
+    return gate, signers
+
+
+def sign_direct(message, signers, *, key_id=None, signing_key=None):
+    """Test-side SignedEnvelope using the B1 verifier's own canonical encoders."""
+    default_key_id, default_signer = signers[message.sender]
+    payload_bytes = _canonical_json(message.payload)
+    unsigned = SignedEnvelope(
+        schema_version=1, sender=message.sender, recipient=message.recipient,
+        role=message.role, project_id=message.project_id, task_id=message.task_id,
+        checkpoint_id=message.checkpoint_id, assignment_id=message.assignment_id,
+        message_id=message.message_id, idempotency_key=message.idempotency_key,
+        sequence=message.sequence, timestamp=message.timestamp, expiry=message.expiry,
+        payload_digest=hashlib.sha256(payload_bytes).digest(),
+        payload=dict(message.payload), key_id=key_id or default_key_id,
+        signature=b"\x00" * 64,
+    )
+    signer = signing_key or default_signer
+    return replace(unsigned, signature=signer.sign(canonical_bytes(unsigned)).signature)
+
+
+def hold_write_lock(db):
+    """Separate real SQLite connection holding the write lock on a disposable store."""
+    locker = sqlite3.connect(db, timeout=0, isolation_level=None)
+    locker.execute("BEGIN IMMEDIATE")
+    return locker
+
+
+def corrupt_store(db, how):
+    """Checkpoint the disposable WAL store, then damage the real database file."""
+    with closing(sqlite3.connect(db)) as con:
+        con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    if how == "header":
+        with open(db, "r+b") as handle:
+            handle.write(b"NOT-A-SQLITE-DB!")
+    elif how == "truncated":
+        with open(db, "r+b") as handle:
+            handle.truncate(37)
+    else:
+        raise AssertionError(how)
+
+
+# ---- Simulator: legacy object, absent fields, wrong actor (rejected before gate) ----
+
+@pytest.mark.parametrize("kind,seq,stage_kind", [
+    ("assignment", 1, "assignment"),
+    ("implementation", 2, "implementation"),
+    ("correction_request", 3, "correction"),
+])
+def test_simulator_rejects_authentic_legacy_envelope_before_gate(tmp_path, monkeypatch, kind, seq, stage_kind):
+    sim = simulator(tmp_path)
+    reserve_prerequisites(sim, stage_kind)
+    snapshot, rows = sim.snapshot, count_rows(tmp_path / DB_NAME)
+    calls = forbid_gate(monkeypatch, sim)
+    legacy = legacy_envelope(kind, seq)
+    assert type(legacy) is AuthenticatedEnvelope
+    result = sim.simulate(legacy, now=NOW)
+    assert result.outcome == "rejected" and "only exact synthetic input" in result.reason
+    assert calls == [] and sim.snapshot == snapshot
+    assert count_rows(tmp_path / DB_NAME) == rows
+
+
+@pytest.mark.parametrize("kind", KINDS)
+@pytest.mark.parametrize("case", ["absent_sha", "absent_evidence", "wrong_sender", "wrong_recipient"])
+def test_simulator_rejects_absent_fields_and_wrong_actor_before_gate(tmp_path, monkeypatch, kind, case):
+    sim = simulator(tmp_path)
+    reserve_prerequisites(sim, kind)
+    snapshot, rows = sim.snapshot, count_rows(tmp_path / DB_NAME)
+    m = msg(kind, NEXT_SEQUENCE[kind])
+    if case == "absent_sha":
+        del m.payload[SHA_FIELD[kind]]
+    elif case == "absent_evidence":
+        del m.payload["evidence_id"]
+    elif case == "wrong_sender":
+        m = replace(m, sender=WRONG_SENDER[kind])
+    else:
+        m = replace(m, recipient=WRONG_RECIPIENT[kind])
+    calls = forbid_gate(monkeypatch, sim)
+    result = sim.simulate(m, now=NOW)
+    assert result.outcome == "rejected"
+    expected = "unauthorized" if case.startswith("wrong") else "unknown or missing"
+    assert expected in result.reason
+    assert calls == [] and sim.snapshot == snapshot
+    assert count_rows(tmp_path / DB_NAME) == rows
+
+
+def test_simulator_rejects_absent_verdict_before_gate(tmp_path, monkeypatch):
+    sim = simulator(tmp_path)
+    reserve_prerequisites(sim, "review")
+    snapshot = sim.snapshot
+    review = msg("review", 3)
+    del review.payload["verdict"]
+    calls = forbid_gate(monkeypatch, sim)
+    result = sim.simulate(review, now=NOW)
+    assert result.outcome == "rejected" and "unknown or missing" in result.reason
+    assert calls == [] and sim.snapshot == snapshot
+    assert count_rows(tmp_path / DB_NAME) == 2
+
+
+# ---- Simulator: signed tamper, future timestamp, unknown key (rejected by gate) ----
+
+@pytest.mark.parametrize("case,reason", [
+    ("payload_tamper", "payload_digest does not match"),
+    ("payload_and_digest_tamper", "Invalid signature"),
+    ("future_timestamp", "too far in the future"),
+    ("unknown_key", "Unknown key_id"),
+])
+def test_simulator_gate_rejects_tamper_future_time_and_unknown_key(tmp_path, monkeypatch, case, reason):
+    sim = simulator(tmp_path)
+    message = msg()
+    original_sign = sim._sign_message
+    if case == "payload_tamper":
+        monkeypatch.setattr(sim, "_sign_message", lambda m: replace(
+            original_sign(m), payload={**m.payload, "base_sha": TAMPERED_SHA}))
+    elif case == "payload_and_digest_tamper":
+        def tamper(m):
+            env = original_sign(m)
+            payload = {**m.payload, "base_sha": TAMPERED_SHA}
+            return replace(env, payload=payload,
+                           payload_digest=hashlib.sha256(_canonical_json(payload)).digest())
+        monkeypatch.setattr(sim, "_sign_message", tamper)
+    elif case == "future_timestamp":
+        message = msg(timestamp=NOW + timedelta(minutes=2), expiry=NOW + timedelta(hours=2))
+    else:
+        monkeypatch.setitem(sim._signers, "chief", (UNKNOWN_KEY_ID, SigningKey(UNKNOWN_SEED)))
+    result = sim.simulate(message, now=NOW)
+    assert result.outcome == "rejected" and reason in result.reason
+    assert sim.snapshot.stage == "EMPTY"
+    assert count_rows(tmp_path / DB_NAME) == 0
+
+
+# ---- Simulator: duplicate re-authentication after dependency changes ----
+
+@pytest.mark.parametrize("change,reason", [
+    ("halt_halted", "HALT state halted"),
+    ("halt_unavailable", "HALT state unavailable"),
+    ("halt_exception", "HALT probe failed closed"),
+    ("evidence_rejected", "evidence rejected"),
+    ("evidence_unavailable", "evidence unavailable"),
+    ("key_revoked", "Key not active"),
+    ("key_expired", "Key expired"),
+    ("key_removed", "Unknown key_id"),
+])
+def test_duplicate_reauthenticated_after_dependency_change(tmp_path, monkeypatch, change, reason):
+    """Each redelivery re-runs B2.1 HALT/signature/evidence checks after reservation."""
+    evidence, halt = FixtureEvidence(), FixtureHalt()
+    sim = simulator(tmp_path, evidence=evidence, halt=halt)
+    reserve_prerequisites(sim, "review")
+    duplicate = msg("implementation", 2)
+    assert sim.simulate(duplicate, now=NOW).outcome == "duplicate"
+    snapshot = sim.snapshot
+    assert snapshot.stage == "AWAIT_REVIEW" and count_rows(tmp_path / DB_NAME) == 2
+    original_root = sim._gate.trust_root
+    if change.startswith("halt_"):
+        halt.state = change.removeprefix("halt_")
+    elif change.startswith("evidence_"):
+        evidence.verdict = change.removeprefix("evidence_")
+    else:
+        # Test substitution of the gate's injected trust root with an authentic
+        # load_trust_root() variant; no production key-rotation API is implied.
+        actor = "jason"
+        variant = {"key_revoked": dict(revoked=actor), "key_expired": dict(expired=actor),
+                   "key_removed": dict(removed=actor)}[change]
+        monkeypatch.setattr(sim._gate, "trust_root", trust_root_variant(**variant))
+    result = sim.simulate(duplicate, now=NOW)
+    assert result.outcome == "rejected" and reason in result.reason
+    assert sim.snapshot == snapshot
+    assert count_rows(tmp_path / DB_NAME) == 2
+    halt.state, evidence.verdict = "clear", "verified"
+    monkeypatch.setattr(sim._gate, "trust_root", original_root)
+    assert sim.simulate(duplicate, now=NOW).outcome == "duplicate"
+    assert sim.snapshot == snapshot and count_rows(tmp_path / DB_NAME) == 2
+
+
+# ---- Distinct next-sequence competitors (same process; not cross-process proof) ----
+
+def _competitors():
+    first = msg("implementation", 2)
+    second = msg("implementation", 2, message_id="msg-2b", idempotency_key="idem-2b")
+    second.payload.update(evidence_id="fixture-2b", implementation_sha=CORRECTION)
+    return first, second
+
+
+def _race(callables, timeout=30):
+    barrier = threading.Barrier(len(callables))
+    outcomes, exceptions = {}, []
+    lock = threading.Lock()
+
+    def run(name, call):
+        try:
+            barrier.wait(timeout=timeout)
+            try:
+                outcome = call()
+            except AdmissionError:
+                outcome = "failclosed"
+            with lock:
+                outcomes[name] = outcome
+        except Exception as exc:  # noqa: BLE001 - surfaced by the assertion below
+            with lock:
+                exceptions.append(exc)
+
+    threads = [threading.Thread(target=run, args=item) for item in callables.items()]
+    started = time.monotonic()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=timeout)
+    assert all(not t.is_alive() for t in threads), "competitor did not finish within finite wait"
+    assert time.monotonic() - started < 2 * timeout
+    assert exceptions == []
+    return outcomes
+
+
+def test_simulator_distinct_next_sequence_competitors_one_reserves(tmp_path):
+    """Same-instance threads against one simulator RLock; not cross-process exclusion."""
+    sim = simulator(tmp_path)
+    reserve_prerequisites(sim, "implementation")
+    first, second = _competitors()
+    outcomes = _race({"first": lambda: sim.simulate(first, now=NOW).outcome,
+                      "second": lambda: sim.simulate(second, now=NOW).outcome})
+    assert sorted(outcomes.values()) == ["rejected", "reserved"]
+    winner = first if outcomes["first"] == "reserved" else second
+    assert sim.snapshot.stage == "AWAIT_REVIEW" and sim.snapshot.next_sequence == 3
+    assert sim.snapshot.latest_sha == winner.payload["implementation_sha"]
+    db = tmp_path / DB_NAME
+    assert count_rows(db) == 2
+    with closing(sqlite3.connect(db)) as con:
+        assert con.execute("SELECT message_id FROM reservations WHERE sequence=2").fetchall() == [
+            (winner.message_id,)]
+
+
+def test_direct_gate_distinct_next_sequence_competitors_separate_instances(tmp_path):
+    """Two gate instances and SQLite connections in ONE process; not cross-process proof."""
+    gate_a, signers = direct_gate(tmp_path)
+    assert gate_a.reserve(sign_direct(msg(), signers), NOW).outcome == "reserved"
+    root, _ = make_test_keys()
+    gate_b = OfflineAdmissionGate(tmp_path / "direct-gate.db", root, FixtureEvidence(), FixtureHalt())
+    first, second = (sign_direct(m, signers) for m in _competitors())
+    outcomes = _race({"first": lambda: gate_a.reserve(first, NOW).outcome,
+                      "second": lambda: gate_b.reserve(second, NOW).outcome})
+    assert list(outcomes.values()).count("reserved") == 1
+    assert set(outcomes.values()) <= {"reserved", "rejected", "failclosed"}
+    assert count_rows(tmp_path / "direct-gate.db") == 2
+    assert count_rows(tmp_path / "direct-gate.db", " WHERE sequence=2") == 1
+
+
+# ---- Real disposable SQLite lock/busy and corruption failures (gate unchanged) ----
+
+def test_simulator_real_sqlite_write_lock_fails_closed_and_invalidates(tmp_path):
+    sim = simulator(tmp_path)
+    reserve_prerequisites(sim, "implementation")
+    snapshot = sim.snapshot
+    locker = hold_write_lock(tmp_path / DB_NAME)
+    started = time.monotonic()
+    try:
+        with pytest.raises(AdmissionError, match="storage failure"):
+            sim.simulate(msg("implementation", 2), now=NOW)
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+    assert time.monotonic() - started < 60
+    assert sim.snapshot == snapshot
+    assert count_rows(tmp_path / DB_NAME) == 1
+    result = sim.simulate(msg("implementation", 2), now=NOW)
+    assert result.outcome == "rejected" and "invalidated" in result.reason
+    assert count_rows(tmp_path / DB_NAME) == 1
+
+
+def test_direct_gate_real_sqlite_write_lock_fails_construction_closed(tmp_path):
+    gate, signers = direct_gate(tmp_path)
+    assert gate.reserve(sign_direct(msg(), signers), NOW).outcome == "reserved"
+    root, _ = make_test_keys()
+    locker = hold_write_lock(tmp_path / "direct-gate.db")
+    started = time.monotonic()
+    try:
+        with pytest.raises(AdmissionError, match="storage failure"):
+            OfflineAdmissionGate(tmp_path / "direct-gate.db", root, FixtureEvidence(), FixtureHalt())
+        with pytest.raises(AdmissionError, match="storage failure"):
+            gate.reserve(sign_direct(msg("implementation", 2), signers), NOW)
+    finally:
+        locker.execute("ROLLBACK")
+        locker.close()
+    assert time.monotonic() - started < 120
+    assert count_rows(tmp_path / "direct-gate.db") == 1
+
+
+@pytest.mark.parametrize("how", ["header", "truncated"])
+def test_simulator_real_sqlite_corruption_fails_closed_and_invalidates(tmp_path, how):
+    sim = simulator(tmp_path)
+    reserve_prerequisites(sim, "implementation")
+    snapshot = sim.snapshot
+    corrupt_store(tmp_path / DB_NAME, how)
+    with pytest.raises(AdmissionError, match="storage failure"):
+        sim.simulate(msg("implementation", 2), now=NOW)
+    assert sim.snapshot == snapshot
+    result = sim.simulate(msg("implementation", 2), now=NOW)
+    assert result.outcome == "rejected" and "invalidated" in result.reason
+
+
+@pytest.mark.parametrize("how", ["header", "truncated"])
+def test_direct_gate_real_sqlite_corruption_fails_closed(tmp_path, how):
+    gate, signers = direct_gate(tmp_path)
+    assert gate.reserve(sign_direct(msg(), signers), NOW).outcome == "reserved"
+    corrupt_store(tmp_path / "direct-gate.db", how)
+    root, _ = make_test_keys()
+    with pytest.raises(AdmissionError, match="storage failure"):
+        OfflineAdmissionGate(tmp_path / "direct-gate.db", root, FixtureEvidence(), FixtureHalt())
+    with pytest.raises(AdmissionError, match="storage failure"):
+        gate.reserve(sign_direct(msg("implementation", 2), signers), NOW)
+
+
+# ---- Direct gate: legacy object, absent fields, wrong actor, tamper, time, key ----
+
+def test_direct_gate_rejects_authentic_legacy_envelope(tmp_path):
+    gate, _ = direct_gate(tmp_path)
+    for kind, seq in (("assignment", 1), ("implementation", 2), ("correction_request", 3)):
+        legacy = legacy_envelope(kind, seq)
+        assert type(legacy) is AuthenticatedEnvelope
+        result = gate.reserve(legacy, NOW)
+        assert result.outcome == "rejected" and result.reason == "malformed payload"
+    assert count_rows(tmp_path / "direct-gate.db") == 0
+
+
+@pytest.mark.parametrize("kind,remove,reason", [
+    ("assignment", "base_sha", "invalid base_sha"),
+    ("implementation", "implementation_sha", "invalid implementation_sha"),
+    ("correction", "implementation_sha", "invalid implementation_sha"),
+    ("review", "implementation_sha", "invalid implementation_sha"),
+    ("assignment", "evidence_id", "missing or empty evidence_id"),
+    ("implementation", "evidence_id", "missing or empty evidence_id"),
+    ("review", "evidence_id", "missing or empty evidence_id"),
+])
+def test_direct_gate_rejects_absent_sha_and_evidence(tmp_path, kind, remove, reason):
+    """Absent verdict is not a B2.1 gate field; it is covered at contract/simulator layers."""
+    gate, signers = direct_gate(tmp_path)
+    m = msg(kind, NEXT_SEQUENCE[kind])
+    del m.payload[remove]
+    result = gate.reserve(sign_direct(m, signers), NOW)
+    assert result.outcome == "rejected" and reason in result.reason
+    assert count_rows(tmp_path / "direct-gate.db") == 0
+
+
+def test_direct_gate_rejects_wrong_sender_and_recipient(tmp_path):
+    gate, signers = direct_gate(tmp_path)
+    cases = [
+        # wrong recipient, valid chief signature
+        (sign_direct(msg(recipient="skippy"), signers), "unauthorized sender/role/recipient/type"),
+        # wrong sender with its own valid key and role for an assignment
+        (sign_direct(msg(sender="skippy", role="reviewer"), signers), "unauthorized sender/role/recipient/type"),
+        # sender claims chief role but signs with implementer key entry
+        (sign_direct(msg(sender="jason"), signers), "Role mismatch"),
+        # sender chief, key entry belongs to jason
+        (sign_direct(msg(), signers, key_id=signers["jason"][0], signing_key=signers["jason"][1]),
+         "Actor mismatch"),
+    ]
+    for envelope, reason in cases:
+        result = gate.reserve(envelope, NOW)
+        assert result.outcome == "rejected" and reason in result.reason, result
+    assert count_rows(tmp_path / "direct-gate.db") == 0
+
+
+def test_direct_gate_rejects_signed_payload_and_field_tamper(tmp_path):
+    gate, signers = direct_gate(tmp_path)
+    envelope = sign_direct(msg(), signers)
+    tampered = replace(envelope, payload={**envelope.payload, "base_sha": TAMPERED_SHA})
+    restamped = replace(tampered, payload_digest=hashlib.sha256(_canonical_json(tampered.payload)).digest())
+    field_tamper = replace(envelope, message_id="msg-tampered")
+    for candidate, reason in ((tampered, "payload_digest does not match"),
+                              (restamped, "Invalid signature"),
+                              (field_tamper, "Invalid signature")):
+        result = gate.reserve(candidate, NOW)
+        assert result.outcome == "rejected" and reason in result.reason, result
+    assert count_rows(tmp_path / "direct-gate.db") == 0
+    assert gate.reserve(envelope, NOW).outcome == "reserved"
+    assert count_rows(tmp_path / "direct-gate.db") == 1
+
+
+@pytest.mark.parametrize("skew_seconds", [60, 61, 3600])
+def test_direct_gate_rejects_future_timestamp(tmp_path, skew_seconds):
+    gate, signers = direct_gate(tmp_path)
+    timestamp = NOW + timedelta(seconds=skew_seconds)
+    envelope = sign_direct(msg(timestamp=timestamp, expiry=timestamp + timedelta(hours=1)), signers)
+    result = gate.reserve(envelope, NOW)
+    assert result.outcome == "rejected" and "too far in the future" in result.reason
+    assert count_rows(tmp_path / "direct-gate.db") == 0
+
+
+def test_direct_gate_rejects_unknown_key_and_wrong_signing_key(tmp_path):
+    gate, signers = direct_gate(tmp_path)
+    unknown = sign_direct(msg(), signers, key_id=UNKNOWN_KEY_ID, signing_key=SigningKey(UNKNOWN_SEED))
+    result = gate.reserve(unknown, NOW)
+    assert result.outcome == "rejected" and "Unknown key_id" in result.reason
+    wrong_signer = sign_direct(msg(), signers, signing_key=SigningKey(UNKNOWN_SEED))
+    result = gate.reserve(wrong_signer, NOW)
+    assert result.outcome == "rejected" and "Invalid signature" in result.reason
+    assert count_rows(tmp_path / "direct-gate.db") == 0
