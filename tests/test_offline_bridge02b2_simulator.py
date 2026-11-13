@@ -35,7 +35,7 @@ from skippy.collaboration.offline_signature_verifier import (
 )
 from skippy.collaboration.offline_bridge02b2_contract import SyntheticContractError, _fingerprint
 from skippy.collaboration.offline_bridge02b2_simulator import (
-    CloseOutcome, CloseResult, SyntheticBridgeSimulator,
+    CLOSE_REASONS, CloseOutcome, CloseResult, SyntheticBridgeSimulator,
 )
 import skippy.collaboration.offline_bridge02b2_simulator as simulator_module
 from test_offline_bridge02b2_contract import (
@@ -1769,6 +1769,46 @@ def assert_close(result, outcome):
     assert type(result.outcome) is CloseOutcome, result
     assert result.outcome is outcome, result
     assert type(result.reason) is str and result.reason, result
+    assert result.reason == CLOSE_REASONS[outcome], (result, CLOSE_REASONS[outcome])
+
+
+# Work order 6863863169: assert_close is canonical close evidence, so it must
+# reject a typed CloseResult whose nonempty reason is not CLOSE_REASONS[outcome].
+# This is test-oracle precision only; CloseResult construction semantics are
+# unchanged (it validates types, not outcome/reason agreement).
+_CLOSE_OUTCOME_PAIRS = [(outcome, other) for outcome in CloseOutcome
+                        for other in CloseOutcome if other is not outcome]
+
+
+def test_close_reasons_cover_every_outcome_with_distinct_nonempty_reasons():
+    assert set(CLOSE_REASONS) == set(CloseOutcome)
+    assert all(type(reason) is str and reason for reason in CLOSE_REASONS.values())
+    assert len(set(CLOSE_REASONS.values())) == len(CLOSE_REASONS)
+
+
+@pytest.mark.parametrize("outcome", list(CloseOutcome), ids=lambda o: o.name)
+def test_assert_close_accepts_matching_canonical_reason(outcome):
+    assert_close(CloseResult(outcome, CLOSE_REASONS[outcome]), outcome)
+
+
+@pytest.mark.parametrize("outcome,other", _CLOSE_OUTCOME_PAIRS,
+                         ids=lambda o: o.name)
+def test_assert_close_rejects_other_outcomes_canonical_reason(outcome, other):
+    wrong = CloseResult(outcome, CLOSE_REASONS[other])
+    assert type(wrong) is CloseResult and wrong.outcome is outcome
+    assert type(wrong.reason) is str and wrong.reason
+    assert wrong.reason != CLOSE_REASONS[outcome]
+    with pytest.raises(AssertionError):
+        assert_close(wrong, outcome)
+
+
+@pytest.mark.parametrize("outcome", list(CloseOutcome), ids=lambda o: o.name)
+def test_assert_close_rejects_valid_typed_noncanonical_reason(outcome):
+    noncanonical = CloseResult(outcome, "x")
+    assert type(noncanonical) is CloseResult
+    assert noncanonical.outcome is outcome and noncanonical.reason == "x"
+    with pytest.raises(AssertionError):
+        assert_close(noncanonical, outcome)
 
 
 def assert_denied_without_calls(sim, calls, db):
