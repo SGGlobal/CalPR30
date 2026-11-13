@@ -84,6 +84,8 @@ class SyntheticBridgeSimulator:
         self._snapshot = WorkflowSnapshot()
         self._invalidated = False
         self._lock = RLock()
+        # Single-active-transition flag; only read or written while holding _lock.
+        self._in_progress = False
         self._gate = OfflineAdmissionGate(path, trust_root, evidence_verifier, halt_probe)
 
     @property
@@ -111,16 +113,34 @@ class SyntheticBridgeSimulator:
         return replace(unsigned, signature=signature)
 
     def simulate(self, message: SyntheticInput, *, now: datetime) -> SimulationResult:
+        # One active transition per session (work order 6845727928). The RLock
+        # still serializes threads: another thread waits for the lock and never
+        # observes the flag set. The flag is checked and set under the lock, so
+        # only a same-thread nested call (for example from a fixture policy, HALT
+        # or evidence callback) sees it. That call is rejected before planning,
+        # signing or gate access and changes no snapshot or reservation row. The
+        # outer call then continues with its own plan and policy result. A plain
+        # non-reentrant lock is deliberately not used: same-thread recursion would
+        # deadlock. This is a fixture consistency control, not a sandbox against
+        # arbitrary in-process code.
         with self._lock:
-            return self._simulate_locked(message, now=now)
+            if self._in_progress:
+                return SimulationResult(
+                    "rejected", "reentrant simulate rejected; one active transition per session")
+            self._in_progress = True
+            try:
+                return self._simulate_locked(message, now=now)
+            finally:
+                self._in_progress = False
 
     def _simulate_locked(self, message: SyntheticInput, *, now: datetime) -> SimulationResult:
         if self._invalidated:
             return SimulationResult("rejected", "simulation invalidated; no crash/restart continuation")
         if type(now) is not datetime or now.tzinfo is None or now.utcoffset() != timedelta(0):
             return SimulationResult("rejected", "now must be UTC-aware")
+        planned_from = self._snapshot
         try:
-            plan = plan_transition(message, self._snapshot)
+            plan = plan_transition(message, planned_from)
         except SyntheticContractError as exc:
             return SimulationResult("rejected", str(exc))
         try:
@@ -138,6 +158,11 @@ class SyntheticBridgeSimulator:
                 or policy_view.payload is validated.payload
             ):
                 return SimulationResult("rejected", "synthetic fixture policy mutated validated input")
+            if self._snapshot is not planned_from:
+                # Only reachable if the guard was bypassed (e.g. private API use).
+                self._invalidated = True
+                return SimulationResult(
+                    "rejected", "workflow snapshot changed during policy; synthetic session invalidated")
             if policy_result != "synthetic_verified":
                 return SimulationResult("rejected", "synthetic fixture policy denied")
             envelope = self._sign_message(validated)
@@ -149,6 +174,11 @@ class SyntheticBridgeSimulator:
             # A commit error may be indeterminate: never retry/replay/resume here.
             self._invalidated = True
             raise
+        if self._snapshot is not planned_from:
+            # Only reachable if the guard was bypassed during reserve. Never apply a stale plan.
+            self._invalidated = True
+            raise AdmissionError(
+                "workflow snapshot changed during reservation; synthetic session invalidated")
         if result.outcome == "rejected":
             return SimulationResult("rejected", result.reason)
         if result.outcome == "duplicate" and plan.duplicate_candidate:

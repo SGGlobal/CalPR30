@@ -24,8 +24,9 @@ from skippy.collaboration.offline_admission_gate import AdmissionError, OfflineA
 from skippy.collaboration.offline_signature_verifier import (
     KeyEntry, SignedEnvelope, _canonical_json, canonical_bytes, load_trust_root,
 )
-from skippy.collaboration.offline_bridge02b2_contract import SyntheticContractError
+from skippy.collaboration.offline_bridge02b2_contract import SyntheticContractError, _fingerprint
 from skippy.collaboration.offline_bridge02b2_simulator import SyntheticBridgeSimulator
+import skippy.collaboration.offline_bridge02b2_simulator as simulator_module
 from test_offline_bridge02b2_contract import (
     NOW, BASE, IMPLEMENTATION, CORRECTION, KINDS, NEXT_SEQUENCE, SHA_FIELD,
     WRONG_RECIPIENT, WRONG_SENDER, legacy_envelope, msg, prerequisite_messages,
@@ -853,3 +854,318 @@ def test_direct_gate_rejects_unknown_key_and_wrong_signing_key(tmp_path):
     result = gate.reserve(wrong_signer, NOW)
     assert result.outcome == "rejected" and "Invalid signature" in result.reason
     assert count_rows(tmp_path / "direct-gate.db") == 0
+
+
+# --- Work order 6845727928: single-active-transition (reentrancy) guard. ---
+# Regression for finding 6845540923. One-shot fixture callbacks attempt a nested
+# simulate() on the SAME thread while the outer call holds the simulator RLock.
+# Every callback sets its one-shot flag BEFORE recursing, so recursion depth is
+# at most one even without the guard, and every thread wait is finite. The
+# guard is a test-fixture consistency control, not a sandbox against arbitrary
+# in-process code (see the private-API bypass test below).
+
+REENTRANT_REASON = "reentrant simulate rejected"
+
+
+class RecursivePolicy(FixturePolicy):
+    """One-shot fixture policy that attempts nested admission on the same thread."""
+
+    def __init__(self, inner_message, *, kind, after="verified"):
+        super().__init__()
+        self.sim = None
+        self.inner_message = inner_message
+        self.kind = kind
+        self.after = after  # verified | denied | raise
+        self.inner_results = []
+        self.fired = False
+
+    def check(self, message, now):
+        result = super().check(message, now)
+        if not self.fired and message.payload.get("type") == self.kind:
+            self.fired = True
+            self.inner_results.append(self.sim.simulate(self.inner_message, now=now))
+            if self.after == "denied":
+                return "rejected"
+            if self.after == "raise":
+                raise RuntimeError("synthetic recursive policy failure")
+        return result
+
+
+class RecursiveHalt(FixtureHalt):
+    """One-shot HALT probe that attempts nested admission from inside gate.reserve."""
+
+    def __init__(self, inner_message):
+        super().__init__()
+        self.sim = None
+        self.inner_message = inner_message
+        self.inner_results = []
+        self.fired = False
+
+    def read(self):
+        if self.sim is not None and not self.fired:
+            self.fired = True
+            self.inner_results.append(self.sim.simulate(self.inner_message, now=NOW))
+        return super().read()
+
+
+def count_plan_sign_and_gate(monkeypatch, sim):
+    calls = {"plan": 0, "sign": 0, "reserve": 0}
+    original_plan = simulator_module.plan_transition
+    original_sign = sim._sign_message
+    original_reserve = sim._gate.reserve
+
+    def wrap_plan(*args, **kwargs):
+        calls["plan"] += 1
+        return original_plan(*args, **kwargs)
+
+    def wrap_sign(message):
+        calls["sign"] += 1
+        return original_sign(message)
+
+    def wrap_reserve(*args, **kwargs):
+        calls["reserve"] += 1
+        return original_reserve(*args, **kwargs)
+
+    monkeypatch.setattr(simulator_module, "plan_transition", wrap_plan)
+    monkeypatch.setattr(sim, "_sign_message", wrap_sign)
+    monkeypatch.setattr(sim._gate, "reserve", wrap_reserve)
+    return calls
+
+
+def reference_snapshot(tmp_path, messages):
+    """The same messages on a separate non-recursive simulator and fresh store."""
+    ref_dir = tmp_path / "reference"
+    ref_dir.mkdir()
+    ref = simulator(ref_dir)
+    for message in messages:
+        assert ref.simulate(message, now=NOW).outcome == "reserved"
+    return ref.snapshot
+
+
+def reserved_identities(db):
+    if not Path(db).exists():
+        return []
+    with closing(sqlite3.connect(db)) as con:
+        return con.execute(
+            "SELECT message_id, idempotency_key, sequence, state FROM reservations ORDER BY sequence"
+        ).fetchall()
+
+
+@pytest.mark.parametrize("kind,seq", [("assignment", 1), ("implementation", 2)])
+def test_recursive_policy_nested_admission_rejected(tmp_path, monkeypatch, kind, seq):
+    """Inner same-thread simulate is rejected before planning, signing or gate access.
+
+    Defined behavior: the outer call continues with its own policy result. The
+    rejected inner attempt changes no snapshot or reservation row, so the outer
+    plan is still based on the current snapshot and commits exactly one row.
+    """
+    outer = msg(kind, seq)
+    policy = RecursivePolicy(msg(kind, seq), kind=kind)
+    sim = simulator(tmp_path, policy=policy)
+    policy.sim = sim
+    reserve_prerequisites(sim, kind)
+    rows_before = reserved_identities(tmp_path / DB_NAME)
+    snapshot_before = sim.snapshot
+    calls = count_plan_sign_and_gate(monkeypatch, sim)
+    result = sim.simulate(outer, now=NOW)
+    assert len(policy.inner_results) == 1
+    inner = policy.inner_results[0]
+    assert inner.outcome == "rejected" and REENTRANT_REASON in inner.reason, inner
+    assert result.outcome == "reserved", result
+    assert calls == {"plan": 1, "sign": 1, "reserve": 1}, calls
+    assert reserved_identities(tmp_path / DB_NAME) == rows_before + [
+        (outer.message_id, outer.idempotency_key, seq, "RESERVED")]
+    assert sim.snapshot == reference_snapshot(tmp_path, prerequisite_messages(kind) + [msg(kind, seq)])
+    assert sim.snapshot.next_sequence == snapshot_before.next_sequence + 1
+    assert sim.snapshot.receipts[-1] == (outer.message_id, outer.idempotency_key, _fingerprint(outer))
+    assert sim._in_progress is False
+
+
+def test_recursive_halt_probe_inside_gate_is_rejected(tmp_path, monkeypatch):
+    """Nested admission from an injected gate dependency is rejected the same way."""
+    halt = RecursiveHalt(msg())
+    sim = simulator(tmp_path, halt=halt)
+    halt.sim = sim
+    calls = count_plan_sign_and_gate(monkeypatch, sim)
+    result = sim.simulate(msg(), now=NOW)
+    assert len(halt.inner_results) == 1
+    inner = halt.inner_results[0]
+    assert inner.outcome == "rejected" and REENTRANT_REASON in inner.reason, inner
+    assert result.outcome == "reserved", result
+    assert calls == {"plan": 1, "sign": 1, "reserve": 1}, calls
+    assert reserved_identities(tmp_path / DB_NAME) == [
+        (msg().message_id, msg().idempotency_key, 1, "RESERVED")]
+    assert sim.snapshot == reference_snapshot(tmp_path, [msg()])
+    assert sim._in_progress is False
+
+
+@pytest.mark.parametrize("after,reason", [
+    ("denied", "synthetic fixture policy denied"),
+    ("raise", "synthetic signing/policy failed closed"),
+])
+def test_guard_resets_after_recursive_policy_denial_or_exception(tmp_path, monkeypatch, after, reason):
+    policy = RecursivePolicy(msg(), kind="assignment", after=after)
+    sim = simulator(tmp_path, policy=policy)
+    policy.sim = sim
+    calls = count_plan_sign_and_gate(monkeypatch, sim)
+    result = sim.simulate(msg(), now=NOW)
+    assert result.outcome == "rejected" and reason in result.reason, result
+    inner = policy.inner_results[0]
+    assert inner.outcome == "rejected" and REENTRANT_REASON in inner.reason, inner
+    assert calls == {"plan": 1, "sign": 0, "reserve": 0}, calls
+    assert sim.snapshot.stage == "EMPTY"
+    assert reserved_identities(tmp_path / DB_NAME) == []
+    assert sim._in_progress is False
+    # Guard released on the failure path: the one-shot policy no longer recurses.
+    assert sim.simulate(msg(), now=NOW).outcome == "reserved"
+    assert calls == {"plan": 2, "sign": 1, "reserve": 1}, calls
+    assert len(reserved_identities(tmp_path / DB_NAME)) == 1
+    assert sim._in_progress is False
+
+
+def test_guard_resets_after_normal_success_duplicate_and_rejection(tmp_path):
+    sim = simulator(tmp_path)
+    assert sim._in_progress is False
+    for kind, seq in [("assignment", 1), ("implementation", 2), ("review", 3)]:
+        assert sim.simulate(msg(kind, seq), now=NOW).outcome == "reserved"
+        assert sim._in_progress is False
+    assert sim.simulate(msg("review", 3), now=NOW).outcome == "duplicate"
+    assert sim._in_progress is False
+    assert sim.simulate(msg("implementation", 9), now=NOW).outcome == "rejected"
+    assert sim._in_progress is False
+    assert sim.simulate(msg(), now=datetime(2026, 1, 1)).outcome == "rejected"
+    assert sim._in_progress is False
+
+
+def test_guard_resets_after_storage_exception_and_session_stays_failstop(tmp_path, monkeypatch):
+    sim = simulator(tmp_path)
+    reserve_calls = []
+
+    def fail(*args, **kwargs):
+        reserve_calls.append(True)
+        raise AdmissionError("indeterminate commit")
+
+    monkeypatch.setattr(sim._gate, "reserve", fail)
+    with pytest.raises(AdmissionError, match="indeterminate"):
+        sim.simulate(msg(), now=NOW)
+    assert sim._in_progress is False
+    result = sim.simulate(msg(), now=NOW)
+    assert result.outcome == "rejected" and "invalidated" in result.reason, result
+    assert reserve_calls == [True]
+    assert sim.snapshot.stage == "EMPTY"
+
+
+def test_private_api_bypass_is_detected_not_sandboxed(tmp_path, monkeypatch):
+    """The guard is not a sandbox: a callback calling the private locked method
+    can still reserve. The outer call detects the snapshot change after policy,
+    rejects before signing/reserve and invalidates the session (fail closed)."""
+
+    class BypassPolicy(FixturePolicy):
+        def __init__(self):
+            super().__init__()
+            self.sim = None
+            self.inner_results = []
+            self.fired = False
+
+        def check(self, message, now):
+            if not self.fired:
+                self.fired = True
+                self.inner_results.append(self.sim._simulate_locked(msg(), now=now))
+            return super().check(message, now)
+
+    policy = BypassPolicy()
+    sim = simulator(tmp_path, policy=policy)
+    policy.sim = sim
+    outer = msg(message_id="msg-outer", idempotency_key="idem-outer")
+    calls = count_plan_sign_and_gate(monkeypatch, sim)
+    result = sim.simulate(outer, now=NOW)
+    assert policy.inner_results[0].outcome == "reserved"
+    assert result.outcome == "rejected" and "snapshot changed" in result.reason, result
+    assert calls == {"plan": 2, "sign": 1, "reserve": 1}, calls
+    assert [row[0] for row in reserved_identities(tmp_path / DB_NAME)] == [msg().message_id]
+    assert sim._in_progress is False
+    follow_up = sim.simulate(msg("implementation", 2), now=NOW)
+    assert follow_up.outcome == "rejected" and "invalidated" in follow_up.reason, follow_up
+
+
+class BlockingPolicy(FixturePolicy):
+    def __init__(self):
+        super().__init__()
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.blocked_once = False
+
+    def check(self, message, now):
+        result = super().check(message, now)
+        if not self.blocked_once:
+            self.blocked_once = True
+            self.entered.set()
+            if not self.release.wait(timeout=10):
+                return "rejected"
+        return result
+
+
+def test_cross_thread_call_waits_for_active_transition_not_rejected(tmp_path):
+    """Same-instance threads still serialize on the RLock; the guard never rejects them."""
+    policy = BlockingPolicy()
+    sim = simulator(tmp_path, policy=policy)
+    outcomes, errors = {}, []
+    second_done = threading.Event()
+
+    def run(name, message, done=None):
+        try:
+            outcomes[name] = sim.simulate(message, now=NOW)
+        except Exception as exc:  # pragma: no cover - reported via assertion
+            errors.append(exc)
+        finally:
+            if done is not None:
+                done.set()
+
+    first = threading.Thread(target=run, args=("first", msg()))
+    second = threading.Thread(target=run, args=("second", msg("implementation", 2), second_done))
+    try:
+        first.start()
+        assert policy.entered.wait(timeout=10)
+        second.start()
+        assert not second_done.wait(timeout=0.3), "second call must block, not be rejected"
+    finally:
+        policy.release.set()
+        first.join(timeout=10)
+        second.join(timeout=10)
+    assert not first.is_alive() and not second.is_alive()
+    assert errors == []
+    assert outcomes["first"].outcome == "reserved", outcomes
+    assert outcomes["second"].outcome == "reserved", outcomes
+    assert len(reserved_identities(tmp_path / DB_NAME)) == 2
+    assert sim.snapshot.next_sequence == 3
+    assert sim._in_progress is False
+
+
+def test_private_api_bypass_during_reserve_fails_closed(tmp_path):
+    """A gate dependency calling the private locked method changes the snapshot
+    mid-reserve; the outer call refuses to apply its plan and invalidates."""
+
+    class BypassHalt(FixtureHalt):
+        def __init__(self):
+            super().__init__()
+            self.sim = None
+            self.inner_results = []
+            self.fired = False
+
+        def read(self):
+            if self.sim is not None and not self.fired:
+                self.fired = True
+                self.inner_results.append(self.sim._simulate_locked(msg(), now=NOW))
+            return super().read()
+
+    halt = BypassHalt()
+    sim = simulator(tmp_path, halt=halt)
+    halt.sim = sim
+    with pytest.raises(AdmissionError, match="snapshot changed during reservation"):
+        sim.simulate(msg(), now=NOW)
+    assert halt.inner_results[0].outcome == "reserved"
+    assert reserved_identities(tmp_path / DB_NAME) == [
+        (msg().message_id, msg().idempotency_key, 1, "RESERVED")]
+    assert sim._in_progress is False
+    follow_up = sim.simulate(msg("implementation", 2), now=NOW)
+    assert follow_up.outcome == "rejected" and "invalidated" in follow_up.reason, follow_up

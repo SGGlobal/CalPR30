@@ -70,6 +70,16 @@ Competitor tests run in one process: one test uses one simulator instance and it
 
 The store-creation and concurrent-invalidation limits in the failure and restart model remain open constraints, not solved: the exists()/wal/shm freshness check is not atomic cross-process exclusive creation, and invalidate_for_restart can race an in-flight simulate() call.
 
+## Single active transition and reentrancy (work order 6845727928)
+
+Finding 6845540923: simulate() holds a reentrant RLock while it calls the caller-supplied fixture policy, and the gate calls the injected HALT and evidence fixtures during reserve. A callback holding the simulator could re-enter simulate() on the same thread. At e54ca6e a one-shot recursive policy made the inner call reserve and advance the snapshot, after which the outer call (planned from the earlier snapshot) reached the gate, received an unexpected duplicate, raised AdmissionError and invalidated the session.
+
+Contract: one session has at most one active transition. simulate() checks and sets an in-progress flag while holding the existing RLock and clears it in a finally block on every return and exception path. A nested call on the same thread is rejected with the deterministic reason "reentrant simulate rejected" before planning, signing or gate access, and it changes no snapshot or reservation row. The RLock is kept: a plain non-reentrant lock would deadlock same-thread recursion. Another thread never sees the flag set, because the flag is only set and cleared while the lock is held; such a call waits for the lock and runs afterwards (normal cross-thread serialization). Gate exceptions still invalidate the session without retry, and the flag is cleared afterwards.
+
+Outer continuation: the outer call continues after a rejected inner attempt and is decided by its own plan, policy result and gate result. Because the rejected inner attempt changed nothing, the outer plan is still based on the current snapshot, and a valid outer call commits exactly one reservation row whose receipt fingerprint matches the outer input. Separately, the simulator records the snapshot it planned from and refuses to proceed if that snapshot changed during the policy call (reject before signing) or during reserve (raise AdmissionError and never apply the stale plan); both invalidate the session.
+
+Limits: this is a test-fixture consistency control, not a sandbox. In-process code can bypass it, for example by calling the private _simulate_locked method; the snapshot-change checks then fail closed, but a reservation made by the bypassing call may already be committed. The guard adds nothing for cross-process exclusion, durable T25 cross-checkpoint identity, store-creation freshness or concurrent invalidate_for_restart races; those constraints remain open as stated above.
+
 ## Tests, limitations and next approval
 
 Run the two new pytest modules against the real QLA source and repository dependencies before any integration decision. Cover approved and correction flows, invalid order/SHA/evidence/role/verdict, duplicate identity, expired/revoked signatures, HALT unavailable, bad SQLite state, restart denial, concurrency and a zero-protected-ledger-call assertion. Report the exact Git SHA and test results.
