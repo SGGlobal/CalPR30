@@ -5,9 +5,13 @@ No BRIDGE-02A ledger, network transport, production keys, or trading involved.
 
 import ast
 import hashlib
+import json
+import multiprocessing
+import os
 import sqlite3
 import threading
 import time
+import traceback
 import urllib.request
 from contextlib import closing
 from dataclasses import replace
@@ -1106,36 +1110,62 @@ class BlockingPolicy(FixturePolicy):
 
 
 def test_cross_thread_call_waits_for_active_transition_not_rejected(tmp_path):
-    """Same-instance threads still serialize on the RLock; the guard never rejects them."""
+    """Same-instance threads (one simulator, one RLock, ONE process); not process evidence.
+
+    Diagnostics tightened by work order 6846218272. ``second_entering`` is set
+    immediately before the contender calls simulate(): it shows the contender
+    thread reached the call site while the first transition was held open in the
+    fixture policy. It is NOT proof that the contender is blocked inside the RLock
+    acquire. The bounded 0.3 s check only observes that the contender had not
+    completed while the first transition was held; it is not lock-contention
+    proof. The conclusive assertions are the outcomes: both calls reserve and the
+    contender is never rejected as reentrant. Only started threads are joined, and
+    every wait and join is finite.
+    """
     policy = BlockingPolicy()
     sim = simulator(tmp_path, policy=policy)
     outcomes, errors = {}, []
+    second_entering = threading.Event()
     second_done = threading.Event()
 
-    def run(name, message, done=None):
+    def run(name, message, entering=None, done=None):
         try:
+            if entering is not None:
+                entering.set()
             outcomes[name] = sim.simulate(message, now=NOW)
-        except Exception as exc:  # pragma: no cover - reported via assertion
-            errors.append(exc)
+        except BaseException as exc:  # noqa: BLE001 - reported via assertion below
+            errors.append((name, repr(exc)))
         finally:
             if done is not None:
                 done.set()
 
-    first = threading.Thread(target=run, args=("first", msg()))
-    second = threading.Thread(target=run, args=("second", msg("implementation", 2), second_done))
+    first = threading.Thread(target=run, args=("first", msg()), name="b2b2-first")
+    second = threading.Thread(
+        target=run, args=("second", msg("implementation", 2), second_entering, second_done),
+        name="b2b2-contender")
+    started = []
+    early_completion = None
     try:
         first.start()
-        assert policy.entered.wait(timeout=10)
+        started.append(first)
+        assert policy.entered.wait(timeout=10), "first transition never reached the fixture policy"
         second.start()
-        assert not second_done.wait(timeout=0.3), "second call must block, not be rejected"
+        started.append(second)
+        assert second_entering.wait(timeout=10), "contender thread never reached simulate()"
+        early_completion = second_done.wait(timeout=0.3)
     finally:
         policy.release.set()
-        first.join(timeout=10)
-        second.join(timeout=10)
-    assert not first.is_alive() and not second.is_alive()
-    assert errors == []
+        for thread in started:
+            thread.join(timeout=10)
+    alive = [thread.name for thread in started if thread.is_alive()]
+    assert alive == [], f"threads still alive after finite join: {alive}"
+    assert errors == [], errors
+    assert early_completion is False, (
+        "contender completed while the first transition was held open: "
+        f"{outcomes.get('second')!r}")
     assert outcomes["first"].outcome == "reserved", outcomes
     assert outcomes["second"].outcome == "reserved", outcomes
+    assert REENTRANT_REASON not in outcomes["second"].reason
     assert len(reserved_identities(tmp_path / DB_NAME)) == 2
     assert sim.snapshot.next_sequence == 3
     assert sim._in_progress is False
@@ -1169,3 +1199,276 @@ def test_private_api_bypass_during_reserve_fails_closed(tmp_path):
     assert sim._in_progress is False
     follow_up = sim.simulate(msg("implementation", 2), now=NOW)
     assert follow_up.outcome == "rejected" and "invalidated" in follow_up.reason, follow_up
+
+
+# --- Work order 6846218272 item 1: T25 durable identity namespace (direct gate). ---
+# Direct-gate layer only: the authentic OfflineAdmissionGate and B1 verify_signature
+# over test-signed SignedEnvelope values. No simulator and no contract stream
+# binding is involved, so the simulator's checkpoint-mismatch rejection cannot be
+# the cause of any result here. Checkpoint A (assignment sequence 1 and
+# implementation sequence 2) is reserved in a disposable store; a NEW gate
+# instance is then constructed against that same store (read-only preflight plus
+# locked revalidation of the existing schema). Otherwise valid checkpoint-B
+# sequence-1 assignments in the SAME project/task reuse checkpoint-A identities.
+# The checkpoint-B signed payload equals checkpoint-A row 1's payload, so case (c)
+# differs from that row only in checkpoint_id. Complete rows (every column,
+# including id, payload_digest and recorded_at) are compared before and after.
+
+T25_DB = "t25-direct-gate.db"
+T25_A1 = ("t25-A-msg-1", "t25-A-idem-1")
+T25_A2 = ("t25-A-msg-2", "t25-A-idem-2")
+T25_CONFLICTS = {
+    "a_reused_message_id_new_idempotency_key": (
+        (T25_A1[0], "t25-B-idem-new"), "conflicting identity"),
+    "b_new_message_id_reused_idempotency_key": (
+        ("t25-B-msg-new", T25_A1[1]), "conflicting identity"),
+    "c_both_reused_same_row": (T25_A1, "conflicting identity"),
+    "d_cross_matched_a1_message_a2_key": (
+        (T25_A1[0], T25_A2[1]), "ambiguous or conflicting identity matches"),
+    "d_cross_matched_a2_message_a1_key": (
+        (T25_A2[0], T25_A1[1]), "ambiguous or conflicting identity matches"),
+}
+
+
+def t25_message(kind, seq, message_id, idempotency_key, **fields):
+    data = dict(project_id="QLA", task_id="task-test", checkpoint_id="ckpt-A",
+                message_id=message_id, idempotency_key=idempotency_key)
+    data.update(fields)
+    return msg(kind, seq, **data)
+
+
+def t25_checkpoint_b(message_id, idempotency_key, **fields):
+    """Otherwise valid checkpoint-B sequence-1 assignment (same signed payload as A1)."""
+    return t25_message("assignment", 1, message_id, idempotency_key,
+                       checkpoint_id="ckpt-B", **fields)
+
+
+def full_reservation_rows(db):
+    """Every column of every reservation row, in id order."""
+    with closing(sqlite3.connect(db)) as con:
+        return con.execute("SELECT * FROM reservations ORDER BY id").fetchall()
+
+
+def t25_store_with_checkpoint_a(tmp_path):
+    db = tmp_path / T25_DB
+    root, signers = make_test_keys()
+    first_gate = OfflineAdmissionGate(db, root, FixtureEvidence(), FixtureHalt())
+    for message in (t25_message("assignment", 1, *T25_A1),
+                    t25_message("implementation", 2, *T25_A2)):
+        result = first_gate.reserve(sign_direct(message, signers), NOW)
+        assert (result.outcome, result.reason) == ("reserved", "ok"), result
+    del first_gate
+    rebuilt_root, _ = make_test_keys()
+    gate = OfflineAdmissionGate(db, rebuilt_root, FixtureEvidence(), FixtureHalt())
+    rows = full_reservation_rows(db)
+    assert [(r[1], r[2], r[3], r[5], r[6], r[11], r[12]) for r in rows] == [
+        ("QLA", "task-test", "ckpt-A", *T25_A1, 1, "RESERVED"),
+        ("QLA", "task-test", "ckpt-A", *T25_A2, 2, "RESERVED"),
+    ]
+    return db, gate, signers, rows
+
+
+@pytest.mark.parametrize("case", sorted(T25_CONFLICTS))
+def test_t25_direct_gate_cross_checkpoint_identity_reuse_rejected(tmp_path, case):
+    """Durable project+task identity namespace across checkpoints (direct gate only)."""
+    db, gate, signers, rows_before = t25_store_with_checkpoint_a(tmp_path)
+    (message_id, idempotency_key), expected_reason = T25_CONFLICTS[case]
+    result = gate.reserve(sign_direct(t25_checkpoint_b(message_id, idempotency_key), signers), NOW)
+    assert result.outcome != "duplicate", result
+    assert (result.outcome, result.reason) == ("rejected", expected_reason), result
+    assert full_reservation_rows(db) == rows_before
+    # Fresh-ID control on the SAME reconstructed gate and store: same project, task,
+    # checkpoint B, sequence 1 and signed payload. It reserves, so checkpoint
+    # mismatch, sequence, signature, evidence or HALT did not cause the rejection.
+    control = t25_checkpoint_b("t25-B-msg-fresh", "t25-B-idem-fresh")
+    result = gate.reserve(sign_direct(control, signers), NOW)
+    assert (result.outcome, result.reason) == ("reserved", "ok"), result
+    rows_after = full_reservation_rows(db)
+    assert rows_after[:2] == rows_before
+    assert [(r[1], r[2], r[3], r[5], r[6], r[11], r[12]) for r in rows_after[2:]] == [
+        ("QLA", "task-test", "ckpt-B", "t25-B-msg-fresh", "t25-B-idem-fresh", 1, "RESERVED")]
+
+
+@pytest.mark.parametrize("boundary", ["other_project", "other_task"])
+def test_t25_direct_gate_identity_namespace_is_project_and_task(tmp_path, boundary):
+    """Independent project/task control: reused checkpoint-A IDs reserve in another
+    namespace, and an exact redelivery there is a duplicate, never a new row."""
+    db, gate, signers, rows_before = t25_store_with_checkpoint_a(tmp_path)
+    scope = {"other_project": {"project_id": "QLA-t25-other"},
+             "other_task": {"task_id": "task-t25-other"}}[boundary]
+    envelope = sign_direct(t25_checkpoint_b(*T25_A1, **scope), signers)
+    result = gate.reserve(envelope, NOW)
+    assert (result.outcome, result.reason) == ("reserved", "ok"), result
+    rows_after = full_reservation_rows(db)
+    assert rows_after[:2] == rows_before and len(rows_after) == 3
+    project, task = scope.get("project_id", "QLA"), scope.get("task_id", "task-test")
+    assert (rows_after[2][1], rows_after[2][2], rows_after[2][3],
+            rows_after[2][5], rows_after[2][6]) == (project, task, "ckpt-B", *T25_A1)
+    result = gate.reserve(envelope, NOW)
+    assert (result.outcome, result.reason) == ("duplicate", "identical reservation"), result
+    assert full_reservation_rows(db) == rows_after
+
+
+# --- Work order 6846218272 item 2: separate-process contention (direct gate). ---
+# Two spawned child processes (multiprocessing "spawn", the Windows default) each
+# build their own trust root, signers, OfflineAdmissionGate and SQLite connections
+# over ONE store the parent pre-initialized. No concurrent fresh-store creation is
+# claimed. Parent monkeypatches are not inherited by spawn, so every child
+# installs the named zero-invocation sentinels itself and returns the counts. The
+# worker is module-level in this test module; spawn re-imports the module by name
+# using the parent's sys.path. Bounded fresh-store repetitions, no retries; this
+# is not exhaustive scheduling, crash or simulator cross-process proof.
+
+PROCESS_DB = "process-contention.db"
+PROCESS_READY_TIMEOUT = 120.0
+PROCESS_RELEASE_TIMEOUT = 60.0
+PROCESS_RESULT_TIMEOUT = 120.0
+PROCESS_JOIN_TIMEOUT = 30.0
+PROCESS_REPETITIONS = 3
+ZERO_SENTINELS = {"ledger.record_event": 0, "transport.__call__": 0,
+                  "urllib.request.urlopen": 0, "place_limit_order": 0}
+
+
+def _process_assignment(name):
+    """Two distinct valid same-checkpoint sequence-1 assignments (distinct IDs and payloads)."""
+    message = msg("assignment", 1, message_id=f"proc-msg-{name}",
+                  idempotency_key=f"proc-idem-{name}")
+    if name == "second":
+        message.payload.update(evidence_id="fixture-proc-second", base_sha=IMPLEMENTATION)
+    return message
+
+
+def _process_contention_worker(db_path, name, conn, release, release_timeout):
+    """Spawned child. Reports PID and ready only after its own initialization, waits
+    on one bounded release, makes exactly one reserve call and always returns a
+    typed outcome or the full formatted traceback (never re-raises)."""
+    report = {"name": name, "pid": os.getpid(), "ppid": os.getppid(), "outcome": None,
+              "reason": None, "error": None, "sentinels": None}
+    try:
+        with pytest.MonkeyPatch.context() as patcher:
+            counts = install_protected_entry_sentinels(patcher)
+            try:
+                root, signers = make_test_keys()
+                gate = OfflineAdmissionGate(Path(db_path), root, FixtureEvidence(), FixtureHalt())
+                envelope = sign_direct(_process_assignment(name), signers)
+                conn.send(("ready", name, os.getpid()))
+                if not release.wait(timeout=release_timeout):
+                    report["error"] = f"release not received within {release_timeout}s"
+                else:
+                    result = gate.reserve(envelope, NOW)
+                    report["outcome"], report["reason"] = result.outcome, result.reason
+            finally:
+                report["sentinels"] = dict(counts)
+    except BaseException:  # noqa: BLE001 - full traceback is returned to the parent
+        report["error"] = traceback.format_exc()
+    try:
+        conn.send(("result", report))
+    finally:
+        conn.close()
+
+
+def _stop_children(children):
+    """Terminate (kill fallback) and join every started, still-live child."""
+    forced, leftovers = [], []
+    for name, process in children.items():
+        if process.is_alive():
+            forced.append(name)
+            process.terminate()
+            process.join(PROCESS_JOIN_TIMEOUT)
+            if process.is_alive():
+                process.kill()
+                process.join(PROCESS_JOIN_TIMEOUT)
+        if process.is_alive():
+            leftovers.append((name, process.pid))
+    return forced, leftovers
+
+
+def run_process_contention(tmp_path):
+    ctx = multiprocessing.get_context("spawn")
+    db = tmp_path / PROCESS_DB
+    root, _ = make_test_keys()
+    OfflineAdmissionGate(db, root, FixtureEvidence(), FixtureHalt())  # schema v2 + WAL, once
+    assert full_reservation_rows(db) == []
+    release = ctx.Event()
+    children, receivers, senders = {}, {}, []
+    evidence = {"start_method": ctx.get_start_method(), "parent_pid": os.getpid()}
+    in_flight = None
+    try:
+        for name in ("first", "second"):
+            receiver, sender = ctx.Pipe(duplex=False)
+            receivers[name] = receiver
+            senders.append(sender)
+            process = ctx.Process(
+                target=_process_contention_worker,
+                args=(str(db), name, sender, release, PROCESS_RELEASE_TIMEOUT),
+                name=f"b2b2-contender-{name}", daemon=True)
+            children[name] = process
+            process.start()
+            sender.close()  # parent keeps only the receiving end
+        ready = {}
+        for name, receiver in receivers.items():
+            assert receiver.poll(PROCESS_READY_TIMEOUT), (
+                f"{name} child not ready within {PROCESS_READY_TIMEOUT}s "
+                f"(exitcode={children[name].exitcode})")
+            message = receiver.recv()
+            assert message[0] == "ready" and message[1] == name, (
+                f"{name} child failed before ready: {message!r}")
+            ready[name] = message[2]
+        assert ready == {name: process.pid for name, process in children.items()}, ready
+        assert len(set(ready.values())) == 2 and os.getpid() not in ready.values(), ready
+        release.set()  # exactly once
+        reports = {}
+        for name, receiver in receivers.items():
+            assert receiver.poll(PROCESS_RESULT_TIMEOUT), (
+                f"{name} child returned no result within {PROCESS_RESULT_TIMEOUT}s")
+            kind, report = receiver.recv()
+            assert kind == "result", (kind, report)
+            reports[name] = report
+        for name, process in children.items():
+            process.join(PROCESS_JOIN_TIMEOUT)
+            assert not process.is_alive(), f"{name} child still alive after finite join"
+        evidence["exitcodes"] = {name: process.exitcode for name, process in children.items()}
+        evidence["children"] = reports
+        for name, report in reports.items():
+            assert report["error"] is None, f"{name} child error:\n{report['error']}"
+            assert report["pid"] == ready[name] and report["ppid"] == os.getpid(), report
+            assert report["sentinels"] == ZERO_SENTINELS, report
+        assert evidence["exitcodes"] == {"first": 0, "second": 0}, evidence["exitcodes"]
+        winners = [name for name, report in reports.items() if report["outcome"] == "reserved"]
+        assert len(winners) == 1, reports
+        winner = winners[0]
+        loser = "second" if winner == "first" else "first"
+        assert reports[winner]["reason"] == "ok", reports
+        assert (reports[loser]["outcome"], reports[loser]["reason"]) == (
+            "rejected", "sequence 1 != 2"), reports
+        expected = _process_assignment(winner)
+        rows = full_reservation_rows(db)
+        assert [row[1:] for row in rows] == [(
+            expected.project_id, expected.task_id, expected.checkpoint_id,
+            expected.assignment_id, expected.message_id, expected.idempotency_key,
+            expected.sender, expected.recipient, expected.role,
+            hashlib.sha256(_canonical_json(expected.payload)).digest(),
+            1, "RESERVED", NOW.isoformat(),
+        )], rows
+        evidence["winner"], evidence["committed_message_id"] = winner, rows[0][5]
+    except BaseException as exc:
+        in_flight = exc
+        raise
+    finally:
+        forced, leftovers = _stop_children(children)
+        for conn in list(receivers.values()) + senders:
+            conn.close()
+        evidence["forced_cleanup"], evidence["leftovers"] = forced, leftovers
+        if in_flight is None and (forced or leftovers):
+            raise AssertionError(f"child cleanup required: forced={forced} leftovers={leftovers}")
+    return evidence
+
+
+@pytest.mark.parametrize("repetition", range(PROCESS_REPETITIONS))
+def test_separate_process_contention_one_reserved_one_sequence_rejected(tmp_path, repetition):
+    evidence = run_process_contention(tmp_path)
+    evidence["repetition"] = repetition
+    (tmp_path / "process-contention-evidence.json").write_text(
+        json.dumps(evidence, indent=2, sort_keys=True), encoding="utf-8")
+    assert evidence["start_method"] == "spawn"
+    assert evidence["forced_cleanup"] == [] and evidence["leftovers"] == []
