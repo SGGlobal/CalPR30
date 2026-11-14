@@ -1395,3 +1395,145 @@ The 119 new node IDs are all in `tests/test_offline_bridge_ingress.py`:
 - Counts are not a claim of exhaustive security.
 - No non-test caller exists, and nothing is claimed about GitHub intake, delivery or commissioning.
 - Skippy source/security review and exact-tree/full-suite verification are pending.
+
+## J13. Transport and commissioning contract (work order 6873386211; DESIGN ONLY; PROPOSED, NOT IMPLEMENTED, NOT AUTHORIZED)
+
+**Status:**
+- Work order: https://github.com/SGGlobal/QLA/issues/23#issuecomment-6873386211.
+- Base `56233c0d21eded9cf86d8c50f376e4d7b3ddb71b`. Documentation only.
+- J12, including the accepted offline ingress and its J12.7/J12.8 records, is unchanged.
+- Nothing here authorizes runtime capability, credentials, endpoints, posting, a runner or trading.
+- Section G and Chief's recorded scoped-exception decision ("Pursue the two scoped exceptions", E1/E2) are unchanged.
+- The 1634-pass runs (Colin Windows; Skippy Linux 6873299793) are offline-prototype evidence only, not transport validation.
+- The existing ChatGPT GitHub communication tools remain authorized independently. GitHub comments do not wake agents.
+
+### J13.1 Proposed path and trust boundaries
+
+| # | Step | Today | Trust boundary |
+| --- | --- | --- | --- |
+| 1 | Producer builds and signs a `SignedEnvelope` (`canonical_bytes`, Ed25519) | **missing**; only tests sign | B1: private key custody on the producer host |
+| 2 | Encode a J12.2.1 frame | **missing** in runtime; test-only encoder | none (bytes are not trusted) |
+| 3 | Carry the frame in a GitHub issue/PR comment | **missing** | B2: GitHub is an untrusted carrier. Account, app and comment metadata are not sender identity, and shared SGGlobal credentials cannot separate Colin from Skippy |
+| 4 | Fetch comments | **missing** comment endpoint. Reusable: GET-only `ProductionHTTPTransport` to api.github.com with redirects rejected, `GitHubLiveProvider` bounds of 1 MB and 10 s, no retries | B3: TLS, read token, network |
+| 5 | Extract exactly one frame from the comment body | **missing** | none |
+| 6 | `deliver` -> existing `accept_signed` | **exists** (accepted offline prototype, J12.7); no non-test caller | B4: S4 signature check is the only authentication point; trust root, evidence and HALT are synthetic today |
+| 7 | Record the acknowledgment | sink **exists** only as a test seam; durable outbox **missing** | B5: local store; durability only |
+| 8 | Post the acknowledgment comment | **missing**; the transport refuses non-GET by design | B6: write token, network |
+| 9 | Confirm external presence | **missing** | B7: a read-back shows presence on GitHub, not that any agent read it |
+
+### J13.2 Producer, keys, authority, source restrictions and delivery identity
+
+**Producer (proposed, later stage):**
+- One producer per participant actor.
+- It builds the envelope, signs it with that actor's local Ed25519 key and emits a J12.2.1 frame.
+- It is the only place a private key is used.
+
+**Keys and custody:**
+- One key per actor, generated and held only on that actor's own host.
+- Keys are never placed in the repository, GitHub comments, CI secrets, shared SGGlobal credentials or ingress hosts. Ingress hosts hold public keys only.
+- Rotation and revocation use the trust-root version. The existing `SyntheticRegistryManager` is process-local, so a durable rollback defense is **missing**.
+
+**Verification authority:**
+- A Chief-approved trust root (`KeyEntry` list plus version), distributed out of band and checked by the existing pure `verify_signature`.
+- A real evidence verifier binding remains **missing**.
+
+**Source restrictions (proposed):**
+- Repository exactly `SGGlobal/QLA`.
+- An explicit, reviewed allow-list of issue/PR numbers.
+- Exactly one fenced block tagged `qla-bridge-frame-v1` per comment; zero or several blocks is a transport refusal with zero adapter calls.
+- A frame of at most 65536 bytes, decoded by the existing J12 decoder.
+- Comment author and app are recorded for audit only, never used for authorization.
+
+**Edits, deletions and pagination:**
+- An edited comment is a new delivery observation. Different bytes decode to a different envelope, which is then replay-rejected or fails S4. Nothing is re-admitted.
+- Deletion after admission does not undo admission. A comment deleted before it was fetched was never delivered, and nothing is inferred from it.
+- Listing uses `since` plus bounded `Link` pagination. GitHub ordering is never trusted for sequence; the signed sequence and S6 govern order.
+
+**Two separate identities:**
+- **Delivery identity:** (repository, thread, comment_id, updated_at, SHA-256 of frame bytes).
+- **Signed replay identity:** (message_id, idempotency_key, sequence), enforced only by S6 and the gate.
+
+Many deliveries may map to one signed identity.
+
+**Redelivery, restart and cursor:**
+- Fetching is at-least-once; there is no exactly-once claim.
+- A per-thread cursor (last comment_id and updated_at) lives in a separate proposed transport store. It advances only after that comment's `IngressResult` is durably written to a delivery log.
+- After a crash between `deliver` and the log or cursor write, redelivery on restart meets S6 replay rejection, or an S2 refusal on a poisoned instance.
+- A cursor never proves freshness or completeness: an edit or delete before fetch can be missed.
+
+### J13.3 Outcome dimensions (independent; none upgrades another)
+
+| Dimension | Values (proposed) | Meaning |
+| --- | --- | --- |
+| Admission | J12 `Admission` (unchanged) | caller's own J2 observation |
+| Acknowledgment recording | J12 `Ack` (unchanged) | local outbox commit only |
+| External posting | `NOT_ATTEMPTED`, `POSTED` (2xx with a comment id), `NOT_POSTED` (definite refusal before acceptance, such as an allow-list or permission refusal), `POST_UNKNOWN` (request may have been sent: timeout, reset, 5xx, unreadable response) | GitHub write attempt |
+| Delivery confirmation | `NOT_CHECKED`, `PRESENT` (read-back finds the marker carrying the acknowledgment digest), `NOT_FOUND_AT_CHECK` (one absent read; not proof it was never posted) | external presence only |
+
+**Rules:**
+- An acknowledgment or posting failure never calls `accept_signed` again and never changes admission.
+- `POST_UNKNOWN` (post-then-error) is resolved only by a manual read-back decision. There is no automatic repost in any proposed stage.
+
+**Relation to `NOT_CONFIRMED`:** the J12 sink stays a **local durable outbox**, so `NOT_CONFIRMED` means only that the outbox commit is unknown. Posting is a separate later step that reads the outbox and records its own posting outcome. An external poster used directly as the `deliver` sink is **not proposed**: its exception would merge outbox and post uncertainty into one `NOT_CONFIRMED`, which is indistinguishable from `POST_UNKNOWN`.
+
+### J13.4 Staged commissioning path
+
+- **T0 (done):** the offline ingress prototype (J12.7, J12.8).
+- **T1 (proposed next; offline):** disposable transport simulation, with no credentials or network.
+  - A fake comment source, frame extractor, delivery log, cursor store, outbox and fake poster with read-back, all on fresh disposable stores with test keys.
+- **T2 (live, read only):** only after a reviewed concrete proposal and Chief authorization.
+  - A fine-grained token limited to Issues: read on `SGGlobal/QLA` only, kept in the Homebase OS credential store (not repository, environment files or CI).
+  - A new GET comment method; the transport stays GET-only.
+  - Acknowledgments stay in the local outbox, and invocation is manual.
+- **T3 (live posting):** separate authorization.
+  - Issues: write limited to the repository, and POST only to allow-listed comment endpoints. This requires a change to the protected transport allow-list.
+  - The marker plus acknowledgment digest enables manual read-back.
+- **T4 (commissioning):** real keys and trust root, evidence binding, store binding and freshness anchor, and every J12.4 and standing Section G limit. None of these is solved by T1-T3.
+
+**T1 proposed files:**
+- NEW `skippy/collaboration/offline_bridge_transport_sim.py`
+- NEW `tests/test_offline_bridge_transport_sim.py`
+- this document.
+
+**T1 interfaces (Protocols):**
+- `CommentSource.list_comments(repository, thread, cursor) -> tuple[CommentObservation, ...]`, where an observation holds comment_id, updated_at, author (audit only) and body.
+- `AckPoster.post(repository, thread, body) -> PostOutcome`.
+- `poll_once(source, adapter, outbox, transport_store, now) -> PollReport`: one bounded pass, at most one `deliver` per new delivery identity, no loop scheduling.
+
+**T1 acceptance and fault cases:**
+- valid frame admitted once and recorded in the outbox;
+- duplicate comment, same frame in two comments, and an edited comment, each with no second admission;
+- deletion after admission;
+- pagination and out-of-order comments;
+- a repository or thread off the allow-list, and zero or two frames, each with zero adapter calls;
+- forged author metadata, which does not authenticate;
+- a simulated crash before the log or cursor write, followed by replay;
+- poster success, raise-before-send, post-then-error (`POST_UNKNOWN`, no repost or re-admission), and absent read-back.
+
+**Stop and manual recovery:**
+- An `UNCERTAIN`/`STOP_RETAINED` result, a poisoned adapter or a retained G ends the pass. The cursor is held at the last fully logged comment and the report says manual.
+- No recovery protocol is defined, and current stores prove no freshness.
+
+### J13.5 Recommended next slice and unresolved decisions
+
+**Smallest next slice:**
+- T1 only, in the two new files above plus this document.
+- It reuses the unchanged ingress, adapter, gate, ledger and verifier; the protected runtime and existing tests stay frozen.
+- Testable fully offline with disposable stores, test keys and fakes.
+- It needs no new dependency beyond the accepted prototype.
+
+**Later commissioning work, not required for T1:** producer and key custody, real trust root, live read, posting, credential storage and the transport allow-list change.
+
+**Unresolved decisions (none decided here):**
+1. Colin is not an actor in the gate's `AUTHORIZATION_MATRIX` (chief, jason, skippy). Whether to map Colin or add an actor would need a protected gate change.
+2. Trust-root signing and distribution authority.
+3. Per-actor key custody location, plus durable rotation and revocation.
+4. The thread allow-list and frame marker syntax.
+5. Confirming "never auto-repost" after `POST_UNKNOWN`.
+6. Location and binding of the cursor and delivery-log store.
+7. Real evidence verifier binding.
+8. Whether separate GitHub identities are wanted, for audit only.
+9. Who invokes `poll_once`: manual only, since there is no runner.
+10. The Section G implementation decision stays Chief's.
+
+execution_enabled=False. All standing open items remain open.
