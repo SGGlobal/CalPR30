@@ -1123,7 +1123,7 @@ Baseline controls reproduce the pre-P-9 (6e9d453) transaction pattern test-local
 
 Execution evidence for the exact committed tree is recorded in the issue #23 evidence comment for this order. It is Colin-executed on Windows, not Skippy and not CI. This document records no test result for its own SHA. All standing items remain open: Section G global stop, the HALT probe-to-commit race, the schema-to-WAL gap, synthetic trust/evidence, cross-database atomicity, binding/freshness, ledger lifecycle, manual recovery, direct gate/ledger fencing, the internal commit seams, multiple bindings, the external freshness anchor and non-cryptographic shared sender identity. None is closed by P-9. execution_enabled=False.
 
-## J12. End-to-end bridge integration contract (work order 6871635630; DESIGN ONLY, PROPOSED / NOT IMPLEMENTED)
+## J12. End-to-end bridge integration contract (work order 6871635630; design; offline ingress prototype implemented by work order 6872880664, see J12.7)
 
 Work order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6871635630; base `7621c464496c45e6206f0b78228e47c77b2f7cb1`. Documentation only. Source was read on Homebase with `git grep` and `Get-Content`, with no store, network or test activity. References are at 7621c46: ADP = `offline_authenticated_adapter.py`, GATE = `offline_admission_gate.py`, VER = `offline_signature_verifier.py`, LED = `checkpoint_ledger.py`. "No non-test caller" is a gap, not evidence of a working bridge. GitHub PR comments and the manual Chief relay are a human-mediated path; they are not the cryptographic bridge, and nothing below joins them.
 
@@ -1148,7 +1148,7 @@ Work order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6871635630; ba
 | 9 | Outbound reply to GitHub | **missing**, deliberately blocked | transport refuses every non-GET method (`github_http_transport.py:86`) |
 | 10 | Legacy unsigned `accept` | implemented, separate | ADP:562; `authenticated_envelope` digest is a checksum, not authentication |
 
-### J12.2 Selected smallest missing edge (PROPOSED / NOT IMPLEMENTED; corrected by work order 6872115811)
+### J12.2 Selected smallest missing edge (corrected by work order 6872115811; implemented as an offline prototype by work order 6872880664, see J12.7)
 
 **Offline signed-frame ingress, with admission and acknowledgment reported separately.** It covers edges 3 and 8 only, as one call: `deliver(frame: bytes, adapter, sink, now) -> IngressResult`.
 - `adapter` is an instance from the existing `open_signed`, built with test trust root, fixture evidence and HALT on disposable stores.
@@ -1234,13 +1234,13 @@ There are two independent dimensions, and neither ever overwrites the other.
 - `ADMITTED` plus `CONFIRMED_BY_SINK` is still not source review, implementation completion, CI, Chief approval or permission to execute work.
 
 **Redelivery** is a new `deliver` call under the existing S6 rules, not a lookup or re-ack:
-- an admitted identity gives `REJECTED` ("replay: identity already admitted", ADP:1309) with no ledger effect;
+- on an applicable unpoisoned instance, an admitted identity gives `REJECTED` ("replay: identity already admitted", ADP:1309) with no ledger effect;
 - a wrong sequence gives `REJECTED` (ADP:1316);
 - a poisoned instance gives `REFUSED` at S2.
 
 Recovering an acknowledgment is manual and unimplemented.
 
-### J12.3 Proposed files and acceptance set (PROPOSED / NOT IMPLEMENTED; no tests in this order)
+### J12.3 Files and acceptance set (implemented in `tests/test_offline_bridge_ingress.py` by work order 6872880664; case 7 corrected per review 6872447073)
 
 **Files:**
 - New `skippy/collaboration/offline_bridge_ingress.py`: decoder, `deliver`, result and record types.
@@ -1269,7 +1269,15 @@ The protected adapter, gate, ledger, verifier and envelope, the current runtime 
    - (ii) records then raises: one record logged, `NOT_CONFIRMED` (never upgraded);
    - (iii) returns normally: `CONFIRMED_BY_SINK`.
 
-   Every branch keeps the original admission. It has at most one adapter call and exactly one sink call, exactly one ledger event for the admitted input and none otherwise, and no resend or re-admission. A later redelivery of the admitted frame gives `REJECTED` (replay).
+   Every branch keeps the original admission, with at most one adapter call, exactly one sink call and no resend or re-admission. Each case fixes its own baseline-relative durable outcome before the sink runs, and the state observed inside the sink equals the state afterwards:
+   - `ADMITTED`: one new ledger event;
+   - `REFUSED` on an existing stream, and `REJECTED` replay: no new event (prior stream events remain);
+   - `UNCERTAIN` before the ledger write: no new event;
+   - `UNCERTAIN` after a real ledger write (W2 delegate-then-raise): one new event.
+
+   *Corrected per review 6872447073:* the earlier "one ledger event for the admitted input and none otherwise" was false for `UNCERTAIN`, which can follow a real ledger write at W2, W3 or R.
+
+   Redelivery follows existing state and instance rules: an unpoisoned instance replay-rejects an admitted identity at E1.b, and the same poisoned instance refuses at S2. There is no lookup, re-ack or automatic redelivery.
 8. **Malformed:** each case is `MALFORMED` with zero adapter calls, no sink call, `correlation=None` and unchanged stores. Cases:
    - not bytes; 65537 bytes;
    - invalid UTF-8; BOM;
@@ -1300,7 +1308,7 @@ The protected adapter, gate, ledger, verifier and envelope, the current runtime 
   - It does not cover the already-configured ChatGPT GitHub communication tools used for these reads, reviews and orders. Those remain authorized for ongoing use, with no new approval loop.
   - There is no runner design or activation; the sequence remains bridge first, runner later.
 
-### J12.5 Smallest proposed implementation scope and passing criteria (PROPOSED; needs Skippy review and Chief authorization)
+### J12.5 Implementation scope and passing criteria (Chief authorized by work order 6872880664; implemented, pending Skippy verification)
 
 The scope is the three paths in J12.3. Two are new files, so this **extends** the present three-file lane.
 
@@ -1328,3 +1336,32 @@ No claim of a working operational bridge follows. execution_enabled=False.
   - Legacy-init COMMIT-then-raise has no committed regression; it was covered only by Skippy's one-off probe.
 - COLIN is a reported identity under the shared SGGlobal login, not authenticated attribution; no claim that comments wake agents. All standing open items remain open.
 - The 1515 results above are prior code evidence at 7621c46. They are not ingress evidence or CI, and no tests were run for the 6872115811 correction.
+
+### J12.7 Offline ingress prototype (work order 6872880664; Chief authorized; pending Skippy source/security and exact-tree verification)
+
+Work order: https://github.com/SGGlobal/QLA/issues/23#issuecomment-6872880664.
+
+**Files:**
+- New `skippy/collaboration/offline_bridge_ingress.py`, containing `decode_signed_frame`, `deliver`, the `Admission` and `Ack` enums and the frozen `Correlation`, `AckRecord` and `IngressResult` dataclasses.
+- New `tests/test_offline_bridge_ingress.py`, covering J12.3 cases 1-8, the closed sets and frozen types, and a source check.
+- This document.
+
+The adapter, gate, ledger, verifier, envelope, all other runtime code, every pre-existing test and helper, and all workflows are byte-unchanged.
+
+**Implementation resolutions within J12.2:**
+- **Imports:** the module imports only `SignedAdmissionError` and `SignedEnvelope` from the frozen modules, plus the `json`, `re`, `dataclasses`, `datetime` and `enum` standard modules.
+  - It never opens, creates or provisions a store, and never loads keys or credentials.
+  - It has no network, GitHub transport or runner path, and no retry, resend, lookup, re-ack or recovery function.
+- **Adapter type:** `deliver` does not type-check `adapter`; tests use labelled doubles for the unknown-outcome mapping. `now` is passed to `accept_signed` unchanged, and S1 validates it.
+- **Raw values kept:**
+  - `adapter_step` keeps any string step reported by the adapter; otherwise it is `None`.
+  - `adapter_classification` is `"accepted"`, one of the five J2 values, or `None` when the reported value is outside that set.
+  - `poisoned` is the error's own bool. It is `None` for `ADMITTED`, `MALFORMED`, unexpected exceptions or returns, and non-bool values, because the adapter reports no poison state in those cases.
+- **Mapping:** `REFUSED` only for `refused` at S1, S2 or T1. `REJECTED` only for `rejected` at E1.b or S10. `STOP_RETAINED` only for `stop_retained` at S9. Everything else, including post-arm owner refusals, `confirmed_rolled_back`, `ambiguous` and unknown classifications or steps, is `UNCERTAIN`.
+- **Exceptions:** `Exception` is caught from the adapter (giving `UNCERTAIN`) and from the sink (giving `NOT_CONFIRMED`). `BaseException` is not caught.
+  - An interrupt from the adapter propagates with no sink call.
+  - An interrupt from the sink propagates with no result.
+- **Sink return:** the value returned by `sink.record` is ignored.
+- **Decoder:** the depth pre-scan counts brackets only outside string literals, honoring escapes. Insignificant JSON whitespace is accepted, so the 65536-byte boundary test pads with whitespace.
+
+**Boundaries kept:** `deliver` has no non-test caller. GitHub edges 1, 2 and 9 are still missing, and trust, evidence and HALT stay synthetic. J12.4 commissioning limits and all standing open items remain open. execution_enabled=False.
