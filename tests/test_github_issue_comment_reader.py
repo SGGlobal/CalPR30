@@ -121,3 +121,41 @@ def test_existing_production_transport_loses_links_no_completeness_claim():
     page=reader.read_comment_page(ProductionHTTPTransport(opener),'SGGlobal/QLA',23)
     assert opener.calls==1 and page.body==BODY
     assert page.next_token is None and page.pagination=='UNKNOWN'
+
+# Independent review LOW notes: pin the offline boundary without widening it.
+@pytest.mark.parametrize('token', [
+    URL.replace('api.github.com', 'api.github.com.')+'2',
+    URL.replace('api.github.com', 'user@api.github.com')+'2',
+    URL.replace('api.github.com', '%61pi.github.com')+'2',
+    URL.replace('per_page=25&page=', 'page=2&per_page=')+'25',
+])
+def test_review_url_edges_refuse_before_transport(token):
+    transport = Transport()
+    with pytest.raises(reader.ReaderRefusal) as exc:
+        reader.read_comment_page(transport, 'SGGlobal/QLA', 23, token)
+    assert exc.value.calls == 0 and transport.calls == []
+
+@pytest.mark.parametrize('relation', ['next last', 'Next'])
+def test_review_relation_edges_refuse_without_following(relation):
+    transport = Transport(HTTPResponse(200, BODY, {'Link': f'<{URL}2>; rel="{relation}"'}))
+    with pytest.raises(reader.ReaderRefusal) as exc:
+        reader.read_comment_page(transport, 'SGGlobal/QLA', 23)
+    assert exc.value.calls == 1 and len(transport.calls) == 1
+
+@pytest.mark.parametrize('link', [
+    f'<{URL}2>; rel="next", <{URL}2>; rel="last"',
+    f'<{URL}2>; rel="last", <{URL}2>; rel="next"',
+])
+def test_review_coherent_next_last_pair_is_observed_only(link):
+    transport = Transport(HTTPResponse(200, BODY, {'Link': link}))
+    page = reader.read_comment_page(transport, 'SGGlobal/QLA', 23)
+    assert page.next_token == URL+'2' and page.pagination == 'NEXT_OBSERVED'
+    assert page.body is BODY and len(transport.calls) == 1
+
+def test_review_media_type_is_not_a_gate_in_offline_reader():
+    # Deliberate current contract: decode returned bytes as UTF-8 JSON, do not
+    # claim media-type enforcement or suitability for authenticated live use.
+    transport = Transport(HTTPResponse(200, BODY, {'Content-Type': 'text/html; charset=iso-8859-1'}))
+    page = reader.read_comment_page(transport, 'SGGlobal/QLA', 23)
+    assert page.body is BODY and page.pagination == 'UNKNOWN'
+    assert len(transport.calls) == 1

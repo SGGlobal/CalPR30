@@ -1737,3 +1737,21 @@ Missing Link is always UNKNOWN, including an empty page. NEXT_OBSERVED means onl
 Focused author test run: 56 passed. Cases include exact raw bytes and manual next request, both allowed threads, cross-thread/origin/query refusal before a call, malformed/duplicate/oversized Link refusal after one call, redirect/error status handling, oversized/invalid JSON and duplicate comment IDs, timeout/error redaction, interrupt propagation, and the existing production transport's missing-Link behavior via a fake opener. No live request or credential was used.
 
 Full-suite exact-source author evidence and final SHA are recorded on issue 23 with routing on PR 26. Independent review remains pending; author test success is not independent acceptance. This is an offline reader seam, not a commissioned or authenticated bridge. The next review must assess this source and contract, including UNKNOWN pagination and the untrusted callable boundary, before any live integration proposal.
+
+
+#### J15.4 Accepted offline checkpoint and LOW-note follow-up — 2026-11-14
+
+The independent review at https://github.com/SGGlobal/QLA/issues/23#issuecomment-6882452769 covers exact source 9c7f00a7531718de3816d71f86fcc99f9314fe2a. The completion-review channel accepted that bounded injected-only reader WITH LOW NOTES at https://github.com/SGGlobal/QLA/pull/26#issuecomment-6882474291. This follow-up records that existing decision rather than creating a second acceptance event.
+
+**Current pagination rule:** in addition to each relation's target rules, reject a Link set when last is earlier than next, regardless of header order. A coherent next=last pair is allowed and returns NEXT_OBSERVED without an automatic follow. Missing next remains UNKNOWN. This supplements J15.2.
+
+**Evidence attribution:** the earlier J15.3 count of 56 is historical author evidence for 31d835f5. At accepted 9c7f00a7, Colin's non-author Linux-cloud review reports 58 reader tests, 129 reader/transport/provider tests, and 1744 full-suite tests passed (90 existing ResourceTracker warnings, 108.32 seconds). The negative control against 31d835f5 reports two failures and 56 passes, as expected. This is reported independent execution, not Windows or CI, and this follow-up did not rerun that full suite.
+
+**Disposition of the three LOW notes:**
+1. Documentation lag: addressed by this additive current-rule and provenance update. Earlier counts are retained as historical evidence.
+2. Content-Type/charset: deliberately unchanged for this accepted offline boundary. The reader ignores these headers and validates returned bytes as UTF-8 JSON. A regression now pins acceptance of valid JSON despite text/html; charset=iso-8859-1. This documents behavior; it does not establish a media-type gate or waive future live-integration requirements. The existing production transport drops these headers as well as Link.
+3. Additional edge probes: nine committed cases now cover trailing-dot host, userinfo, percent-encoded host, reordered query, compound/mixed-case relations, coherent next=last in both orders, and the media-type behavior above. Refused inputs assert zero calls; refused response links assert exactly one call and no follow.
+
+Follow-up author validation: 138 reader/transport/provider tests passed in 0.15 seconds on Linux cloud (67 reader cases plus 71 existing transport/provider cases). Only this contract and the reader's test file change; production code is byte-for-byte unchanged from the accepted checkpoint. The 1744 full result remains attached to 9c7f00a7, not this follow-up's new commit. No new full-suite or independent validation is claimed for the test/documentation follow-up.
+
+T2's accepted scope remains offline, injected-only. Production header preservation, authentication wiring and media-type policy remain future integration decisions. The three T1 LOW findings and all prior commissioning blockers remain open. execution_enabled=False. No live call, credential, runner, merge, deployment or trading authorization follows.
