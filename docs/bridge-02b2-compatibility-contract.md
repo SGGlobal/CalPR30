@@ -1607,3 +1607,71 @@ The worker must supply an adapter successfully opened by the existing signed pat
 
 P1/P2 design review checked these transitions against the unchanged J12 ingress: MALFORMED invokes no sink; accepted return has unknown poison scalar but known ADMITTED; sink failures preserve original admission; interrupts propagate. The contract adds only fixture transport coordination, not authentication or recovery authority. Implementation and verification remain pending.
 
+
+## J14. Commissioning-readiness report and one live-read proposal (Nightshift P8; PROPOSED, NOT AUTHORIZED)
+
+Work order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6873540007. Documentation only. This section is appended after J13 and does not change J12 or J13. It records what the disposable T1 fixture can show after P3-P7 and proposes one read-only next step. It authorizes no live call, credential, endpoint, posting, runner, or trading. It does not claim operational bridge readiness, source completeness, freshness, or exactly-once delivery. Section G and Chief's recorded choice ("Pursue the two scoped exceptions", E1/E2) stay as they are. execution_enabled=False.
+
+### J14.1 What the T1 fixture demonstrates
+
+T1 is the offline simulation in `skippy/collaboration/offline_bridge_transport_sim.py` and `tests/test_offline_bridge_transport_sim.py`. The ingress `deliver` path, adapter, gate, ledger, and verifier are the unchanged frozen code. At `94c71bfb3e7507bc7c78f3fcb73319c30f4ab88a` the fixture shows:
+
+- A fake comment source with at most four pages, 25 observations per page, 100 observations in a pass, a 131072-byte body, and explicit continuation when the page bound stops the pass. That continuation is a fixture hint, not a GitHub cursor and not proof that the source is exhausted.
+- One `qla-bridge-frame-v1` frame slice, taken from the original body bytes. A changed body under the same repository, thread, and comment id is held before `deliver`. The first body digest stays the pin.
+- A disposable transport database: `PREPARED` is committed before `deliver`, the local outbox commits inside the J12 sink, and `FINAL` records the returned ingress result. The continuation row is written only after those finals are confirmed to the caller.
+- Separate `post_once` and `read_back_once` operations. Posting states stay `NOT_ATTEMPTED`, `POSTED`, `NOT_POSTED`, and `POST_UNKNOWN`. An attempted row is not posted again. Read-back records `PRESENT` or `NOT_FOUND_AT_CHECK` only after its own commit. A failed read-back commit stays `NOT_CHECKED` for the caller. Presence does not change admission.
+- `create_fresh` refuses an existing path. `open_existing` validates the file and returns rows. A second process that finds `PREPARED` or `ATTEMPTING` can inspect that row and cannot obtain a polling or posting session. One session runs only one poll, post, or read at a time. That lock is in-process. It is not a distributed exclusion proof.
+- Focused and full checks on that clean tree, Linux cloud VM, CPython 3.12.3, pytest 8.4.2, SQLite 3.45.1, PyNaCl 1.6.2: `tests/test_offline_bridge_transport_sim.py` 36 passed in 1.30s; full suite 1670 passed, 15 warnings, 101.31s, exit 0. The warnings are the existing adapter multiprocessing resource-tracker warnings. This is the author's cloud run. It is not Windows evidence, not GitHub CI, not independent verification, and not transport validation. 1670 is the prior 1634 plus these 36 fixture tests.
+
+### J14.2 What T1 does not demonstrate
+
+- No live GitHub read or write, and no use of a credential.
+- No producer, private-key custody, trust-root distribution, or evidence verifier bound to repository or CI facts. `verify_signature` checks an envelope against the trust root it is given. It does not establish who supplied that root.
+- No freshness, completeness, or exactly-once claim. Fetch remains at-least-once inside one fixture. Unseen edits that happened before the first observation are not detectable.
+- No durable edit-hold flag beyond the pinned body digest. The owning session stops on an edit. A new process cannot poll, so it cannot admit that edit. Inspection of a clean `ADMITTED` row does not by itself display the later edit.
+- No recovery, resume, or repost API. An unknown commit stops the owning session. Reopening does not continue it.
+- No cross-database atomicity between the transport file and the receipts, gate, or ledger files. A `PREPARED` row can coexist with a landed ledger event. Absence of `FINAL` is not absence of admission.
+- Section G is not implemented by T1. The HALT probe-to-commit race, schema-to-WAL gap, participant exclusions, store binding, and the freshness anchor remain as J12.4 left them. E1/E2 is the selected direction and is not reopened here.
+- Comment author text is audit material on the poll report and on a frame refusal. The frozen transport schema has no author column. Author text is not passed to `accept_signed`.
+- The gate matrix actors used by the fixture are chief, jason, and skippy. Colin is not an actor. A second assignment on one stream is refused by the frozen ledger preflight. That refusal is adapter behavior, not a transport completeness proof.
+
+### J14.3 Open items that remain open
+
+Every item below stays open. T1 closes none of them.
+
+- J12.4 authority, evidence, participant exclusions, store binding, freshness, HALT probe-to-commit, schema-to-WAL, cross-database atomicity, ledger lifecycle, and manual recovery.
+- J13.5 decisions 2 through 9: trust-root signing and distribution; per-actor key custody and durable rotation; the production thread allow-list and live framing; any future live repost policy; production store location, binding, freshness, and recovery; a real evidence verifier; whether separate GitHub identities are wanted for audit; and who may invoke a live poll. There is still no runner.
+- J13.5 decision 1 stays as written: adding an actor would be a protected gate change. Decision 10 stays as written: Chief already chose scoped E1/E2, and implementation of Section G is a separate question.
+- The J13.1 steps that are still missing for a live bridge: producer signing, a runtime encoder, carrying a frame in a comment, a live comment fetch, a durable operational outbox, posting, and external confirmation. The fixture substitutes fakes for those steps only.
+
+### J14.4 Proposed next slice: one read-only comment fetch (T2), not authorized by this section
+
+This is a proposal for a later Chief decision. It does not add code.
+
+**Goal.** One manual, read-only fetch of issue or pull-request conversation comments for `SGGlobal/QLA`, using the existing GET-only `ProductionHTTPTransport` (api.github.com, redirects rejected, 1 MB, 10 s, no retries). The fetch stops in memory. It does not call `deliver`, write a transport journal, post, or admit.
+
+**Files, only if a later order authorizes them.**
+- NEW `skippy/collaboration/github_issue_comment_reader.py`. It would call the existing transport with `GET` and a comments URL. It would not change the transport, the adapter, the gate, the ledger, the verifier, or the ingress.
+- NEW `tests/test_github_issue_comment_reader.py`, using an injected transport double. The default suite would make no live call.
+- This document, to record the result. No workflow, dependency, or credential file.
+
+**Interface.** `read_comment_page(transport, repository, number, page_token) -> CommentPageBytes`. `repository` must be `SGGlobal/QLA`. `number` must be one issue or pull number from a Chief-approved allow-list. `page_token` is either absent or the opaque `Link` token from the previous response. The return is the raw response bytes plus the next token, or a refusal. The reader would not decode a frame and would not construct a `SignedEnvelope`.
+
+**Credential scope and custody.** A fine-grained token limited to Issues: read on `SGGlobal/QLA`, stored in the Homebase OS credential store. It would not be placed in the repository, CI, an environment file, or the fixture. The existing ChatGPT GitHub tools stay on their own authorization and are not this token. Homebase was offline for the T1 work, so this proposal does not assume a machine is available to hold the token.
+
+**Acceptance and faults, when implementation is later authorized.**
+- Injected 200 response with one page and a next token: the raw bytes and token are returned, and the transport double is called once with `GET`.
+- Wrong repository, non-GET, oversize body, timeout, and a non-2xx status: refusal, zero further calls, no retry.
+- Malformed JSON or an unexpected `Link` header: refusal. The raw bytes are not repaired.
+- A live probe, if Chief separately authorizes one call: record the URL, the response status, the byte length, and the operator. Do not admit, post, or store a journal from that probe.
+
+**Stop and manual.** Any unknown transport result stops that call. There is no retry and no automatic second page. A person decides whether to request the next page.
+
+**Decisions needed from Chief before any T2 code or live call.**
+1. Approve or reject this read-only slice as the next build.
+2. Name the allow-list of issue and pull numbers.
+3. Confirm token custody on Homebase, and that the token is Issues: read only.
+4. Say whether the first implementation is injected-transport tests only, or tests plus one manual live probe.
+5. Name who may run that probe. Comments do not start it.
+
+Until those decisions are recorded, T2 is not authorized. T3 posting remains separately unauthorized and would require a protected transport change that this proposal does not include.
