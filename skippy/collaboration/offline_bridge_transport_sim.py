@@ -323,6 +323,7 @@ def _collect_once(
     start_token: str | None,
     stored_snapshot: str | None,
     counter: list[int],
+    remaining: list[int],
     *,
     allow_restart: bool,
 ) -> CollectedBatch:
@@ -338,10 +339,11 @@ def _collect_once(
     token: str | None = start_token
     snapshot: str | None = None
     pages: list[CommentPage] = []
-    for _ in range(MAX_PAGES):
+    while remaining[0] > 0:
         if token in seen:
             raise SourceRefusal("repeated token")
         seen.add(token)
+        remaining[0] -= 1
         try:
             page = _fetch_page(source, repository, thread, token, counter)
         except Exception as exc:
@@ -374,6 +376,8 @@ def _collect_once(
         if page.next_token in seen:
             raise SourceRefusal("repeated token")
         token = page.next_token
+    if not pages:
+        raise SourceRefusal("page bound")
     observations = tuple(item for page in pages for item in page.observations)
     return CollectedBatch(
         observations=normalize_observations(observations),
@@ -395,24 +399,27 @@ def collect_observations(
 ) -> CollectedBatch:
     """Read at most four fake pages and return one normalized batch.
 
-    A non-null ``next_token`` after four pages means the fixture stopped at its
-    bound. That is an incomplete hint, not proof the source is exhausted.
-    A resumed token whose snapshot differs, or whose ``page`` call raises, is
-    read again from the first page once. Structural refusals (types, sizes,
+    A non-null ``next_token`` after the page budget means the fixture stopped at
+    its bound. That is an incomplete hint, not proof the source is exhausted.
+    The budget is four source calls for the whole pass, including a discarded
+    stale-token request. A resumed token whose snapshot differs, or whose
+    ``page`` call raises, is read again from the first page with only the
+    calls still left in that budget. Structural refusals (types, sizes,
     repeated tokens, a snapshot that changes mid-pass, contradictory bodies)
     propagate and must not be admitted. A source exception on a fresh listing
     propagates so the caller can report manual failure instead of an empty success.
     """
     counter = [0]
+    remaining = [MAX_PAGES]
     if start_token is not None:
         try:
             return _collect_once(
-                source, repository, thread, start_token, stored_snapshot, counter,
+                source, repository, thread, start_token, stored_snapshot, counter, remaining,
                 allow_restart=True,
             )
         except _RestartListing:
             batch = _collect_once(
-                source, repository, thread, None, None, counter, allow_restart=False,
+                source, repository, thread, None, None, counter, remaining, allow_restart=False,
             )
             return CollectedBatch(
                 observations=batch.observations,
@@ -423,7 +430,7 @@ def collect_observations(
                 restarted=True,
             )
     return _collect_once(
-        source, repository, thread, None, None, counter, allow_restart=False,
+        source, repository, thread, None, None, counter, remaining, allow_restart=False,
     )
 
 
@@ -444,6 +451,9 @@ _SAFE_NULL_POISON = {
     ("ADMITTED", "CONFIRMED_BY_SINK"),
     ("MALFORMED", "NOT_ATTEMPTED"),
 }
+_POST_STATES = frozenset({"NOT_ATTEMPTED", "ATTEMPTING", "POSTED", "NOT_POSTED", "POST_UNKNOWN"})
+_CONFIRMATIONS = frozenset({"NOT_CHECKED", "PRESENT", "NOT_FOUND_AT_CHECK"})
+_BLOCKING_POST_STATES = frozenset({"ATTEMPTING", "POST_UNKNOWN"})
 
 
 class InspectionError(TransportFixtureError):
@@ -706,7 +716,45 @@ def _columns(connection, table: str) -> tuple[str, ...]:
     return tuple(row[1] for row in connection.execute(f"PRAGMA table_info({table})"))
 
 
+def _index_columns(connection, index_name: str) -> tuple[str, ...]:
+    return tuple(row[2] for row in connection.execute(f"PRAGMA index_info({index_name})"))
+
+
+def _primary_key(connection, table: str) -> tuple[str, ...]:
+    ranked = [
+        (row[5], row[1])
+        for row in connection.execute(f"PRAGMA table_info({table})")
+        if row[5]
+    ]
+    ranked.sort()
+    return tuple(name for _order, name in ranked)
+
+
+def _require_unique(connection, table: str, columns: tuple[str, ...]) -> None:
+    for row in connection.execute(f"PRAGMA index_list({table})"):
+        if row[2] != 1:
+            continue
+        if _index_columns(connection, row[1]) == columns:
+            return
+    raise InspectionError("constraint")
+
+
+def _require_digest(value, *, allow_null: bool) -> None:
+    if value is None and allow_null:
+        return
+    if type(value) is not bytes or len(value) != 32:
+        raise InspectionError("digest")
+
+
+def _require_ascii_token(value: str, *, what: str) -> None:
+    try:
+        _ascii_bounded(value, what=what)
+    except SourceRefusal as exc:
+        raise InspectionError(what) from exc
+
+
 def _validate_connection(connection) -> sqlite3.Row:
+    """Reject a fixture that does not match the J13.6 schema and binding. Does not repair it."""
     names = {
         row[0] for row in connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
@@ -715,8 +763,14 @@ def _validate_connection(connection) -> sqlite3.Row:
     if names != set(_SCHEMA):
         raise InspectionError("schema")
     for table, columns in _SCHEMA.items():
-        if _columns(connection, table) != columns:
+        info = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        if tuple(row[1] for row in info) != columns:
             raise InspectionError(table)
+    if _primary_key(connection, "deliveries") != ("repository", "thread", "comment_id"):
+        raise InspectionError("constraint")
+    if _primary_key(connection, "continuation") != ("thread",):
+        raise InspectionError("constraint")
+    _require_unique(connection, "outbox", ("delivery_key",))
     mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
     sync = connection.execute("PRAGMA synchronous").fetchone()[0]
     if str(mode).lower() != "wal" or sync != 2:
@@ -726,9 +780,64 @@ def _validate_connection(connection) -> sqlite3.Row:
     ).fetchall()
     if len(rows) != 1 or rows[0]["version"] != FIXTURE_VERSION:
         raise InspectionError("meta")
-    states = {row[0] for row in connection.execute("SELECT DISTINCT state FROM deliveries")}
-    if not states <= {"PREPARED", "FINAL"}:
-        raise InspectionError("state")
+    if rows[0]["repository"] != REPOSITORY:
+        raise InspectionError("repository")
+    try:
+        parsed_threads = json.loads(rows[0]["allowed_threads"])
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise InspectionError("threads") from exc
+    if type(parsed_threads) is not list or not parsed_threads:
+        raise InspectionError("threads")
+    if len(set(parsed_threads)) != len(parsed_threads):
+        raise InspectionError("threads")
+    allowed: set[int] = set()
+    for thread in parsed_threads:
+        if type(thread) is not int or thread <= 0:
+            raise InspectionError("threads")
+        allowed.add(thread)
+    identities: set[tuple[str, int, int]] = set()
+    for row in connection.execute(
+        "SELECT repository, thread, comment_id, body_digest, frame_digest, state, result_json FROM deliveries"
+    ):
+        if row["repository"] != REPOSITORY or row["thread"] not in allowed:
+            raise InspectionError("membership")
+        if type(row["comment_id"]) is not int or row["comment_id"] <= 0:
+            raise InspectionError("membership")
+        _require_digest(row["body_digest"], allow_null=False)
+        _require_digest(row["frame_digest"], allow_null=True)
+        if row["state"] not in ("PREPARED", "FINAL"):
+            raise InspectionError("state")
+        if row["state"] == "PREPARED" and row["result_json"] is not None:
+            raise InspectionError("state")
+        if row["state"] == "FINAL" and type(row["result_json"]) is not str:
+            raise InspectionError("state")
+        identities.add((row["repository"], row["thread"], row["comment_id"]))
+    for row in connection.execute(
+        "SELECT delivery_key, ack_json, ack_digest, post_state, external_id, confirmation FROM outbox"
+    ):
+        if row["post_state"] not in _POST_STATES or row["confirmation"] not in _CONFIRMATIONS:
+            raise InspectionError("outbox")
+        _require_digest(row["ack_digest"], allow_null=False)
+        if type(row["ack_json"]) is not str:
+            raise InspectionError("outbox")
+        if row["post_state"] == "POSTED":
+            if type(row["external_id"]) is not int or row["external_id"] <= 0:
+                raise InspectionError("outbox")
+        elif row["external_id"] is not None:
+            raise InspectionError("outbox")
+        try:
+            repository, thread_text, comment_text = row["delivery_key"].split("\x1f")
+            identity = (repository, int(thread_text), int(comment_text))
+        except (AttributeError, ValueError) as exc:
+            raise InspectionError("outbox") from exc
+        if identity not in identities:
+            raise InspectionError("outbox")
+    for row in connection.execute("SELECT thread, snapshot_id, token FROM continuation"):
+        if row["thread"] not in allowed:
+            raise InspectionError("continuation")
+        _require_ascii_token(row["snapshot_id"], what="continuation")
+        if row["token"] is not None:
+            _require_ascii_token(row["token"], what="continuation")
     return rows[0]
 
 
@@ -749,8 +858,12 @@ def _row_blocks(state: str, result_json: str | None) -> bool:
 
 
 def _store_blocks(connection) -> bool:
+    """True when automatic poll or post must stop. POST_UNKNOWN is retained and still blocks."""
     rows = connection.execute("SELECT state, result_json FROM deliveries").fetchall()
-    return any(_row_blocks(row["state"], row["result_json"]) for row in rows)
+    if any(_row_blocks(row["state"], row["result_json"]) for row in rows):
+        return True
+    posts = connection.execute("SELECT post_state FROM outbox").fetchall()
+    return any(row["post_state"] in _BLOCKING_POST_STATES for row in posts)
 
 
 def create_fresh(path, repository: str, threads: tuple[int, ...]) -> "FixtureSession":
@@ -816,12 +929,7 @@ def open_existing(path) -> Inspection:
     connection.row_factory = sqlite3.Row
     try:
         meta = _validate_connection(connection)
-        try:
-            threads = tuple(json.loads(meta["allowed_threads"]))
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise InspectionError("threads") from exc
-        if type(threads) is not tuple or not all(type(item) is int and item > 0 for item in threads):
-            raise InspectionError("threads")
+        threads = tuple(json.loads(meta["allowed_threads"]))
         deliveries = tuple(
             tuple(row) for row in connection.execute(
                 "SELECT repository, thread, comment_id, body_digest, frame_digest, state, result_json "
@@ -878,6 +986,7 @@ class FixtureSession:
             return True
         connection = _connect(self.path)
         try:
+            _validate_connection(connection)
             return _store_blocks(connection)
         finally:
             connection.close()
@@ -912,6 +1021,16 @@ class FixtureSession:
     def poll_once(self, source, adapter, now, *, thread: int) -> PollReport:
         """One bounded intake pass. Does not post and does not retry inside the pass."""
         _require_disabled()
+        try:
+            return self._poll_once_locked(source, adapter, now, thread=thread)
+        except Exception:
+            self.manual_required = True
+            return self._manual(source_calls=0, deliver_calls=0)
+        except BaseException:
+            self.manual_required = True
+            raise
+
+    def _poll_once_locked(self, source, adapter, now, *, thread: int) -> PollReport:
         if self._blocked():
             return self._manual(source_calls=0, deliver_calls=0)
         if type(thread) is not int or thread not in self.threads:
@@ -1066,6 +1185,16 @@ class FixtureSession:
     def post_once(self, poster) -> PostReport:
         """Post at most one confirmed local ack. Never calls ``deliver`` and never reposts."""
         _require_disabled()
+        try:
+            return self._post_once_locked(poster)
+        except Exception:
+            self.manual_required = True
+            return PostReport(None, True, True, 0, None, None)
+        except BaseException:
+            self.manual_required = True
+            raise
+
+    def _post_once_locked(self, poster) -> PostReport:
         if self.manual_required or self._post_blocked():
             self.manual_required = True
             return PostReport(None, True, True, 0, None, None)
@@ -1101,12 +1230,35 @@ class FixtureSession:
         if not wrote:
             self.manual_required = True
             return PostReport(None, True, True, 1, key, None)
+        if outcome == "POST_UNKNOWN":
+            # The outcome stays POST_UNKNOWN. Further automatic poll and post work stops.
+            self.manual_required = True
+            return PostReport(outcome, False, True, 1, key, external_id)
         return PostReport(outcome, False, False, 1, key, external_id)
 
     @_serialized
     def read_back_once(self, reader, key: str) -> ReadReport:
-        """One fake read. Presence does not change admission, ack, or post eligibility."""
+        """One fake read. Presence does not change admission, ack, post state, or a stop."""
         _require_disabled()
+        stopped = self.manual_required
+        try:
+            report = self._read_back_locked(reader, key)
+        except Exception:
+            self.manual_required = True
+            return ReadReport("NOT_CHECKED", True, True, 0)
+        except BaseException:
+            self.manual_required = True
+            raise
+        if stopped:
+            self.manual_required = True
+        return report
+
+    def _read_back_locked(self, reader, key: str) -> ReadReport:
+        connection = _connect(self.path)
+        try:
+            _validate_connection(connection)
+        finally:
+            connection.close()
         if type(key) is not str:
             self.manual_required = True
             return ReadReport("NOT_CHECKED", True, True, 0)
@@ -1139,12 +1291,8 @@ class FixtureSession:
     def _post_blocked(self) -> bool:
         connection = _connect(self.path)
         try:
-            if _store_blocks(connection):
-                return True
-            row = connection.execute(
-                "SELECT 1 FROM outbox WHERE post_state = 'ATTEMPTING' LIMIT 1"
-            ).fetchone()
-            return row is not None
+            _validate_connection(connection)
+            return _store_blocks(connection)
         finally:
             connection.close()
 

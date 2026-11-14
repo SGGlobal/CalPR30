@@ -54,7 +54,7 @@ from skippy.collaboration.offline_authenticated_adapter import (
     OfflineAuthenticatedAdapter,
     provision_signed_receipts_store,
 )
-from skippy.collaboration.offline_bridge_ingress import deliver
+from skippy.collaboration.offline_bridge_ingress import decode_signed_frame, deliver
 from skippy.collaboration.offline_signature_verifier import (
     KeyEntry,
     SignedEnvelope,
@@ -1166,3 +1166,243 @@ def test_edit_pin_is_what_a_new_process_can_see(tmp_path, monkeypatch):
     assert child["digest"] == body_digest(original)
     assert "ADMITTED" in child["result"]
     assert child["blocking"] is False
+
+
+# --- review 6874008447 --------------------------------------------------------
+
+class StoringRemote:
+    """Stores the posted marker, then raises. Read-back can see that side effect."""
+
+    def __init__(self):
+        self.stored = []
+        self.calls = []
+
+    def post(self, repository, thread, body):
+        self.calls.append((repository, thread, body))
+        self.stored.append(bytes(body))
+        raise RuntimeError("stored then failed")
+
+    def read(self, key):
+        return self.stored[-1] if self.stored else None
+
+
+def _sql(path, statement, params=()):
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(statement, params)
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_post_unknown_stops_poll_and_a_second_post(tmp_path):
+    stores = AdmissionStores(tmp_path / "adm")
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    first = envelope_frame(make_envelope(
+        stores.signers, tag="1", sequence=1, mid="tr-1", idem="idem-1", kind="assignment",
+    ))
+    second = envelope_frame(make_envelope(
+        stores.signers, tag="2", sequence=2, mid="tr-2", idem="idem-2", kind="implementation",
+    ))
+    adapter = CountingAdapter(stores.adapter())
+    admitted = session.poll_once(ScriptSource({None: page((
+        obs(1, first, TS), obs(2, second, TS2),
+    ))}), adapter, NOW, thread=23)
+    assert [item.kind for item in admitted.dispositions] == ["ADMITTED", "ADMITTED"]
+    assert adapter.calls == 2
+    before = open_existing(session.path)
+    remote = StoringRemote()
+    posted = session.post_once(remote)
+    assert posted.outcome == "POST_UNKNOWN" and posted.manual_required is True and posted.unknown is False
+    assert len(remote.calls) == 1 and len(remote.stored) == 1
+    inspected = open_existing(session.path)
+    states = {row[0]: row[3] for row in inspected.outbox}
+    assert list(states.values()).count("POST_UNKNOWN") == 1
+    assert list(states.values()).count("NOT_ATTEMPTED") == 1
+    assert inspected.blocking is True
+    again = session.post_once(remote)
+    assert again.poster_calls == 0 and len(remote.calls) == 1 and session.manual_required is True
+    later = session.poll_once(
+        ScriptSource({None: page((obs(3, b"later-comment", "2026-11-14T00:00:03Z"),))}),
+        adapter, NOW, thread=23,
+    )
+    assert later.deliver_calls == 0 and later.manual_required is True and adapter.calls == 2
+    unknown_key = next(row[0] for row in inspected.outbox if row[3] == "POST_UNKNOWN")
+    read = session.read_back_once(remote, unknown_key)
+    assert read.confirmation == "PRESENT" and read.reader_calls == 1
+    after = open_existing(session.path)
+    assert after.blocking is True
+    assert after.deliveries[0][6] == before.deliveries[0][6]
+    assert after.deliveries[1][6] == before.deliveries[1][6]
+    assert {row[3] for row in after.outbox} == {"POST_UNKNOWN", "NOT_ATTEMPTED"}
+    child = _spawn(session.path)
+    assert child["blocking"] is True and child["post_state"] == "POST_UNKNOWN"
+    assert child["has_poll"] is False and child["created"] is False and child["constructed"] is False
+
+
+def test_restart_stays_inside_four_source_calls(tmp_path):
+    pages = {
+        "stale": page((obs(99, b"discarded"),), snapshot="other"),
+        None: page((obs(1, b"r1"),), token="p2", snapshot="new"),
+        "p2": page((obs(2, b"r2", TS2),), token="p3", snapshot="new"),
+        "p3": page((obs(3, b"r3", "2026-11-14T00:00:03Z"),), token="p4", snapshot="new"),
+        "p4": page((obs(4, b"r4", "2026-11-14T00:00:04Z"),), token="p5", snapshot="new"),
+        "p5": lambda *_args: (_ for _ in ()).throw(AssertionError("fifth call")),
+    }
+    source = ScriptSource(pages)
+    batch = collect_observations(source, REPOSITORY, 23, start_token="stale", stored_snapshot="kept")
+    assert batch.restarted is True and batch.complete is False and batch.next_token == "p4"
+    assert batch.source_calls == 4
+    assert [call[2] for call in source.calls] == ["stale", None, "p2", "p3"]
+    assert 99 not in [item.comment_id for item in batch.observations]
+
+    stores = AdmissionStores(tmp_path / "adm")
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    _sql(session.path, "INSERT INTO continuation(thread, snapshot_id, token) VALUES (23, 'kept', 'stale')")
+    adapter = CountingAdapter(stores.adapter())
+    session_source = ScriptSource(pages)
+    report = session.poll_once(session_source, adapter, NOW, thread=23)
+    assert report.status == "INCOMPLETE" and report.continuation_token == "p4"
+    assert report.deliver_calls == 0 and adapter.calls == 0 and report.source_calls == 4
+    assert [call[2] for call in session_source.calls] == ["stale", None, "p2", "p3"]
+    assert [row[2] for row in open_existing(session.path).deliveries] == [1, 2, 3]
+
+
+def test_corrupt_fixtures_are_rejected_and_do_not_admit(tmp_path):
+    stores = AdmissionStores(tmp_path / "adm")
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    body = envelope_frame(make_envelope(stores.signers))
+    adapter = CountingAdapter(stores.adapter())
+    assert session.poll_once(
+        ScriptSource({None: page((obs(1, body),))}), adapter, NOW, thread=23,
+    ).dispositions[0].kind == "ADMITTED"
+    _sql(session.path, "UPDATE fixture_meta SET repository = 'other/repo'")
+    report = session.poll_once(ScriptSource({None: page((obs(2, body, TS2),))}), adapter, NOW, thread=23)
+    assert report.manual_required is True and report.deliver_calls == 0 and adapter.calls == 1
+    with pytest.raises(sim.InspectionError):
+        open_existing(session.path)
+
+    def fresh(name):
+        root = tmp_path / name
+        root.mkdir()
+        made = create_fresh(root / "transport.db", REPOSITORY, (23, 26))
+        local = AdmissionStores(root / "adm")
+        signed = envelope_frame(make_envelope(local.signers))
+        counter = CountingAdapter(local.adapter())
+        made.poll_once(ScriptSource({None: page((obs(1, signed),))}), counter, NOW, thread=23)
+        return made, counter
+
+    duplicate, _counter = fresh("dup")
+    _sql(duplicate.path, "UPDATE fixture_meta SET allowed_threads = ?", (json.dumps([23, 23]),))
+    with pytest.raises(sim.InspectionError):
+        open_existing(duplicate.path)
+
+    bogus, counter = fresh("bogus")
+    _sql(bogus.path, "UPDATE outbox SET post_state = 'BOGUS'")
+    report = bogus.poll_once(ScriptSource({None: page((obs(2, b"next", TS2),))}), counter, NOW, thread=23)
+    assert report.deliver_calls == 0 and counter.calls == 1 and report.manual_required is True
+    with pytest.raises(sim.InspectionError):
+        open_existing(bogus.path)
+
+    short, _counter = fresh("short")
+    _sql(short.path, "UPDATE deliveries SET body_digest = X'00'")
+    with pytest.raises(sim.InspectionError):
+        open_existing(short.path)
+
+    foreign, _counter = fresh("foreign")
+    _sql(foreign.path, "UPDATE deliveries SET thread = 99")
+    with pytest.raises(sim.InspectionError):
+        open_existing(foreign.path)
+
+    bare = tmp_path / "bare.db"
+    connection = sqlite3.connect(bare)
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute(
+            "CREATE TABLE fixture_meta (version INTEGER NOT NULL, repository TEXT NOT NULL, "
+            "allowed_threads TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE deliveries (repository TEXT NOT NULL, thread INTEGER NOT NULL, "
+            "comment_id INTEGER NOT NULL, body_digest BLOB NOT NULL, frame_digest BLOB, "
+            "state TEXT NOT NULL, result_json TEXT, PRIMARY KEY (repository, thread, comment_id))"
+        )
+        connection.execute(
+            "CREATE TABLE outbox (delivery_key TEXT NOT NULL, ack_json TEXT NOT NULL, "
+            "ack_digest BLOB NOT NULL, post_state TEXT NOT NULL, external_id INTEGER, "
+            "confirmation TEXT NOT NULL)"
+        )
+        connection.execute(
+            "CREATE TABLE continuation (thread INTEGER NOT NULL PRIMARY KEY, snapshot_id TEXT NOT NULL, "
+            "token TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO fixture_meta(version, repository, allowed_threads) VALUES (1, 'SGGlobal/QLA', '[23, 26]')"
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    with pytest.raises(sim.InspectionError):
+        open_existing(bare)
+
+
+def test_session_holds_a_canonically_equivalent_whitespace_edit(tmp_path):
+    stores = AdmissionStores(tmp_path / "adm")
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    env = make_envelope(stores.signers)
+    original = envelope_frame(env)
+    adapter = CountingAdapter(stores.adapter())
+    assert session.poll_once(
+        ScriptSource({None: page((obs(1, original),))}), adapter, NOW, thread=23,
+    ).dispositions[0].kind == "ADMITTED"
+    ledger_before = ledger_rows(stores)
+    journal_before = open_existing(session.path).deliveries[0]
+    frame = extract_frame(original).frame
+    whitespace = frame.replace(b"{", b"{ ", 1)
+    decoded_original = decode_signed_frame(frame)
+    decoded_space = decode_signed_frame(whitespace)
+    assert canonical_bytes(decoded_original) == canonical_bytes(decoded_space)
+    held = session.poll_once(
+        ScriptSource({None: page((obs(1, fence(whitespace), TS2),))}), adapter, NOW, thread=23,
+    )
+    assert held.dispositions[0].kind == "EDIT_HELD" and held.deliver_calls == 0 and adapter.calls == 1
+    assert ledger_rows(stores) == ledger_before
+    assert open_existing(session.path).deliveries[0][3:] == journal_before[3:]
+    assert session.manual_required is True
+
+
+def test_fresh_signature_is_held_on_a_clean_session(tmp_path):
+    stores = AdmissionStores(tmp_path / "adm")
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    original = envelope_frame(make_envelope(stores.signers, tag="base", sequence=1, mid="tr-base", idem="idem-base"))
+    adapter = CountingAdapter(stores.adapter())
+    session.poll_once(ScriptSource({None: page((obs(4, original),))}), adapter, NOW, thread=23)
+    ledger_before = ledger_rows(stores)
+    journal_before = open_existing(session.path).deliveries[0]
+    changed = envelope_frame(make_envelope(
+        stores.signers, tag="fresh", sequence=2, mid="tr-fresh", idem="idem-fresh", kind="implementation",
+    ))
+    held = session.poll_once(
+        ScriptSource({None: page((obs(4, changed, TS2),))}), adapter, NOW, thread=23,
+    )
+    assert held.dispositions[0].kind == "EDIT_HELD" and held.deliver_calls == 0 and adapter.calls == 1
+    assert ledger_rows(stores) == ledger_before
+    assert open_existing(session.path).deliveries[0][3:] == journal_before[3:]
+
+
+def test_storage_read_failure_latches_manual_without_an_adapter_call(tmp_path, monkeypatch):
+    stores = AdmissionStores(tmp_path / "adm")
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    body = envelope_frame(make_envelope(stores.signers))
+    adapter = CountingAdapter(stores.adapter())
+
+    def unavailable(_path):
+        raise sqlite3.OperationalError("setup")
+
+    monkeypatch.setattr(sim, "_connect", unavailable)
+    report = session.poll_once(ScriptSource({None: page((obs(1, body),))}), adapter, NOW, thread=23)
+    assert report.manual_required is True and report.deliver_calls == 0 and adapter.calls == 0
+    assert session.manual_required is True
+    posted = session.post_once(FakePoster())
+    assert posted.poster_calls == 0 and posted.manual_required is True

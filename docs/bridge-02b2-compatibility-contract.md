@@ -1608,6 +1608,15 @@ The worker must supply an adapter successfully opened by the existing signed pat
 P1/P2 design review checked these transitions against the unchanged J12 ingress: MALFORMED invokes no sink; accepted return has unknown poison scalar but known ADMITTED; sink failures preserve original admission; interrupts propagate. The contract adds only fixture transport coordination, not authentication or recovery authority. Implementation and verification remain pending.
 
 
+### J13.7 Corrections after source review 6874008447 (additive; PROPOSED, NOT AUTHORIZED)
+
+This subsection is additive. Where it and J13.6 differ, this subsection governs the fixture. J13.6's earlier sentences are not rewritten. Nothing here authorizes a live call. execution_enabled=False.
+
+- A persisted `POST_UNKNOWN` outbox row stops later automatic `poll_once` and `post_once` work. The stored posting outcome remains `POST_UNKNOWN`. `read_back_once` may record `PRESENT` or `NOT_FOUND_AT_CHECK` and must not clear that stop, change admission, or change the local ack.
+- `open_existing` reports the fixture as blocking while any outbox row is `ATTEMPTING` or `POST_UNKNOWN`.
+- One pass may call the fake source at most four times in total. A discarded stale-token or mismatched-snapshot request counts toward those four. The replacement traversal uses only the calls that remain, and a non-null next token after that budget is an incomplete continuation, not a fifth call.
+- `open_existing` rejects a file whose schema, primary or unique constraints, repository (`SGGlobal/QLA`), thread list, row membership, digest shape, or outbox state and confirmation values do not match this fixture. Rejection does not repair the file and does not add a resume API. A session that then hits that file, or a storage connection or read error outside a commit attempt, latches manual and does not call the adapter.
+
 ## J14. Commissioning-readiness report and one live-read proposal (Nightshift P8; PROPOSED, NOT AUTHORIZED)
 
 Work order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6873540007. Documentation only. This section is appended after J13 and does not change J12 or J13. It records what the disposable T1 fixture can show after P3-P7 and proposes one read-only next step. It authorizes no live call, credential, endpoint, posting, runner, or trading. It does not claim operational bridge readiness, source completeness, freshness, or exactly-once delivery. Section G and Chief's recorded choice ("Pursue the two scoped exceptions", E1/E2) stay as they are. execution_enabled=False.
@@ -1675,3 +1684,5 @@ This is a proposal for a later Chief decision. It does not add code.
 5. Name who may run that probe. Comments do not start it.
 
 Until those decisions are recorded, T2 is not authorized. T3 posting remains separately unauthorized and would require a protected transport change that this proposal does not include.
+
+**Review note (6874008447).** This T2 proposal was written before independent source review accepted T1. It is premature and unreviewed. It is not a commissioning-readiness claim and it does not authorize a live read. T1 acceptance remains with the reviewer. The proposal stays on the page so the record is intact.
