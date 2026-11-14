@@ -1396,13 +1396,13 @@ The 119 new node IDs are all in `tests/test_offline_bridge_ingress.py`:
 - No non-test caller exists, and nothing is claimed about GitHub intake, delivery or commissioning.
 - Skippy source/security review and exact-tree/full-suite verification are pending.
 
-## J13. Transport and commissioning contract (work order 6873386211; DESIGN ONLY; PROPOSED, NOT IMPLEMENTED, NOT AUTHORIZED)
+## J13. Transport and commissioning contract (work order 6873386211; DESIGN ONLY; T1 AUTHORIZED BY NIGHTSHIFT, NOT IMPLEMENTED)
 
 **Status:**
 - Work order: https://github.com/SGGlobal/QLA/issues/23#issuecomment-6873386211.
 - Base `56233c0d21eded9cf86d8c50f376e4d7b3ddb71b`. Documentation only.
 - J12, including the accepted offline ingress and its J12.7/J12.8 records, is unchanged.
-- Nothing here authorizes runtime capability, credentials, endpoints, posting, a runner or trading.
+- Nightshift order 6873540007 authorizes only the reviewed T1 disposable offline simulation in its exact three paths. Live capabilities, credentials, endpoints, posting, a runner and trading remain unauthorized.
 - Section G and Chief's recorded scoped-exception decision ("Pursue the two scoped exceptions", E1/E2) are unchanged.
 - The 1634-pass runs (Colin Windows; Skippy Linux 6873299793) are offline-prototype evidence only, not transport validation.
 - The existing ChatGPT GitHub communication tools remain authorized independently. GitHub comments do not wake agents.
@@ -1434,7 +1434,7 @@ The 119 new node IDs are all in `tests/test_offline_bridge_ingress.py`:
 - Rotation and revocation use the trust-root version. The existing `SyntheticRegistryManager` is process-local, so a durable rollback defense is **missing**.
 
 **Verification authority:**
-- A Chief-approved trust root (`KeyEntry` list plus version), distributed out of band and checked by the existing pure `verify_signature`.
+- A proposed Chief-approved trust root (`KeyEntry` list plus version) requires an authenticated distribution mechanism that is still missing. The pure `verify_signature` verifies an envelope against a supplied root; it does not authenticate that root's origin or distribution.
 - A real evidence verifier binding remains **missing**.
 
 **Source restrictions (proposed):**
@@ -1445,9 +1445,9 @@ The 119 new node IDs are all in `tests/test_offline_bridge_ingress.py`:
 - Comment author and app are recorded for audit only, never used for authorization.
 
 **Edits, deletions and pagination:**
-- An edited comment is a new delivery observation. Different bytes decode to a different envelope, which is then replay-rejected or fails S4. Nothing is re-admitted.
+- An edit is a new observation, but different bytes can encode the same canonical signed values. A different valid signed identity might otherwise be admitted. T1 therefore pins the first observed body digest per repository/thread/comment_id and holds any changed body before calling deliver, as specified in J13.6. Unseen edits before first fetch cannot be detected.
 - Deletion after admission does not undo admission. A comment deleted before it was fetched was never delivered, and nothing is inferred from it.
-- Listing uses `since` plus bounded `Link` pagination. GitHub ordering is never trusted for sequence; the signed sequence and S6 govern order.
+- Live listing/pagination remains a later proposal, not a T1 guarantee. T1 uses bounded immutable fake pages and explicit continuation as specified in J13.6. Transport order does not authorize signed sequence or prove completeness.
 
 **Two separate identities:**
 - **Delivery identity:** (repository, thread, comment_id, updated_at, SHA-256 of frame bytes).
@@ -1457,8 +1457,8 @@ Many deliveries may map to one signed identity.
 
 **Redelivery, restart and cursor:**
 - Fetching is at-least-once; there is no exactly-once claim.
-- A per-thread cursor (last comment_id and updated_at) lives in a separate proposed transport store. It advances only after that comment's `IngressResult` is durably written to a delivery log.
-- After a crash between `deliver` and the log or cursor write, redelivery on restart meets S6 replay rejection, or an S2 refusal on a poisoned instance.
+- T1 stores delivery records, local outbox and continuation hints in one disposable transport database, separate from adapter stores. It persists PREPARED before deliver and a FINAL result before a continuation advance. Continuation hints never authorize omission of unresolved records.
+- An unresolved PREPARED record stops restart before any deliver. Accepted identities may hit S6 only when actually submitted; pre-admission failures, durable G/PENDING/UNCERTAIN/Rule U and process-local poison have different effects. J13.6 defines conservative transport handling; losing an instance does not prove a clean restart.
 - A cursor never proves freshness or completeness: an edit or delete before fetch can be missed.
 
 ### J13.3 Outcome dimensions (independent; none upgrades another)
@@ -1474,7 +1474,7 @@ Many deliveries may map to one signed identity.
 - An acknowledgment or posting failure never calls `accept_signed` again and never changes admission.
 - `POST_UNKNOWN` (post-then-error) is resolved only by a manual read-back decision. There is no automatic repost in any proposed stage.
 
-**Relation to `NOT_CONFIRMED`:** the J12 sink stays a **local durable outbox**, so `NOT_CONFIRMED` means only that the outbox commit is unknown. Posting is a separate later step that reads the outbox and records its own posting outcome. An external poster used directly as the `deliver` sink is **not proposed**: its exception would merge outbox and post uncertainty into one `NOT_CONFIRMED`, which is indistinguishable from `POST_UNKNOWN`.
+**Relation to `NOT_CONFIRMED`:** T1 injects a **local durable outbox** as the J12 sink. NOT_CONFIRMED means recording was not confirmed: it covers failures before a commit as well as commit-then-error; it does not prove that any commit occurred. Posting is a separate later step that reads the outbox and records its own posting outcome. An external poster used directly as the `deliver` sink is **not proposed**: its exception would merge outbox and post uncertainty into one `NOT_CONFIRMED`, which is indistinguishable from `POST_UNKNOWN`.
 
 ### J13.4 Staged commissioning path
 
@@ -1496,9 +1496,8 @@ Many deliveries may map to one signed identity.
 - this document.
 
 **T1 interfaces (Protocols):**
-- `CommentSource.list_comments(repository, thread, cursor) -> tuple[CommentObservation, ...]`, where an observation holds comment_id, updated_at, author (audit only) and body.
-- `AckPoster.post(repository, thread, body) -> PostOutcome`.
-- `poll_once(source, adapter, outbox, transport_store, now) -> PollReport`: one bounded pass, at most one `deliver` per new delivery identity, no loop scheduling.
+- The normative bounded interfaces and state transitions are J13.6 below. They supersede the earlier tuple-only listing sketch.
+- poll_once performs intake only. post_once and read_back_once are separate bounded operations; none schedules another call.
 
 **T1 acceptance and fault cases:**
 - valid frame admitted once and recorded in the outbox;
@@ -1507,7 +1506,7 @@ Many deliveries may map to one signed identity.
 - pagination and out-of-order comments;
 - a repository or thread off the allow-list, and zero or two frames, each with zero adapter calls;
 - forged author metadata, which does not authenticate;
-- a simulated crash before the log or cursor write, followed by replay;
+- simulated interruption before/after PREPARED, outbox and FINAL commits; restart must hold unresolved attempts rather than automatically replay them;
 - poster success, raise-before-send, post-then-error (`POST_UNKNOWN`, no repost or re-admission), and absent read-back.
 
 **Stop and manual recovery:**
@@ -1525,15 +1524,86 @@ Many deliveries may map to one signed identity.
 **Later commissioning work, not required for T1:** producer and key custody, real trust root, live read, posting, credential storage and the transport allow-list change.
 
 **Unresolved decisions (none decided here):**
-1. Colin is not an actor in the gate's `AUTHORIZATION_MATRIX` (chief, jason, skippy). Whether to map Colin or add an actor would need a protected gate change.
+1. Colin is not a distinct gate actor. T1 fixtures use existing allowed actor names. A human-facing alias alone need not modify the gate; adding a new cryptographic/authorization actor would require a separately scoped protected change.
 2. Trust-root signing and distribution authority.
 3. Per-actor key custody location, plus durable rotation and revocation.
-4. The thread allow-list and frame marker syntax.
-5. Confirming "never auto-repost" after `POST_UNKNOWN`.
-6. Location and binding of the cursor and delivery-log store.
+4. The production thread allow-list and framing remain commissioning decisions. T1 fixes its fixture profile in J13.6.
+5. T1 fixes no automatic repost after any attempt; a future operational delivery policy remains uncommissioned.
+6. T1 uses one disposable transport SQLite file with fixture binding; production location, binding, freshness and recovery remain unresolved.
 7. Real evidence verifier binding.
 8. Whether separate GitHub identities are wanted, for audit only.
 9. Who invokes `poll_once`: manual only, since there is no runner.
-10. The Section G implementation decision stays Chief's.
+10. Chief has already chosen scoped E1/E2. Remaining Section G implementation/commissioning decisions do not reopen that choice.
 
 execution_enabled=False. All standing open items remain open.
+
+### J13.6 Frozen T1 fixture contract (Nightshift P1/P2)
+
+This section governs P3-P5 under order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6873540007. It is a reviewed implementation contract, not evidence of implemented behavior. J12 and all earlier runtime components remain unchanged. Only the two new T1 files and this document may change. No dependencies, production stores, real secrets, network, live source, runner or recovery API. Tests use existing authorized actors and disposable synthetic evidence.
+
+**Scope and ownership**
+- One manually invoked worker owns one fresh fixture transport database and one already-opened signed adapter. Concurrent workers/multiple bindings are excluded from T1; do not present a serialization or distributed exactly-once guarantee.
+- create_fresh(path, repository, threads) refuses an existing path; open_existing is inspection-only: it validates the exact fixture schema/version and repository/thread binding without initialization or repair, and cannot poll, post or resume. Any restart requires manual review; T1 has no resume/recovery API. WAL plus synchronous=FULL are fixture durability settings, not power-loss/freshness guarantees.
+- Malformed/missing/corrupt state, storage exceptions, unknown commit outcomes and unresolved attempts stop the pass with manual_required. Do not clear, recreate, delete or repair a store to continue. Tests may discard their entire fixture after inspection.
+- No automatic retry within a pass. A later explicit poll on the same uninterrupted fixture instance may process newly observed comments only if the prior state is fully recorded and no manual block exists. Reopening cannot silently resume after an unknown final commit.
+
+**Fake source and bounds**
+- CommentObservation has exact scalar fields: positive integer comment_id (not bool), whole-second UTC updated_at string, author string (audit only), body bytes. Repository/thread are fixed inputs checked against a fixture allow-list (SGGlobal/QLA; default fixture threads 23 and 26).
+- CommentPage has a nonempty snapshot_id, tuple of observations, and next_token (nonempty string or null). CommentSource.page(repository, thread, token) returns one page from an immutable fake snapshot; it has no GitHub client.
+- A pass fetches at most four pages, 25 observations per page, 100 observations total, body at most 131072 bytes, author at most 256 UTF-8 bytes, token/snapshot_id at most 128 ASCII characters. Repeated tokens, changed snapshot_id mid-pass, invalid exact types, invalid timestamps or oversized pages cause a source refusal before deliver. A source exception yields an incomplete/manual report, not an empty successful source.
+- Validate the bounded batch before admission. Exact duplicate observations are collapsed. Contradictory observations for one comment_id hold the batch before any deliver. Sort the remaining batch by (updated_at, comment_id) for determinism, without claiming signed sequence order. A later-sequence refusal is not automatically retried.
+- A non-null token after four pages is an explicit INCOMPLETE continuation report, not source exhaustion. Persist the token/snapshot hint only after all processed observations have final logs. On another snapshot or invalid continuation, restart listing from its first page and deduplicate from durable records. Never skip unresolved journal rows.
+- Continuation is a fake traversal hint, not proof of freshness, absence, completeness or an authoritative GitHub cursor. Dynamic live pagination/overlap semantics remain a future design.
+
+**Exact framing and edit policy**
+- Decode body as strict UTF-8 with no BOM, lone surrogate or newline normalization. Profile framing is exactly one opening line containing only three backticks followed by qla-bridge-frame-v1, LF, frame bytes, LF, and a closing line containing only three backticks. The closing line may be the final line or have one following LF. Prefix/suffix commentary may exist on other lines but no other triple-backtick line is permitted. CRLF, indented/tag-variant fences, zero/multiple blocks, any other fence line and unclosed fences are transport refusals.
+- Extract the byte slice between those two framing LF separators unchanged; its length must be 1..65536 inclusive. Delimiter LF bytes are excluded, internal signed JSON bytes are preserved. J12 alone decodes/authenticates the frame.
+- Before deliver, pin SHA-256 of the entire first observed body under (repository, thread, comment_id), including refused frames. Updated timestamps/author changes with identical body are duplicate observations, never a second deliver. Any changed body for that identity is EDIT_HELD with zero deliver and a manual stop. This includes whitespace edits that preserve canonical signature values and freshly signed edits; neither is silently accepted as a new message.
+- Different comment_ids carrying the same frame are separate deliveries; the frozen signed adapter/gate remains authoritative for replay. The transport must not upgrade a repeat into ADMITTED or return a fabricated original acknowledgment.
+- Deletion after observation never erases journal/outbox or undoes admission. Unobserved deletion/edit and carrier authenticity remain unprovable.
+
+**Transport schema and transactions**
+- All transport rows live in one disposable SQLite database: fixture_meta(version, repository, allowed_threads); deliveries(repository, thread, comment_id, body_digest, frame_digest nullable, state, result_json nullable); outbox(delivery_key unique, ack_json, ack_digest, post_state, external_id nullable, confirmation); continuation(thread, snapshot_id, token nullable).
+- deliveries is unique by repository/thread/comment_id; states PREPARED or FINAL. Pre-extraction refusals are FINAL with transport disposition and no IngressResult; EDIT_HELD does not replace the original body/result. Unresolved PREPARED on any open/poll blocks the entire transport fixture.
+- Transaction A inserts and commits PREPARED (with pinned body/frame digests) BEFORE calling deliver. If A errors, do not call deliver. A commit that landed then raised leaves PREPARED and restart blocks. A first write that never landed leaves no durable trace, but this call still must not call deliver; this does not solve the general first-write impossibility.
+- Call unchanged deliver exactly once for that prepared delivery, with a sink bound to its delivery key. Sink transaction B inserts exactly one local AckRecord and digest and commits; it performs no posting. Its exception is handled by existing J12. No second sink call or manufactured acknowledgment for MALFORMED.
+- Transaction C records the exact returned IngressResult and sets FINAL atomically. C does not clear any adapter or gate stop. Only a confirmed C can permit a later continuation update in transaction D. No transaction spans the adapter stores and transport store.
+- A/B/C/D commit-then-error must retain caller uncertainty. Even if fresh inspection finds FINAL, it does not retroactively turn a failed call into a confirmed one. The current pass stops. PREPARED on restart always stops; FINAL with UNCERTAIN, STOP_RETAINED, poisoned true/unknown where outcome is unsafe, or ack NOT_CONFIRMED also blocks. Confirmed ADMITTED with ack CONFIRMED_BY_SINK is safe to log, despite its result.poisoned being null on the known accepted-return branch.
+- Ordinary caught adapter exceptions already map to UNCERTAIN. Interrupts/BaseException propagate with PREPARED intact. A source/frame refusal never authenticates author metadata.
+- Failures before C may leave a landed outbox record or a real ledger event; inspect actual effects in tests. Do not equate absence of a final transport result with absence of admission.
+
+**Restart and existing adapter state**
+
+| Observation | T1 action / knowledge limit |
+| --- | --- |
+| PREPARED without confirmed final result | Stop/manual before deliver, regardless of apparent adapter effects |
+| FINAL uncertain/stop-retained/unconfirmed ack | Stop/manual; no replay, repair or repost |
+| FINAL clean result and same comment body | Skip duplicate; no adapter/sink call, preserve original record |
+| Same comment_id, changed body | EDIT_HELD/manual; no new adapter call |
+| Another comment_id, same signed identity | Frozen adapter may refuse at S6; log the new caller result without inventing prior admission confirmation |
+| Durable G, PENDING/UNCERTAIN intent or Rule U uncertain audit | Existing signed open/preflight refuses; transport does not clear or bypass these predicates |
+| Old instance poisoned, no durable predicate found | Poison is local and does not survive process death; this absence never resolves a PREPARED transport attempt |
+| No transport attempt and no adapter effect | On the same uninterrupted healthy fixture, a new explicit poll may submit through existing checks; reopen is inspection-only and no universal replay rejection is claimed |
+
+The worker must supply an adapter successfully opened by the existing signed path. T1 does not add privileged gate/ledger inspection or a new recovery constructor. Runtime HALT/stop probes remain the existing adapter's responsibility. This transport does not promise to detect all external writer changes or close probe-to-commit gaps.
+
+**Outbox and fake posting**
+- poll_once performs source/extraction/journal/ingress only and returns PollReport with processed dispositions, complete/incomplete status, continuation hint and manual_required. It never posts.
+- post_once(store, poster) selects at most one eligible outbox row whose FINAL admission is clean and acknowledgment confirmed. It first commits post_state=ATTEMPTING, then invokes the injected fake AckPoster.post once. Rows for uncertain/manual admissions or unresolved PREPARED are ineligible.
+- Fake PostOutcome is POSTED with a positive integer external_id, NOT_POSTED with a definite local pre-send refusal, or POST_UNKNOWN. Invalid returns and ordinary poster exceptions are POST_UNKNOWN; a generic exception cannot prove it happened before send. No real HTTP status guarantee is inferred.
+- Persist the observed post result separately from admission and local acknowledgment. ATTEMPTING surviving a crash means unknown/manual, even if the fake remote contains the acknowledgment. No automatic retry/repost for any attempted row, including NOT_POSTED. A failed result commit stops and never returns a definite no-post claim. BaseException propagates.
+- read_back_once(store, reader, delivery_key) performs at most one fake read and records PRESENT or NOT_FOUND_AT_CHECK only after confirmed local write; exception/unknown write remains NOT_CHECKED/manual. Presence requires the exact expected acknowledgment digest/marker in that fake fixture; it proves neither recipient consumption nor cryptographic authenticity of a live GitHub response.
+- Presence does not alter admission, acknowledge unconfirmed ingress, clear manual state or make an attempted row eligible again. There is no operational reconciliation/recovery method.
+
+**Required acceptance matrix before P6**
+- Real signed assignment round trip on fresh stores: one real ledger admission, one sink record, clean final delivery; all code stays execution_enabled=False.
+- Exact duplicate comment; repeated signed frame under another id; body edit (including canonically equivalent whitespace and a fresh valid envelope); forged author; deletion after admission.
+- Four-page/100-item bounds; continuation/non-exhaustion; ties/out-of-order items; repeated tokens; changed snapshot; invalid scalar types; oversized body/page/token; source raises. Prove source-invalid batches make zero adapter calls.
+- Exact fence syntax and byte limits (65536 accepted profile size, 65537 refused), zero/two blocks, CRLF and invalid UTF-8; malformed J12 frame has zero adapter calls and no sink.
+- Actual A/B/C/D SQLite commit failures before commit and delegate-commit-then-raise, plus BaseException interruption around deliver; inspect journal, outbox and adapter effects independently. Full-call wrappers are not evidence of internal gate/ledger COMMIT seams.
+- Restart with PREPARED and with unsafe FINAL; no automatic re-admission. Existing durable stop/Rule U behavior is reused, not weakened. Include uncertainty after a real ledger write.
+- Fake post success/refusal/exception/remote-record-then-raise; ATTEMPTING restart; post-result commit uncertainty; read-back present/absent/error. Assert no repost, no extra deliver and unchanged original admission/ack dimensions.
+- Existing runtime/test/dependency/workflow paths unchanged; meaningful focused tests plus exact committed full-suite cloud evidence. No Windows or GitHub CI claim.
+
+P1/P2 design review checked these transitions against the unchanged J12 ingress: MALFORMED invokes no sink; accepted return has unknown poison scalar but known ADMITTED; sink failures preserve original admission; interrupts propagate. The contract adds only fixture transport coordination, not authentication or recovery authority. Implementation and verification remain pending.
+
