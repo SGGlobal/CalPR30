@@ -12,8 +12,8 @@ unchanged ingress ``deliver`` path. ``execution_enabled`` remains False.
 P3: bounded fake pages, exact frame extraction, and delivery identity.
 P4: one disposable transport database, PREPARED before ``deliver``, a local
 outbox sink, FINAL, and a continuation hint written only after confirmed
-finals. The fake poster is a later priority. Nothing here is a live transport
-or a claim of source completeness, freshness, or exactly-once delivery.
+finals. P5 adds a fake poster and a one-shot read-back. Nothing here is a live
+transport or a claim of source completeness, freshness, or exactly-once delivery.
 """
 
 from __future__ import annotations
@@ -476,6 +476,36 @@ class PollReport:
 
 
 @dataclass(frozen=True)
+class PostOutcome:
+    """Fake poster result. ``POSTED`` carries a positive integer id, not a bool."""
+
+    outcome: str
+    external_id: int | None = None
+
+
+@dataclass(frozen=True)
+class PostReport:
+    """One posting attempt. ``unknown`` is not one of the four posting outcomes."""
+
+    outcome: str | None
+    unknown: bool
+    manual_required: bool
+    poster_calls: int
+    delivery_key: str | None
+    external_id: int | None
+
+
+@dataclass(frozen=True)
+class ReadReport:
+    """One fake read. An unknown write leaves confirmation ``NOT_CHECKED``."""
+
+    confirmation: str
+    manual_required: bool
+    unknown: bool
+    reader_calls: int
+
+
+@dataclass(frozen=True)
 class Inspection:
     """Read-only view. Has no poll, post, or resume operation."""
 
@@ -511,6 +541,41 @@ def commit_refusal(connection) -> None:
 def commit_continuation(connection) -> None:
     """Transaction D. Runs only after every processed observation has a confirmed FINAL."""
     connection.commit()
+
+
+def commit_post_attempt(connection) -> None:
+    """Commits post_state=ATTEMPTING before the fake poster is called."""
+    connection.commit()
+
+
+def commit_post_result(connection) -> None:
+    """Commits the observed post outcome. A failure leaves the attempt unknown."""
+    connection.commit()
+
+
+def commit_readback(connection) -> None:
+    """Commits PRESENT or NOT_FOUND_AT_CHECK. A failure stays NOT_CHECKED to the caller."""
+    connection.commit()
+
+
+def acknowledgment_marker(digest: bytes) -> bytes:
+    """Exact bytes a fake read must contain. Not a live GitHub marker."""
+    if type(digest) is not bytes or len(digest) != 32:
+        raise TransportFixtureError("digest")
+    return b"qla-bridge-ack-v1\n" + digest.hex().encode("ascii") + b"\n"
+
+
+def _interpret_post(returned) -> tuple[str, int | None]:
+    """Map a poster return to one of the three outcomes. Anything else is unknown."""
+    if type(returned) is not PostOutcome:
+        return "POST_UNKNOWN", None
+    if returned.outcome == "POSTED" and type(returned.external_id) is int and returned.external_id > 0:
+        return "POSTED", returned.external_id
+    if returned.outcome == "NOT_POSTED":
+        return "NOT_POSTED", None
+    if returned.outcome == "POST_UNKNOWN":
+        return "POST_UNKNOWN", None
+    return "POST_UNKNOWN", None
 
 
 def delivery_key(repository: str, thread: int, comment_id: int) -> str:
@@ -978,3 +1043,135 @@ class FixtureSession:
         return 1, Disposition(
             thread, observation.comment_id, kind, result.adapter_calls, observation.author, result.ack.value,
         )
+
+    def post_once(self, poster) -> PostReport:
+        """Post at most one confirmed local ack. Never calls ``deliver`` and never reposts."""
+        _require_disabled()
+        if self.manual_required or self._post_blocked():
+            self.manual_required = True
+            return PostReport(None, True, True, 0, None, None)
+        chosen = self._eligible_post()
+        if chosen is None:
+            return PostReport("NOT_ATTEMPTED", False, False, 0, None, None)
+        key, digest, repository, thread = chosen
+        wrote = self._write(
+            "UPDATE outbox SET post_state = 'ATTEMPTING' "
+            "WHERE delivery_key = ? AND post_state = 'NOT_ATTEMPTED'",
+            (key,),
+            commit_post_attempt,
+        )
+        if not wrote:
+            self.manual_required = True
+            return PostReport(None, True, True, 0, key, None)
+        body = acknowledgment_marker(digest)
+        try:
+            returned = poster.post(repository, thread, body)
+        except Exception:
+            outcome, external_id = "POST_UNKNOWN", None
+        except BaseException:
+            self.manual_required = True
+            raise
+        else:
+            outcome, external_id = _interpret_post(returned)
+        wrote = self._write(
+            "UPDATE outbox SET post_state = ?, external_id = ? "
+            "WHERE delivery_key = ? AND post_state = 'ATTEMPTING'",
+            (outcome, external_id, key),
+            commit_post_result,
+        )
+        if not wrote:
+            self.manual_required = True
+            return PostReport(None, True, True, 1, key, None)
+        return PostReport(outcome, False, False, 1, key, external_id)
+
+    def read_back_once(self, reader, key: str) -> ReadReport:
+        """One fake read. Presence does not change admission, ack, or post eligibility."""
+        _require_disabled()
+        if type(key) is not str:
+            self.manual_required = True
+            return ReadReport("NOT_CHECKED", True, True, 0)
+        digest = self._ack_digest(key)
+        if digest is None:
+            return ReadReport("NOT_CHECKED", False, False, 0)
+        try:
+            found = reader.read(key)
+        except Exception:
+            self.manual_required = True
+            return ReadReport("NOT_CHECKED", True, True, 1)
+        except BaseException:
+            self.manual_required = True
+            raise
+        if found is not None and type(found) is not bytes:
+            self.manual_required = True
+            return ReadReport("NOT_CHECKED", True, True, 1)
+        marker = acknowledgment_marker(digest)
+        confirmation = "PRESENT" if found is not None and marker in found else "NOT_FOUND_AT_CHECK"
+        wrote = self._write(
+            "UPDATE outbox SET confirmation = ? WHERE delivery_key = ?",
+            (confirmation, key),
+            commit_readback,
+        )
+        if not wrote:
+            self.manual_required = True
+            return ReadReport("NOT_CHECKED", True, True, 1)
+        return ReadReport(confirmation, False, False, 1)
+
+    def _post_blocked(self) -> bool:
+        connection = _connect(self.path)
+        try:
+            if _store_blocks(connection):
+                return True
+            row = connection.execute(
+                "SELECT 1 FROM outbox WHERE post_state = 'ATTEMPTING' LIMIT 1"
+            ).fetchone()
+            return row is not None
+        finally:
+            connection.close()
+
+    def _eligible_post(self):
+        connection = _connect(self.path)
+        try:
+            rows = connection.execute(
+                "SELECT delivery_key, ack_digest FROM outbox WHERE post_state = 'NOT_ATTEMPTED' "
+                "ORDER BY delivery_key"
+            ).fetchall()
+            for row in rows:
+                key = row["delivery_key"]
+                try:
+                    repository, thread_text, comment_text = key.split("\x1f")
+                    thread, comment_id = int(thread_text), int(comment_text)
+                except (ValueError, AttributeError):
+                    continue
+                delivery = connection.execute(
+                    "SELECT state, result_json FROM deliveries "
+                    "WHERE repository = ? AND thread = ? AND comment_id = ?",
+                    (repository, thread, comment_id),
+                ).fetchone()
+                if delivery is None or delivery["state"] != "FINAL" or delivery["result_json"] is None:
+                    continue
+                try:
+                    payload = json.loads(delivery["result_json"])
+                except json.JSONDecodeError:
+                    continue
+                if (
+                    type(payload) is dict
+                    and payload.get("admission") == "ADMITTED"
+                    and payload.get("ack") == "CONFIRMED_BY_SINK"
+                    and not _blocks_payload(payload)
+                ):
+                    return key, bytes(row["ack_digest"]), repository, thread
+            return None
+        finally:
+            connection.close()
+
+    def _ack_digest(self, key: str):
+        connection = _connect(self.path)
+        try:
+            row = connection.execute(
+                "SELECT ack_digest FROM outbox WHERE delivery_key = ?", (key,)
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        return bytes(row["ack_digest"])

@@ -2,7 +2,7 @@
 
 OFFLINE SYNTHETIC ONLY. Governing contract: J13.6. P3 covers the bounded fake
 source, exact frame extraction and delivery identity. P4 covers the disposable
-journal, outbox and continuation. The poster is a later priority.
+journal, outbox and continuation. P5 covers the fake poster and read-back.
 execution_enabled=False. No network or credentials.
 """
 
@@ -39,6 +39,8 @@ from skippy.collaboration.offline_bridge_transport_sim import (
     body_digest,
     classify_delivery,
     collect_observations,
+    PostOutcome,
+    acknowledgment_marker,
     create_fresh,
     extract_frame,
     frame_digest,
@@ -745,3 +747,211 @@ def test_uncertainty_after_a_real_ledger_write_blocks_the_next_poll(tmp_path, mo
     assert open_existing(session.path).blocking is True
     follow = session.poll_once(ScriptSource({None: page((obs(2, b"later"),))}), adapter, NOW, thread=23)
     assert follow.deliver_calls == 0 and follow.source_calls == 0 and adapter.calls == 1
+
+
+# --- P5 fake post and read-back ------------------------------------------------
+
+class FakePoster:
+    def __init__(self, result=PostOutcome("POSTED", 4242), exc=None):
+        self.result = result
+        self.exc = exc
+        self.calls = []
+
+    def post(self, repository, thread, body):
+        self.calls.append((repository, thread, body))
+        if self.exc is not None:
+            raise self.exc
+        return self.result
+
+
+class FakeReader:
+    def __init__(self, body=None, exc=None):
+        self.body = body
+        self.exc = exc
+        self.calls = []
+
+    def read(self, key):
+        self.calls.append(key)
+        if self.exc is not None:
+            raise self.exc
+        return self.body
+
+
+def admit_one(tmp_path):
+    stores = AdmissionStores(tmp_path / "adm")
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    body = envelope_frame(make_envelope(stores.signers))
+    session.poll_once(ScriptSource({None: page((obs(1, body),))}), stores.adapter(), NOW, thread=23)
+    inspected = open_existing(session.path)
+    return session, stores, inspected.outbox[0][0], bytes(inspected.outbox[0][2]), inspected.deliveries[0][6]
+
+
+def test_posted_not_posted_and_unknown_are_not_reposted(tmp_path):
+    session, stores, key, digest, admission = admit_one(tmp_path)
+    marker = acknowledgment_marker(digest)
+    poster = FakePoster()
+    report = session.post_once(poster)
+    assert report.outcome == "POSTED" and report.unknown is False and report.poster_calls == 1
+    assert report.external_id == 4242 and poster.calls[0][0] == REPOSITORY
+    assert poster.calls[0][1] == 23 and marker in poster.calls[0][2]
+    inspected = open_existing(session.path)
+    assert inspected.outbox[0][3] == "POSTED" and inspected.outbox[0][4] == 4242
+    assert inspected.deliveries[0][6] == admission
+    assert len(ledger_rows(stores)) == 1
+    again = session.post_once(poster)
+    assert again.outcome == "NOT_ATTEMPTED" and again.poster_calls == 0 and len(poster.calls) == 1
+
+    session, _stores, _key, _digest, _admission = admit_one(tmp_path / "refuse")
+    poster = FakePoster(PostOutcome("NOT_POSTED"))
+    assert session.post_once(poster).outcome == "NOT_POSTED"
+    assert session.post_once(poster).poster_calls == 0 and len(poster.calls) == 1
+    assert open_existing(session.path).outbox[0][3] == "NOT_POSTED"
+
+    session, _stores, _key, _digest, _admission = admit_one(tmp_path / "raise")
+    poster = FakePoster(exc=RuntimeError("reset"))
+    report = session.post_once(poster)
+    assert report.outcome == "POST_UNKNOWN" and report.poster_calls == 1 and len(poster.calls) == 1
+    assert session.post_once(poster).poster_calls == 0 and len(poster.calls) == 1
+    assert open_existing(session.path).outbox[0][3] == "POST_UNKNOWN"
+
+
+def test_invalid_poster_returns_are_post_unknown(tmp_path):
+    cases = (None, PostOutcome("POSTED", True), PostOutcome("POSTED", 0), PostOutcome("MAYBE"))
+    for index, result in enumerate(cases):
+        session, _stores, _key, _digest, _admission = admit_one(tmp_path / str(index))
+        poster = FakePoster(result)
+        report = session.post_once(poster)
+        assert report.outcome == "POST_UNKNOWN" and report.poster_calls == 1
+        assert open_existing(session.path).outbox[0][3] == "POST_UNKNOWN"
+        assert open_existing(session.path).outbox[0][4] is None
+
+
+def test_post_attempt_and_result_commit_seams(tmp_path, monkeypatch):
+    originals = {
+        "commit_post_attempt": sim.commit_post_attempt,
+        "commit_post_result": sim.commit_post_result,
+    }
+
+    def run(name, seam, mode):
+        for key, fn in originals.items():
+            monkeypatch.setattr(sim, key, fn)
+        session, _stores, key, _digest, _admission = admit_one(tmp_path / name)
+        real = originals[seam]
+        if mode == "before":
+            def wrapped(_connection, _real=real):
+                raise sqlite3.OperationalError("before")
+        else:
+            def wrapped(connection, _real=real):
+                _real(connection)
+                raise sqlite3.OperationalError("after")
+        monkeypatch.setattr(sim, seam, wrapped)
+        poster = FakePoster()
+        report = session.post_once(poster)
+        return session, poster, report, open_existing(session.path)
+
+    session, poster, report, inspected = run("attempt-before", "commit_post_attempt", "before")
+    assert report.unknown is True and report.poster_calls == 0 and poster.calls == []
+    assert inspected.outbox[0][3] == "NOT_ATTEMPTED"
+    assert session.post_once(poster).poster_calls == 0
+
+    session, poster, report, inspected = run("attempt-after", "commit_post_attempt", "after")
+    assert report.unknown is True and poster.calls == []
+    assert inspected.outbox[0][3] == "ATTEMPTING"
+    assert session.post_once(poster).poster_calls == 0 and session.post_once(poster).unknown is True
+
+    session, poster, report, inspected = run("result-before", "commit_post_result", "before")
+    assert report.unknown is True and report.outcome is None and len(poster.calls) == 1
+    assert inspected.outbox[0][3] == "ATTEMPTING"
+    assert session.post_once(poster).poster_calls == 0 and len(poster.calls) == 1
+
+    session, poster, report, inspected = run("result-after", "commit_post_result", "after")
+    assert report.unknown is True and report.outcome is None
+    assert inspected.outbox[0][3] == "POSTED"
+    assert session.post_once(poster).poster_calls == 0 and len(poster.calls) == 1
+
+
+def test_poster_interrupt_leaves_attempting(tmp_path, monkeypatch):
+    session, _stores, _key, _digest, _admission = admit_one(tmp_path)
+
+    class Stop(BaseException):
+        pass
+
+    def interrupt(repository, thread, body):
+        raise Stop("stop")
+
+    poster = FakePoster()
+    poster.post = interrupt
+    with pytest.raises(Stop):
+        session.post_once(poster)
+    assert open_existing(session.path).outbox[0][3] == "ATTEMPTING"
+    follow = session.post_once(FakePoster())
+    assert follow.unknown is True and follow.poster_calls == 0
+
+
+def test_read_back_present_absent_and_error_do_not_repost(tmp_path):
+    session, stores, key, digest, admission = admit_one(tmp_path)
+    poster = FakePoster(exc=TimeoutError("timeout"))
+    assert session.post_once(poster).outcome == "POST_UNKNOWN"
+    present = FakeReader(acknowledgment_marker(digest) + b"\nextra")
+    report = session.read_back_once(present, key)
+    assert report.confirmation == "PRESENT" and report.reader_calls == 1 and report.unknown is False
+    inspected = open_existing(session.path)
+    assert inspected.outbox[0][5] == "PRESENT" and inspected.outbox[0][3] == "POST_UNKNOWN"
+    assert inspected.deliveries[0][6] == admission
+    assert session.post_once(poster).poster_calls == 0 and len(poster.calls) == 1
+    assert len(ledger_rows(stores)) == 1
+
+    session, _stores, key, digest, _admission = admit_one(tmp_path / "miss")
+    session.post_once(FakePoster())
+    missing = session.read_back_once(FakeReader(b"unrelated"), key)
+    assert missing.confirmation == "NOT_FOUND_AT_CHECK"
+    assert open_existing(session.path).outbox[0][3] == "POSTED"
+    assert session.post_once(FakePoster()).poster_calls == 0
+
+    session, _stores, key, _digest, _admission = admit_one(tmp_path / "err")
+    session.post_once(FakePoster())
+    failed = session.read_back_once(FakeReader(exc=RuntimeError("read")), key)
+    assert failed.confirmation == "NOT_CHECKED" and failed.unknown is True
+    assert open_existing(session.path).outbox[0][5] == "NOT_CHECKED"
+
+
+def test_read_back_commit_seams_stay_not_checked_for_the_caller(tmp_path, monkeypatch):
+    real = sim.commit_readback
+    session, _stores, key, digest, _admission = admit_one(tmp_path)
+    session.post_once(FakePoster())
+    monkeypatch.setattr(sim, "commit_readback", lambda _connection: (_ for _ in ()).throw(
+        sqlite3.OperationalError("before")))
+    report = session.read_back_once(FakeReader(acknowledgment_marker(digest)), key)
+    assert report.confirmation == "NOT_CHECKED" and report.unknown is True
+    assert open_existing(session.path).outbox[0][5] == "NOT_CHECKED"
+
+    def after(connection):
+        real(connection)
+        raise sqlite3.OperationalError("after")
+
+    session, _stores, key, digest, _admission = admit_one(tmp_path / "after")
+    session.post_once(FakePoster())
+    monkeypatch.setattr(sim, "commit_readback", after)
+    report = session.read_back_once(FakeReader(acknowledgment_marker(digest)), key)
+    assert report.confirmation == "NOT_CHECKED" and report.unknown is True
+    assert open_existing(session.path).outbox[0][5] == "PRESENT"
+    assert open_existing(session.path).outbox[0][3] == "POSTED"
+
+
+def test_unconfirmed_ack_is_not_posted(tmp_path, monkeypatch):
+    real = sim.commit_outbox
+
+    def after(connection):
+        real(connection)
+        raise sqlite3.OperationalError("after")
+
+    monkeypatch.setattr(sim, "commit_outbox", after)
+    stores = AdmissionStores(tmp_path / "adm")
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    body = envelope_frame(make_envelope(stores.signers))
+    report = session.poll_once(ScriptSource({None: page((obs(1, body),))}), stores.adapter(), NOW, thread=23)
+    assert "NOT_CONFIRMED" in open_existing(session.path).deliveries[0][6]
+    poster = FakePoster()
+    posted = session.post_once(poster)
+    assert posted.poster_calls == 0 and poster.calls == []
+    assert report.manual_required is True
