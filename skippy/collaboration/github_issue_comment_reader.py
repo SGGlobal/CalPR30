@@ -83,6 +83,9 @@ def _links(headers: dict, number: int, page: int) -> str | None:
         if relation == "last" and target < page:
             raise ValueError("last")
         seen[relation] = url
+    if "next" in seen and "last" in seen:
+        if _page(seen["last"], number) < _page(seen["next"], number):
+            raise ValueError("contradictory pagination")
     return seen.get("next")
 
 

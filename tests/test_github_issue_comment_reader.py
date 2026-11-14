@@ -55,6 +55,8 @@ def test_bad_input_calls_nothing(repo,number,token):
     f'<{URL}3>; rel="next"', f'<{URL}2>; rel="next"\r\n', '', 'x'*8193,
     f'<{URL}2>; rel="unknown"', f'<{URL}2>; rel="first"',
     f'<{URL}2>; rel="prev"', f'<{URL}2&token=secret>; rel="next"',
+    f'<{URL}2>; rel="next", <{URL}1>; rel="last"',
+    f'<{URL}1>; rel="last", <{URL}2>; rel="next"',
     f'<{URL.replace("/23/","/26/")}2>; rel="next"',
 ])
 def test_bad_links_never_followed(link):
