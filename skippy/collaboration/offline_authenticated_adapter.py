@@ -378,89 +378,102 @@ class OfflineAuthenticatedAdapter:
                 raise OfflineAdapterError(f"Orphan sequence state for {stream}")
 
     def _init_receipts(self):
-        with closing(sqlite3.connect(self.database_path)) as connection, connection:
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS audit_receipts (
-                    receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    message_id TEXT NOT NULL,
-                    idempotency_key TEXT NOT NULL,
-                    project_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    checkpoint_id TEXT NOT NULL,
-                    assignment_id TEXT NOT NULL,
-                    sender TEXT NOT NULL,
-                    outcome TEXT NOT NULL,
-                    reason TEXT,
-                    recorded_at TEXT NOT NULL
+        """P-9 legacy constructor guard (work order 6870819489, amended 6871180075).
+
+        One receipts ``BEGIN IMMEDIATE`` is acquired BEFORE any DDL or INSERT.
+        Under that same transaction ``sqlite_master`` is read for the reserved
+        schema-object name ``signed_admission_marker`` (any object kind, any
+        letter case, regardless of marker rows or value). If it is present
+        the constructor refuses with ``OfflineAdapterError``: no DDL, no
+        INSERT, and neither ``_schema_preflight`` nor ``_reconcile`` runs. The
+        stop row and any stored reason (G) are never read, parsed or adopted.
+
+        If the name is absent, the unchanged legacy statements run in that
+        same transaction and commit. Successful unmarked end states are
+        unchanged (a missing file is still created unmarked); failure
+        atomicity intentionally changes: a failure before commit no longer
+        leaves autocommitted partial DDL behind.
+
+        Open, lock, read and initialization errors become
+        ``OfflineAdapterError`` with the cause chained. The connection is
+        closed on every outcome, and a rollback that raised is never reported
+        as confirmed. No retry, no repair of a marked store, no marker
+        reconstruction and no compensating write. A store whose marker object
+        was removed out of band is indistinguishable from an unmarked store
+        (stated limit, not a safety claim).
+        """
+        try:
+            connection = _legacy_init_connect(self.database_path)
+        except Exception as exc:
+            raise OfflineAdapterError(
+                f"Legacy constructor refused: receipts store not openable ({type(exc).__name__}: {exc}); "
+                "no initialization write issued"
+            ) from exc
+        try:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+            except Exception as exc:
+                raise OfflineAdapterError(
+                    "Legacy constructor refused: receipts lock not acquired or store unreadable "
+                    f"({type(exc).__name__}: {exc}); no initialization write issued"
+                ) from exc
+            try:
+                reserved = connection.execute(
+                    "SELECT type FROM sqlite_master WHERE lower(name) = ?",
+                    (_SIGNED_MARKER_OBJECT,),
+                ).fetchall()
+            except Exception as exc:
+                self._legacy_init_abort(
+                    connection,
+                    "Legacy constructor refused: receipts store unreadable; no initialization write issued",
+                    exc,
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sequence_state (
-                    stream_key TEXT PRIMARY KEY,
-                    next_sequence INTEGER NOT NULL
+            if reserved:
+                kinds = ", ".join(sorted({str(row[0]) for row in reserved}))
+                rollback = (
+                    "rollback returned" if self._legacy_init_rollback(connection)
+                    else "rollback raised; lock release outcome unknown"
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS intent_journal (
-                    intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    message_id TEXT NOT NULL UNIQUE,
-                    idempotency_key TEXT NOT NULL UNIQUE,
-                    project_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    checkpoint_id TEXT NOT NULL,
-                    assignment_id TEXT NOT NULL,
-                    sequence INTEGER NOT NULL,
-                    payload_digest TEXT NOT NULL,
-                    state TEXT NOT NULL,
-                    recorded_at TEXT NOT NULL
+                raise OfflineAdapterError(
+                    "Legacy constructor refused: receipts store carries reserved schema object "
+                    f"signed_admission_marker ({kinds}); no initialization write issued; {rollback}"
                 )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS fail_stop (
-                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                    stopped INTEGER NOT NULL,
-                    reason TEXT
-                )
-                """
-            )
-            connection.execute(
-                "INSERT OR IGNORE INTO fail_stop (singleton, stopped, reason) VALUES (1, 0, NULL)"
-            )
-            connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS assignment_identity (
-                    project_id TEXT NOT NULL,
-                    task_id TEXT NOT NULL,
-                    assignment_id TEXT NOT NULL,
-                    PRIMARY KEY (project_id, task_id)
-                )
-                """
-            )
-            connection.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS audit_receipts_no_update
-                BEFORE UPDATE ON audit_receipts
-                BEGIN
-                    SELECT RAISE(ABORT, 'audit_receipts is append-only');
-                END
-                """
-            )
-            connection.execute(
-                """
-                CREATE TRIGGER IF NOT EXISTS audit_receipts_no_delete
-                BEFORE DELETE ON audit_receipts
-                BEGIN
-                    SELECT RAISE(ABORT, 'audit_receipts is append-only');
-                END
-                """
-            )
+            try:
+                for statement in _LEGACY_INIT_STATEMENTS:
+                    connection.execute(statement)
+            except Exception as exc:
+                self._legacy_init_abort(connection, "Legacy initialization failed before commit", exc)
+            try:
+                connection.commit()
+            except Exception as exc:
+                raise OfflineAdapterError(
+                    f"Legacy initialization commit outcome unknown ({type(exc).__name__}: {exc}); "
+                    "inspect manually; no retry"
+                ) from exc
+        finally:
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001 - cleanup only; outcome already decided
+                pass
+
+    @staticmethod
+    def _legacy_init_rollback(connection) -> bool:
+        """True only when rollback() returned normally (never assumed)."""
+        try:
+            connection.rollback()
+            return True
+        except Exception:  # noqa: BLE001 - reported to the caller as unconfirmed
+            return False
+
+    def _legacy_init_abort(self, connection, message, exc):
+        """Failure before commit() was invoked: report the rollback as observed."""
+        if self._legacy_init_rollback(connection):
+            raise OfflineAdapterError(
+                f"{message} ({type(exc).__name__}: {exc}); rollback returned; nothing committed by this call"
+            ) from exc
+        raise OfflineAdapterError(
+            f"{message} ({type(exc).__name__}: {exc}); rollback raised; outcome unknown; inspect manually"
+        ) from exc
 
     def _seen_ids(self) -> tuple[set[str], set[str]]:
         with closing(sqlite3.connect(self.database_path)) as connection, connection:
@@ -1827,6 +1840,92 @@ _SIGNED_STR_HEADERS = (
     "sender", "recipient", "role", "project_id", "task_id", "checkpoint_id",
     "assignment_id", "message_id", "idempotency_key", "key_id",
 )
+
+# P-9 (work order 6870819489, amended 6871180075): the legacy _init_receipts
+# statements, unchanged in bytes and order, executed by the guarded
+# constructor inside one receipts BEGIN IMMEDIATE transaction.
+_LEGACY_INIT_STATEMENTS = (
+    """
+                CREATE TABLE IF NOT EXISTS audit_receipts (
+                    receipt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    project_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    checkpoint_id TEXT NOT NULL,
+                    assignment_id TEXT NOT NULL,
+                    sender TEXT NOT NULL,
+                    outcome TEXT NOT NULL,
+                    reason TEXT,
+                    recorded_at TEXT NOT NULL
+                )
+                """,
+    """
+                CREATE TABLE IF NOT EXISTS sequence_state (
+                    stream_key TEXT PRIMARY KEY,
+                    next_sequence INTEGER NOT NULL
+                )
+                """,
+    """
+                CREATE TABLE IF NOT EXISTS intent_journal (
+                    intent_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL UNIQUE,
+                    idempotency_key TEXT NOT NULL UNIQUE,
+                    project_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    checkpoint_id TEXT NOT NULL,
+                    assignment_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    payload_digest TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                )
+                """,
+    """
+                CREATE TABLE IF NOT EXISTS fail_stop (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    stopped INTEGER NOT NULL,
+                    reason TEXT
+                )
+                """,
+    "INSERT OR IGNORE INTO fail_stop (singleton, stopped, reason) VALUES (1, 0, NULL)",
+    """
+                CREATE TABLE IF NOT EXISTS assignment_identity (
+                    project_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    assignment_id TEXT NOT NULL,
+                    PRIMARY KEY (project_id, task_id)
+                )
+                """,
+    """
+                CREATE TRIGGER IF NOT EXISTS audit_receipts_no_update
+                BEFORE UPDATE ON audit_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit_receipts is append-only');
+                END
+                """,
+    """
+                CREATE TRIGGER IF NOT EXISTS audit_receipts_no_delete
+                BEFORE DELETE ON audit_receipts
+                BEGIN
+                    SELECT RAISE(ABORT, 'audit_receipts is append-only');
+                END
+                """,
+)
+
+# Reserved schema-object name (any object kind, compared case-insensitively).
+_SIGNED_MARKER_OBJECT = "signed_admission_marker"
+
+
+def _legacy_init_connect(database_path):
+    """Private P-9 connection seam (test fault injection only; not a public interface).
+
+    Plain ``sqlite3.connect`` as the legacy constructor used it (a missing file
+    is still created; default 5 s busy timeout), with explicit transaction
+    control so no statement can autocommit outside BEGIN IMMEDIATE.
+    """
+    return sqlite3.connect(database_path, timeout=5.0, isolation_level=None)
+
 
 # Receipts DDL: byte-for-byte the statements of the legacy _init_receipts
 # (existing schema), plus the one new J6 table (schema change; fresh

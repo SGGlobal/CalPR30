@@ -844,17 +844,19 @@ def test_signed_construction_never_creates_or_initializes_a_missing_store(tmp_pa
 
 def test_legacy_accept_refuses_marked_store_and_signed_instance_refuses_legacy_path(tmp_path):
     env = Env(tmp_path)
-    legacy = OfflineAuthenticatedAdapter(env.ledger, env.receipts, trusted_fixture=True,
-                                         halt_check=lambda: False)
     envelope = build_envelope(
         project_id=PROJECT, task_id=TASK, checkpoint_id=CHECKPOINT, assignment_id=ASSIGNMENT,
         message_id="legacy-1", idempotency_key="legacy-idem-1", sender="chief", recipient="jason",
         role="chief", payload={"type": "assignment", "objective": "legacy"}, timestamp=NOW,
         expiry=NOW + timedelta(hours=1), sequence=1,
     )
+    # P-9 (work order 6870819489, amendment 6871180075): the legacy constructor now
+    # refuses a marked store before any write. This intentionally supersedes the
+    # former accept-stage expectation (construction no longer succeeds here).
     before = durable_state(env.paths)
     with pytest.raises(OfflineAdapterError, match="signed_admission_marker"):
-        legacy.accept(envelope, now=NOW)
+        OfflineAuthenticatedAdapter(env.ledger, env.receipts, trusted_fixture=True,
+                                    halt_check=lambda: False)
     assert durable_state(env.paths) == before
     signed = env.adapter()
     with pytest.raises(OfflineAdapterError, match="legacy unsigned path disabled"):
@@ -1407,7 +1409,10 @@ def test_m7a_p2_acquires_while_g_remains_and_is_refused_with_zero_writes(tmp_pat
     legacy.wait("ready", START_TIMEOUT)
     legacy.set("go")
     legacy_report = legacy.report()
-    assert legacy_report["result"] == "refused" and "Fail-stop active" in legacy_report["message"]
+    # P-9 (6870819489 / 6871180075): the legacy child is refused by the constructor
+    # marker guard before accept(); supersedes the former "Fail-stop active" stage.
+    assert legacy_report["result"] == "refused" and "signed_admission_marker" in legacy_report["message"]
+    assert legacy_report["message"].startswith("Legacy constructor refused: ")
     assert legacy_report["state_after"] == legacy_report["state_before"]
     assert durable_state(env.paths) == armed
     p1.set("release:before_connect_2")
@@ -2216,3 +2221,564 @@ def test_signed_record_documented_shape_only_limits(tmp_path, case):
     env, _ = _signed_history(tmp_path)
     _rewrite(env, mid, mutate=mutate, raw=raw)
     env.adapter()                                              # construction passes: shape-only check
+
+
+# =============================================================================
+# P-9 legacy-constructor guard (work order 6870819489, amended by 6871180075)
+# =============================================================================
+#
+# Fresh disposable stores only. "Baseline" controls reproduce the pre-P-9
+# (6e9d453) ``_init_receipts`` transaction pattern test-locally on their own
+# disposable store: the same statements through a default-isolation
+# connection used as a context manager, so each CREATE autocommits and the
+# INSERT commits when the block exits. No frozen repository file and no live
+# store is used to make a control. Snapshots are taken after setup, when the
+# store is quiescent; file hashes are asserted only for rollback-journal
+# (DELETE) stores, because WAL mode adds -wal/-shm housekeeping that is not a
+# logical write.
+
+P9_PREFIX = "Legacy constructor refused: "
+P9_MARKER = P9_PREFIX + "receipts store carries reserved schema object signed_admission_marker"
+P9_WRITE_VERBS = ("CREATE", "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "REPLACE")
+
+
+def _p9_baseline_init(path, fail_after=None):
+    """Pre-P-9 pattern: per-statement autocommitted DDL, implicit INSERT transaction."""
+    con = sqlite3.connect(path)
+    try:
+        with con:
+            for statement in adapter_module._LEGACY_INIT_STATEMENTS:
+                con.execute(statement)
+                if fail_after and " ".join(statement.split()).startswith(fail_after):
+                    raise InjectedFault(f"baseline injected after {fail_after}")
+    finally:
+        con.close()
+
+
+def _p9_snapshot(path):
+    """Every schema object and every row of every table (read-only connection)."""
+    con = _ro(path)
+    try:
+        objects = con.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        rows = {}
+        for (name,) in con.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name"
+        ).fetchall():
+            rows[name] = con.execute(f'SELECT * FROM "{name}" ORDER BY rowid').fetchall()
+    finally:
+        con.close()
+    return {"objects": objects, "rows": rows}
+
+
+def _p9_sha(path):
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def _p9_legacy(ledger, path):
+    return OfflineAuthenticatedAdapter(ledger, path, trusted_fixture=True, halt_check=lambda: False)
+
+
+def _p9_writes(log):
+    return [flat for flat in log if flat.split(" ", 1)[0].upper() in P9_WRITE_VERBS]
+
+
+class _P9Recorder:
+    """Test-local proxy around the private P-9 seam ``_legacy_init_connect``.
+
+    Records every statement and call. Optional faults: ``after`` raises
+    InjectedFault after the real statement with that prefix executed;
+    ``rollback`` makes rollback() raise without delegating; ``commit`` makes
+    commit() raise without delegating.
+    """
+
+    def __init__(self, real, fault=None):
+        self._real, self._fault, self.log = real, dict(fault or {}), []
+
+    def execute(self, sql, params=()):
+        flat = " ".join(sql.split())
+        self.log.append(flat)
+        cursor = self._real.execute(sql, params)
+        if self._fault.get("after") and flat.startswith(self._fault["after"]):
+            raise InjectedFault(f"injected after {self._fault['after']}")
+        return cursor
+
+    def commit(self):
+        self.log.append("commit()")
+        if self._fault.get("commit"):
+            raise InjectedFault("injected commit failure (not delegated)")
+        return self._real.commit()
+
+    def rollback(self):
+        self.log.append("rollback()")
+        if self._fault.get("rollback"):
+            raise InjectedFault("injected rollback failure (not delegated)")
+        return self._real.rollback()
+
+    def close(self):
+        self.log.append("close()")
+        return self._real.close()
+
+
+def _p9_spy(monkeypatch, fault=None):
+    """Record seam connections and any later constructor step (_schema_preflight, _reconcile)."""
+    made, calls = [], []
+    real_factory = adapter_module._legacy_init_connect
+
+    def factory(path):
+        recorder = _P9Recorder(real_factory(path), fault)
+        made.append(recorder)
+        return recorder
+
+    monkeypatch.setattr(adapter_module, "_legacy_init_connect", factory)
+    for name in ("_schema_preflight", "_reconcile"):
+        original = getattr(OfflineAuthenticatedAdapter, name)
+
+        def wrapper(self, *args, _name=name, _original=original, **kwargs):
+            calls.append(_name)
+            return _original(self, *args, **kwargs)
+
+        monkeypatch.setattr(OfflineAuthenticatedAdapter, name, wrapper)
+    return made, calls
+
+
+def _p9_assert_refused_without_writes(made, calls):
+    assert calls == [], "a later constructor step ran after the guard refused"
+    assert len(made) == 1
+    log = made[0].log
+    assert log[0] == "BEGIN IMMEDIATE", log           # lock first, before any read or write
+    assert _p9_writes(log) == [], log
+    assert "commit()" not in log and log[-1] == "close()", log
+
+
+def test_p9_guarded_statements_are_the_unchanged_legacy_statements():
+    statements = adapter_module._LEGACY_INIT_STATEMENTS
+    ddl = [s for s in statements if not s.startswith("INSERT")]
+    # _SIGNED_RECEIPTS_DDL is documented as the byte-for-byte legacy DDL plus the marker table.
+    assert ddl == list(adapter_module._SIGNED_RECEIPTS_DDL[:-1])
+    assert [s for s in statements if s.startswith("INSERT")] == [
+        "INSERT OR IGNORE INTO fail_stop (singleton, stopped, reason) VALUES (1, 0, NULL)"]
+    assert statements.index(next(s for s in statements if s.startswith("INSERT"))) == 4
+
+
+P9_DAMAGE = {
+    "deleted_fail_stop": [("DELETE FROM fail_stop", ())],
+    "dropped_receipts_table": [("DROP TABLE sequence_state", ())],
+    "dropped_audit_receipts": [("DROP TABLE audit_receipts", ())],
+    "dropped_trigger": [("DROP TRIGGER audit_receipts_no_delete", ())],
+}
+
+
+@pytest.mark.parametrize("case", list(P9_DAMAGE))
+def test_p9_damaged_marked_store_baseline_repairs_but_guard_refuses_without_writes(tmp_path, monkeypatch,
+                                                                                   case):
+    # Isolated baseline control on its own disposable store.
+    base = Env(tmp_path / "baseline")
+    raw_write(base.receipts, *P9_DAMAGE[case])
+    damaged = _p9_snapshot(base.receipts)
+    with pytest.raises(SignedAdmissionError):
+        base.adapter()
+    _p9_baseline_init(base.receipts)
+    repaired = _p9_snapshot(base.receipts)
+    assert repaired != damaged                                  # old initialization repaired evidence
+    if case == "deleted_fail_stop":
+        assert repaired["rows"]["fail_stop"] == [(1, 0, None)]
+    base.adapter()                                              # ...and the store became admissible
+    # Corrected constructor on a separate, identically damaged disposable store.
+    env = Env(tmp_path / "guarded")
+    raw_write(env.receipts, *P9_DAMAGE[case])
+    before, digest = _p9_snapshot(env.receipts), _p9_sha(env.receipts)
+    files = sorted(os.listdir(env.root))
+    made, calls = _p9_spy(monkeypatch)
+    with pytest.raises(OfflineAdapterError, match="signed_admission_marker") as info:
+        _p9_legacy(env.ledger, env.receipts)
+    assert str(info.value).startswith(P9_MARKER) and "rollback returned" in str(info.value)
+    _p9_assert_refused_without_writes(made, calls)
+    assert _p9_snapshot(env.receipts) == before and _p9_sha(env.receipts) == digest
+    assert sorted(os.listdir(env.root)) == files
+    if case == "deleted_fail_stop":
+        assert before["rows"]["fail_stop"] == []                # remains deleted
+    with pytest.raises(SignedAdmissionError) as refused:
+        env.adapter()                                           # open_signed still refuses
+    assert refused.value.classification == "refused"
+
+
+@pytest.mark.parametrize("journal_mode", ["delete", "wal"])
+@pytest.mark.parametrize("stop", ["healthy", "armed"])
+def test_p9_healthy_and_armed_marked_stores_unchanged_and_g_retained(tmp_path, monkeypatch, journal_mode,
+                                                                      stop):
+    env = Env(tmp_path, journal_mode=journal_mode)
+    g_value = "p9-synthetic-g-" + "5a" * 16
+    if stop == "armed":
+        raw_write(env.receipts, ("UPDATE fail_stop SET stopped = 1, reason = ? WHERE singleton = 1",
+                                 (g_value,)))
+    before, snapshot = durable_state(env.paths), _p9_snapshot(env.receipts)
+    digest = _p9_sha(env.receipts)
+    made, calls = _p9_spy(monkeypatch)
+    with pytest.raises(OfflineAdapterError, match="signed_admission_marker") as info:
+        _p9_legacy(env.ledger, env.receipts)
+    assert str(info.value).startswith(P9_MARKER) and g_value not in str(info.value)
+    _p9_assert_refused_without_writes(made, calls)
+    assert durable_state(env.paths) == before and _p9_snapshot(env.receipts) == snapshot
+    if journal_mode == "delete":
+        assert _p9_sha(env.receipts) == digest
+    if stop == "armed":
+        assert before["fail_stop"] == [(1, 1, g_value)]
+        with pytest.raises(SignedAdmissionError, match="stop present"):
+            env.adapter()
+    else:
+        assert before["fail_stop"] == [(1, 0, None)]
+        env.adapter()                                           # healthy store still admissible
+    assert durable_state(env.paths) == before
+
+
+P9_RESERVED = {
+    # case: (provisioned first?, setup statements)
+    "empty_marker": (True, [("DELETE FROM signed_admission_marker", ())]),
+    "malformed_marker": (True, [("UPDATE signed_admission_marker SET marker = 'not-the-marker'", ())]),
+    "marker_replaced_by_view": (True, [("DROP TABLE signed_admission_marker", ()),
+                                       ("CREATE VIEW signed_admission_marker AS SELECT 1 AS singleton", ())]),
+    "view_on_unprovisioned_file": (False, [("CREATE VIEW signed_admission_marker AS SELECT 1 AS x", ())]),
+    "index_on_unprovisioned_file": (False, [("CREATE TABLE unrelated (x)", ()),
+                                            ("CREATE INDEX signed_admission_marker ON unrelated (x)", ())]),
+    "trigger_on_unprovisioned_file": (False, [
+        ("CREATE TABLE unrelated (x)", ()),
+        ("CREATE TRIGGER signed_admission_marker AFTER INSERT ON unrelated BEGIN SELECT 1; END", ())]),
+    "case_variant_table_on_unprovisioned_file": (False, [("CREATE TABLE SIGNED_ADMISSION_MARKER (x)", ())]),
+}
+
+
+@pytest.mark.parametrize("case", list(P9_RESERVED))
+def test_p9_any_reserved_marker_object_refuses_before_init_writes(tmp_path, monkeypatch, case):
+    provisioned, setup = P9_RESERVED[case]
+    env = Env(tmp_path, provision=provisioned)
+    raw_write(env.receipts, *setup)
+    before, digest = _p9_snapshot(env.receipts), _p9_sha(env.receipts)
+    made, calls = _p9_spy(monkeypatch)
+    with pytest.raises(OfflineAdapterError, match="signed_admission_marker") as info:
+        _p9_legacy(env.ledger, env.receipts)
+    assert str(info.value).startswith(P9_MARKER)
+    _p9_assert_refused_without_writes(made, calls)
+    assert _p9_snapshot(env.receipts) == before and _p9_sha(env.receipts) == digest
+    if not provisioned:
+        assert "fail_stop" not in before["rows"]                # no legacy object was created
+    with pytest.raises(SignedAdmissionError):
+        env.adapter()
+
+
+def test_p9_non_sqlite_bytes_and_unopenable_paths_refuse_unchanged(tmp_path, monkeypatch):
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    junk = tmp_path / "junk.db"
+    payload = b"not a sqlite store" * 64
+    junk.write_bytes(payload)
+    folder = tmp_path / "a-directory"
+    folder.mkdir()
+    files = sorted(os.listdir(tmp_path))
+    made, calls = _p9_spy(monkeypatch)
+    for target in (junk, folder):
+        with pytest.raises(OfflineAdapterError, match="^" + P9_PREFIX) as info:
+            _p9_legacy(ledger, target)
+        assert "no initialization write issued" in str(info.value)
+        assert isinstance(info.value.__cause__, sqlite3.Error), repr(info.value.__cause__)
+    assert calls == []
+    assert all(_p9_writes(recorder.log) == [] and recorder.log[-1] == "close()" for recorder in made)
+    assert junk.read_bytes() == payload and sorted(os.listdir(tmp_path)) == files
+    assert os.listdir(folder) == []
+
+
+@pytest.mark.parametrize("also_deleted_stop", [False, True])
+def test_p9_dropped_marker_is_an_undetected_limit_not_a_safe_store(tmp_path, also_deleted_stop):
+    env = Env(tmp_path)
+    statements = [("DROP TABLE signed_admission_marker", ())]
+    if also_deleted_stop:
+        statements.append(("DELETE FROM fail_stop", ()))
+    raw_write(env.receipts, *statements)
+    before = _p9_snapshot(env.receipts)
+    _p9_legacy(env.ledger, env.receipts)                       # stated limit: indistinguishable from unmarked
+    after = _p9_snapshot(env.receipts)
+    if also_deleted_stop:
+        assert after["rows"]["fail_stop"] == [(1, 0, None)]   # limit: repaired, as for any unmarked store
+    else:
+        assert after == before
+    with pytest.raises(SignedAdmissionError, match="provisioning marker missing"):
+        env.adapter()                                           # never treated as a safe signed store
+
+
+def test_p9_missing_and_unmarked_existing_stores_keep_legacy_outcomes(tmp_path, monkeypatch):
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    baseline = tmp_path / "baseline.db"
+    _p9_baseline_init(baseline)
+    made, calls = _p9_spy(monkeypatch)
+    missing = tmp_path / "missing.db"
+    adapter = _p9_legacy(ledger, missing)                      # missing path: created unmarked
+    assert _p9_snapshot(missing) == _p9_snapshot(baseline)
+    assert calls == ["_schema_preflight", "_reconcile"]
+    log = made[0].log
+    assert log[0] == "BEGIN IMMEDIATE" and log[-2:] == ["commit()", "close()"]
+    envelope = build_envelope(
+        project_id=PROJECT, task_id=TASK, checkpoint_id=CHECKPOINT, assignment_id=ASSIGNMENT,
+        message_id="p9-legacy-1", idempotency_key="p9-legacy-idem-1", sender="chief", recipient="jason",
+        role="chief", payload={"type": "assignment", "objective": "legacy"}, timestamp=NOW,
+        expiry=NOW + timedelta(hours=1), sequence=1,
+    )
+    assert adapter.accept(envelope, now=NOW) == "accepted"
+    populated, digest = _p9_snapshot(missing), _p9_sha(missing)
+    _p9_legacy(ledger, missing)                                # existing initialized unmarked store
+    assert _p9_snapshot(missing) == populated and _p9_sha(missing) == digest
+    unrelated = tmp_path / "unrelated.db"
+    raw_write(unrelated, ("CREATE TABLE unrelated (x)", ()), ("INSERT INTO unrelated VALUES (7)", ()))
+    _p9_legacy(CheckpointLedger(tmp_path / "unrelated-ledger.db"), unrelated)  # unmarked, other objects
+    snap = _p9_snapshot(unrelated)
+    assert snap["rows"]["unrelated"] == [(7,)] and snap["rows"]["fail_stop"] == [(1, 0, None)]
+    expected = {(kind, name) for kind, name, _, _ in _p9_snapshot(baseline)["objects"]}
+    assert expected <= {(kind, name) for kind, name, _, _ in snap["objects"]}
+
+
+P9_INIT_FAULTS = {
+    # mode: (fault, expected text, text that must be absent)
+    "statement_fails_rollback_returns": ({"after": "CREATE TABLE IF NOT EXISTS intent_journal"},
+                                         "rollback returned; nothing committed by this call", None),
+    "statement_fails_rollback_raises": ({"after": "CREATE TABLE IF NOT EXISTS intent_journal",
+                                         "rollback": True},
+                                        "rollback raised; outcome unknown", "rollback returned"),
+    "commit_raises": ({"commit": True}, "commit outcome unknown", "rollback returned"),
+}
+
+
+@pytest.mark.parametrize("mode", list(P9_INIT_FAULTS))
+def test_p9_injected_init_failure_is_atomic_and_never_overclaims_rollback(tmp_path, monkeypatch, mode):
+    fault, needle, absent = P9_INIT_FAULTS[mode]
+    if fault.get("after"):
+        # Baseline control: the same failure point under the pre-P-9 pattern leaves partial DDL.
+        base = tmp_path / "baseline.db"
+        with pytest.raises(InjectedFault):
+            _p9_baseline_init(base, fail_after=fault["after"])
+        tables = {name for kind, name, _, _ in _p9_snapshot(base)["objects"] if kind == "table"}
+        assert {"audit_receipts", "sequence_state", "intent_journal"} <= tables
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    target = tmp_path / "receipts.db"
+    made, calls = _p9_spy(monkeypatch, fault)
+    with pytest.raises(OfflineAdapterError) as info:
+        _p9_legacy(ledger, target)
+    message = str(info.value)
+    assert needle in message, message
+    if absent:
+        assert absent not in message, message
+    assert isinstance(info.value.__cause__, InjectedFault)
+    assert calls == [] and made[0].log[0] == "BEGIN IMMEDIATE" and made[0].log[-1] == "close()"
+    # Fresh read-only observation (observer knowledge, not the caller's classification).
+    assert _p9_snapshot(target)["objects"] == []
+    monkeypatch.undo()
+    _p9_legacy(ledger, target)                                 # a later unfaulted construction succeeds
+    assert _p9_snapshot(target)["rows"]["fail_stop"] == [(1, 0, None)]
+
+
+def test_p9_lock_timeout_refuses_before_any_write(tmp_path):
+    ledger = CheckpointLedger(tmp_path / "ledger.db")
+    target = tmp_path / "receipts.db"
+    _p9_legacy(ledger, target)
+    before, digest = _p9_snapshot(target), _p9_sha(target)
+    holder = sqlite3.connect(target, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        with pytest.raises(OfflineAdapterError, match="^" + P9_PREFIX + "receipts lock not acquired") as info:
+            _p9_legacy(ledger, target)
+        waited = time.monotonic() - started
+        assert "database is locked" in str(info.value) and isinstance(info.value.__cause__, sqlite3.Error)
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert 4.0 <= waited < 30.0, waited                        # bounded by the legacy 5 s busy timeout
+    assert _p9_snapshot(target) == before and _p9_sha(target) == digest
+
+
+# --- P-9 two-process constructor/provisioning contention ---------------------
+
+P9_EVENT_NAMES = ("ready", "go", "paused", "release", "begin_requested")
+
+
+class _P9PausingConnection:
+    """Child-local proxy: signals before BEGIN IMMEDIATE and pauses at one point."""
+
+    def __init__(self, real, events, pause_on):
+        self._real, self._events, self._pause_on = real, events, pause_on
+
+    def _pause(self):
+        self._events["paused"].set()
+        if not self._events["release"].wait(START_TIMEOUT):
+            raise Inconclusive("release not received")
+
+    def execute(self, sql, params=()):
+        if " ".join(sql.split()).upper().startswith("BEGIN IMMEDIATE"):
+            if self._pause_on == "before_begin":
+                self._pause()
+            self._events["begin_requested"].set()
+        return self._real.execute(sql, params)
+
+    def commit(self):
+        if self._pause_on == "before_commit":
+            self._pause()
+        return self._real.commit()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def _p9_child_main(job, conn, events):
+    """Spawned P-9 participant with its own fresh connections; never re-raises."""
+    report = {"pid": os.getpid(), "error": None, "role": job["role"]}
+    try:
+        path = Path(job["path"])
+        if job["role"] == "provision":
+            real_provision = adapter_module._provision_connect
+            adapter_module._provision_connect = lambda uri: _P9PausingConnection(
+                real_provision(uri), events, job["pause_on"])
+            events["ready"].set()
+            if not events["go"].wait(START_TIMEOUT):
+                raise Inconclusive("go not received")
+            try:
+                provision_signed_receipts_store(path)
+                report["result"] = "provisioned"
+            except SignedAdmissionError as exc:
+                report.update(result="refused", classification=exc.classification, message=str(exc))
+        else:
+            real_init = adapter_module._legacy_init_connect
+            adapter_module._legacy_init_connect = lambda target: _P9PausingConnection(
+                real_init(target), events, job["pause_on"])
+            ledger = CheckpointLedger(Path(job["ledger"]))
+            events["ready"].set()
+            if not events["go"].wait(START_TIMEOUT):
+                raise Inconclusive("go not received")
+            try:
+                _p9_legacy(ledger, path)
+                report["result"] = "constructed"
+            except OfflineAdapterError as exc:
+                report.update(result="refused", message=str(exc))
+    except BaseException:  # noqa: BLE001 - the parent receives the full traceback
+        report["error"] = traceback.format_exc()
+    try:
+        conn.send(report)
+    finally:
+        conn.close()
+
+
+class _P9Child:
+    def __init__(self, job):
+        self.events = {name: SPAWN.Event() for name in P9_EVENT_NAMES}
+        self.receiver, sender = SPAWN.Pipe(duplex=False)
+        self.process = SPAWN.Process(target=_p9_child_main, args=(job, sender, self.events), daemon=True)
+        self.process.start()
+        sender.close()
+        self._report = None
+
+    def wait(self, name, timeout=BARRIER_TIMEOUT):
+        if not self.events[name].wait(timeout):
+            raise Inconclusive(f"P-9 child event {name!r} not observed within {timeout}s")
+
+    def set(self, name):
+        self.events[name].set()
+
+    def finished(self):
+        return self.receiver.poll(0)
+
+    def report(self, timeout=START_TIMEOUT):
+        if self._report is None:
+            if not self.receiver.poll(timeout):
+                raise Inconclusive(f"P-9 child result not received within {timeout}s")
+            self._report = self.receiver.recv()
+            assert self._report["error"] is None, self._report["error"]
+        return self._report
+
+    def stop(self):
+        if self.process.is_alive():
+            for name in ("go", "release"):
+                self.events[name].set()
+            self.process.join(2.0)
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(JOIN_TIMEOUT)
+        if self.process.is_alive():
+            self.process.kill()
+            self.process.join(JOIN_TIMEOUT)
+        self.receiver.close()
+
+
+@pytest.fixture
+def p9_children():
+    started = []
+
+    def start(job):
+        child = _P9Child(job)
+        started.append(child)
+        child.wait("ready", START_TIMEOUT)
+        return child
+
+    try:
+        yield start
+    finally:
+        for child in started:
+            child.stop()
+        assert not any(child.process.is_alive() for child in started), "P-9 child process survived"
+
+
+@pytest.mark.parametrize("schedule", ["provisioning_holds_lock_first", "constructor_holds_lock_first"])
+def test_p9_two_process_constructor_and_provisioning_never_both_succeed(tmp_path, p9_children, schedule):
+    target = tmp_path / "receipts.db"
+    ledger = str(tmp_path / "ledger.db")
+    if schedule == "provisioning_holds_lock_first":
+        provisioner = p9_children({"role": "provision", "path": str(target), "pause_on": "before_commit"})
+        provisioner.set("go")
+        provisioner.wait("paused")             # P-3 holds BEGIN IMMEDIATE: schema + marker written, uncommitted
+        constructor = p9_children({"role": "construct", "path": str(target), "ledger": ledger,
+                                   "pause_on": None})
+        constructor.set("go")
+        constructor.wait("begin_requested")
+        time.sleep(0.5)
+        blocked = not constructor.finished()
+        provisioner.set("release")
+        waiter, waiter_report = constructor, constructor.report()
+        holder_report = provisioner.report()
+        if waiter_report["result"] == "refused" and "lock not acquired" in waiter_report["message"]:
+            raise Inconclusive("constructor busy wait expired: inconclusive, not a pass")
+    else:
+        provisioner = p9_children({"role": "provision", "path": str(target), "pause_on": "before_begin"})
+        provisioner.set("go")
+        provisioner.wait("paused")             # P-3 created the empty file (O_EXCL); no transaction yet
+        constructor = p9_children({"role": "construct", "path": str(target), "ledger": ledger,
+                                   "pause_on": "before_commit"})
+        constructor.set("go")
+        constructor.wait("paused")             # constructor holds BEGIN IMMEDIATE: legacy DDL uncommitted
+        provisioner.set("release")
+        provisioner.wait("begin_requested")
+        time.sleep(0.5)
+        blocked = not provisioner.finished()
+        constructor.set("release")
+        holder_report = constructor.report()
+        waiter, waiter_report = provisioner, provisioner.report()
+        if (waiter_report["result"] == "refused"
+                and waiter_report.get("classification") == "pre_transaction_failure"):
+            raise Inconclusive("provisioning busy wait expired: inconclusive, not a pass")
+    assert blocked, f"{waiter_report['role']} completed while the other participant held the receipts lock"
+    outcomes = {holder_report["role"]: holder_report["result"], waiter_report["role"]: waiter_report["result"]}
+    assert outcomes != {"provision": "provisioned", "construct": "constructed"}, "both succeeded"
+    snapshot = _p9_snapshot(target)
+    tables = {name for kind, name, _, _ in snapshot["objects"] if kind == "table"}
+    con = _ro(target)
+    try:
+        schema_problem = adapter_module._signed_schema_problem(con)
+    finally:
+        con.close()
+    if schedule == "provisioning_holds_lock_first":
+        assert outcomes == {"provision": "provisioned", "construct": "refused"}
+        assert waiter_report["message"].startswith(P9_MARKER)
+        assert schema_problem is None
+        assert [row[:2] for row in snapshot["rows"]["signed_admission_marker"]] == [(1, SIGNED_MARKER_VALUE)]
+    else:
+        assert outcomes == {"construct": "constructed", "provision": "refused"}
+        assert waiter_report["classification"] == "confirmed_rolled_back"
+        assert "not an empty new store" in waiter_report["message"]
+        assert "signed_admission_marker" not in tables
+    assert snapshot["rows"]["fail_stop"] == [(1, 0, None)]
+    print(f"P9-OBSERVATION schedule={schedule} outcomes={outcomes} tables={sorted(tables)}")
