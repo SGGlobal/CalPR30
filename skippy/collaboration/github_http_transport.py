@@ -31,6 +31,43 @@ from skippy.collaboration.github_live_provider import (
 
 
 ALLOWED_HOST = "api.github.com"
+MAX_SELECTED_HEADER_BYTES = 16384
+MAX_LINK_HEADER_BYTES = 8192
+
+
+def _selected_headers(headers) -> dict[str, str]:
+    """Select metadata without collapsing repeated raw occurrences.
+
+    HTTPMessage.raw_items preserves duplicates. Plain dict is supported for
+    injected doubles only; an already collapsed mapping cannot prove uniqueness.
+    """
+    try:
+        if type(headers) is dict:
+            items = headers.items()
+        else:
+            items = headers.raw_items()
+        selected = {}
+        size = 0
+        for name, value in items:
+            if type(name) is not str:
+                raise ValueError
+            name = name.lower()
+            if name not in ("link", "content-type"):
+                continue
+            if type(value) is not str or name in selected:
+                raise ValueError
+            if any(ord(char) < 32 or 127 <= ord(char) <= 159 for char in value):
+                raise ValueError
+            length = len(value.encode("utf-8"))
+            size += len(name) + length
+            if size > MAX_SELECTED_HEADER_BYTES:
+                raise ValueError
+            if name == "link" and length > MAX_LINK_HEADER_BYTES:
+                raise ValueError
+            selected[name] = value
+        return selected
+    except Exception:
+        raise CredentialSafeError("Invalid response headers") from None
 
 
 class RedirectRejectingHandler(HTTPRedirectHandler):
@@ -133,6 +170,8 @@ class ProductionHTTPTransport:
                 if final != url:
                     raise CredentialSafeError("Unexpected redirect")
 
+                selected = _selected_headers(getattr(response, "headers", {}))
+
                 chunks = []
                 remaining = MAX_RESPONSE_BYTES + 1
                 while remaining > 0:
@@ -147,7 +186,7 @@ class ProductionHTTPTransport:
                     raise CredentialSafeError("Response exceeds size bound")
 
                 status = getattr(response, "status", 200)
-                return HTTPResponse(status=status, body=body, headers={})
+                return HTTPResponse(status=status, body=body, headers=selected)
 
         except CredentialSafeError:
             raise

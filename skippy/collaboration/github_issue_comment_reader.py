@@ -1,8 +1,8 @@
 """T2 offline reader seam. Injected transport only; no credentials or live factory.
 
 One bounded GET per call. Raw bytes are observations, never authenticated work.
-Missing pagination headers mean UNKNOWN, including with ProductionHTTPTransport,
-which currently drops all response headers. No completeness claim is made.
+Missing pagination headers mean UNKNOWN. Strict response validation is opt-in;
+no completeness claim is made.
 """
 from __future__ import annotations
 
@@ -102,8 +102,30 @@ def _constant(_value):
     raise ValueError("non-JSON constant")
 
 
+def _strict_content_type(headers):
+    if type(headers) is not dict:
+        raise ValueError("headers")
+    values = []
+    size = 0
+    for name, value in headers.items():
+        if type(name) is not str or type(value) is not str:
+            raise ValueError("headers")
+        if name.lower() not in ("content-type", "link"):
+            continue
+        size += len(name.lower()) + len(value.encode("utf-8"))
+        if size > 16384 or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value):
+            raise ValueError("headers")
+        if name.lower() == "content-type":
+            values.append(value)
+    if len(values) != 1 or re.fullmatch(
+        r' *(?:application/json|application/vnd\.github\+json) *'
+        r'(?:; *charset *= *(?:utf-8|"utf-8") *)?', values[0], re.IGNORECASE | re.ASCII,
+    ) is None:
+        raise ValueError("content-type")
+
+
 def read_comment_page(transport, repository: str, number: int,
-                      page_token: str | None = None) -> CommentPageBytes:
+                      page_token: str | None = None, *, strict_response: bool = False) -> CommentPageBytes:
     """Invoke a supplied test transport once; never follow a Link automatically.
 
     A caller may explicitly pass a validated next URL for another manual call.
@@ -112,6 +134,8 @@ def read_comment_page(transport, repository: str, number: int,
     """
     if execution_enabled is not False:
         raise ReaderRefusal("execution disabled required", 0)
+    if type(strict_response) is not bool:
+        raise ReaderRefusal("strict option refused", 0)
     if type(repository) is not str or repository != REPOSITORY:
         raise ReaderRefusal("repository refused", 0)
     if type(number) is not int or number not in THREADS:
@@ -137,6 +161,8 @@ def read_comment_page(transport, repository: str, number: int,
     if type(response.body) is not bytes or len(response.body) > MAX_BYTES:
         raise ReaderRefusal("body refused", 1)
     try:
+        if strict_response:
+            _strict_content_type(response.headers)
         payload = json.loads(response.body.decode("utf-8"), object_pairs_hook=_pairs,
                              parse_constant=_constant)
         if type(payload) is not list or len(payload) > PER_PAGE:

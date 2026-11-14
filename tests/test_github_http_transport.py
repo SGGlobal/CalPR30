@@ -469,3 +469,61 @@ def test_no_trading_side_effects(tmp_path):
 
     protocol = CollaborationProtocol(tmp_path / "bridge.db")
     assert protocol.is_halted is False
+
+# Header integration slice: real transport, fake upstream only.
+class HeaderOpener:
+    def __init__(self, headers):
+        self.headers = headers
+        self.calls = []
+    def open(self, request, timeout):
+        self.calls.append((request.get_method(), request.full_url, timeout))
+        response = MockResponse(200, b'[]', request.full_url)
+        response.headers = self.headers
+        return response
+
+
+def test_selected_raw_header_occurrences_preserved_only():
+    headers = Message()
+    headers['LiNk'] = '<https://api.github.com/x>; rel="next"'
+    headers['Content-Type'] = 'application/json'
+    headers['Set-Cookie'] = 'unrelated-secret'
+    result = ProductionHTTPTransport(HeaderOpener(headers))('GET', 'https://api.github.com/x', {}, 10)
+    assert result.headers == {'link': '<https://api.github.com/x>; rel="next"', 'content-type':'application/json'}
+    assert result.body == b'[]'
+
+@pytest.mark.parametrize('name', ['Link', 'Content-Type'])
+def test_duplicate_raw_headers_refused_before_collapse(name):
+    headers = Message()
+    headers[name] = 'first'
+    headers[name.swapcase()] = 'second'
+    opener = HeaderOpener(headers)
+    with pytest.raises(CredentialSafeError, match='Invalid response headers'):
+        ProductionHTTPTransport(opener)('GET', 'https://api.github.com/x', {}, 10)
+    assert len(opener.calls) == 1
+
+@pytest.mark.parametrize('headers', [
+    {'Link':'x'*8193}, {'Content-Type':'x'*16373}, {'Link':'x\r\ny'},
+    {'Content-Type':'x\ty'}, {'Link':'x\x00y'}, {'Link':'x\x7fy'},
+    {'Link':'x\x85y'}, {'Link':9}, {9:'value'}, None, [],
+    {'Link':'x\ud800y'}, {'Link':'x', 'lINK':'x'},
+])
+def test_selected_header_faults_are_static_and_one_call(headers):
+    opener = HeaderOpener(headers)
+    with pytest.raises(CredentialSafeError) as exc:
+        ProductionHTTPTransport(opener)('GET','https://api.github.com/x',{},10)
+    assert str(exc.value) == 'Invalid response headers'
+    assert exc.value.__suppress_context__ and len(opener.calls) == 1
+
+@pytest.mark.parametrize('link,content', [
+    ('x'*8192, 'x'*8176), # names 4+12 bring total to exactly 16384
+    ('é'*4096, 'application/json'),
+])
+def test_selected_header_exact_byte_bounds(link,content):
+    result=ProductionHTTPTransport(HeaderOpener({'Link':link,'Content-Type':content}))(
+        'GET','https://api.github.com/x',{},10)
+    assert result.headers == {'link':link, 'content-type':content}
+
+def test_combined_selected_header_bound():
+    opener=HeaderOpener({'Link':'x'*8192,'Content-Type':'x'*8177})
+    with pytest.raises(CredentialSafeError):
+        ProductionHTTPTransport(opener)('GET','https://api.github.com/x',{},10)

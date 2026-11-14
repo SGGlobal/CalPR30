@@ -102,7 +102,7 @@ def test_execution_flag_and_non_callable_refused(monkeypatch):
     with pytest.raises(reader.ReaderRefusal): reader.read_comment_page(t,'SGGlobal/QLA',23)
     assert t.calls==[]
 
-def test_existing_production_transport_loses_links_no_completeness_claim():
+def test_production_transport_preserves_link_without_automatic_follow():
     class Response:
         url=URL+'1'
         status=200
@@ -120,7 +120,7 @@ def test_existing_production_transport_loses_links_no_completeness_claim():
     opener=Opener()
     page=reader.read_comment_page(ProductionHTTPTransport(opener),'SGGlobal/QLA',23)
     assert opener.calls==1 and page.body==BODY
-    assert page.next_token is None and page.pagination=='UNKNOWN'
+    assert page.next_token == URL+'2' and page.pagination=='NEXT_OBSERVED'
 
 # Independent review LOW notes: pin the offline boundary without widening it.
 @pytest.mark.parametrize('token', [
@@ -140,7 +140,8 @@ def test_review_relation_edges_refuse_without_following(relation):
     transport = Transport(HTTPResponse(200, BODY, {'Link': f'<{URL}2>; rel="{relation}"'}))
     with pytest.raises(reader.ReaderRefusal) as exc:
         reader.read_comment_page(transport, 'SGGlobal/QLA', 23)
-    assert exc.value.calls == 1 and len(transport.calls) == 1
+    assert exc.value.calls == 1
+    assert transport.calls == [('GET', URL+'1', {'Accept': 'application/vnd.github+json'}, 10)]
 
 @pytest.mark.parametrize('link', [
     f'<{URL}2>; rel="next", <{URL}2>; rel="last"',
@@ -150,7 +151,8 @@ def test_review_coherent_next_last_pair_is_observed_only(link):
     transport = Transport(HTTPResponse(200, BODY, {'Link': link}))
     page = reader.read_comment_page(transport, 'SGGlobal/QLA', 23)
     assert page.next_token == URL+'2' and page.pagination == 'NEXT_OBSERVED'
-    assert page.body is BODY and len(transport.calls) == 1
+    assert page.body is BODY
+    assert transport.calls == [('GET', URL+'1', {'Accept': 'application/vnd.github+json'}, 10)]
 
 def test_review_media_type_is_not_a_gate_in_offline_reader():
     # Deliberate current contract: decode returned bytes as UTF-8 JSON, do not
@@ -159,3 +161,88 @@ def test_review_media_type_is_not_a_gate_in_offline_reader():
     page = reader.read_comment_page(transport, 'SGGlobal/QLA', 23)
     assert page.body is BODY and page.pagination == 'UNKNOWN'
     assert len(transport.calls) == 1
+
+@pytest.mark.parametrize('value', [
+    'application/json', 'application/vnd.github+json', 'APPLICATION/JSON',
+    'application/json; charset=utf-8', 'application/vnd.github+json; charset="UTF-8"',
+    ' application/json ; CHARSET = UTF-8 ',
+])
+def test_strict_content_type_accepts_utf8_json(value):
+    transport=Transport(HTTPResponse(200,BODY,{'Content-Type':value}))
+    result=reader.read_comment_page(transport,'SGGlobal/QLA',23,strict_response=True)
+    assert result.body is BODY and result.pagination=='UNKNOWN'
+    assert transport.calls == [('GET',URL+'1',{'Accept':'application/vnd.github+json'},10)]
+
+@pytest.mark.parametrize('headers', [
+    {}, {'Content-Type':'text/html'}, {'Content-Type':'application/json; charset=latin-1'},
+    {'Content-Type':'application/json; charset=utf-8; charset=utf-8'},
+    {'Content-Type':'application/json; version=1'}, {'Content-Type':'application/json;'},
+    {'Content-Type':'application/json, application/json'},
+    {'Content-Type':'application/json','content-type':'application/json'},
+    {'Content-Type':'application/json\r\n'}, {'Content-Type':'application/json; charset="utf-8'},
+    {'Content-Type':'application/json; charset="utf-8"x'},
+    {'Content-Type':'application/json; charset=utf-8\t'},
+    {'Content-Type':'application/json'+' '*16373},
+])
+def test_strict_response_refuses_bad_media_type_after_one_call(headers):
+    transport=Transport(HTTPResponse(200,BODY,headers))
+    with pytest.raises(reader.ReaderRefusal) as exc:
+        reader.read_comment_page(transport,'SGGlobal/QLA',23,strict_response=True)
+    assert exc.value.calls == 1
+    assert transport.calls == [('GET',URL+'1',{'Accept':'application/vnd.github+json'},10)]
+
+@pytest.mark.parametrize('option', [None,0,1,'yes'])
+def test_strict_option_requires_boolean_before_call(option):
+    transport=Transport()
+    with pytest.raises(reader.ReaderRefusal) as exc:
+        reader.read_comment_page(transport,'SGGlobal/QLA',23,strict_response=option)
+    assert exc.value.calls==0 and transport.calls==[]
+
+@pytest.mark.parametrize('link', [None, f'<{URL}2>; rel="next", <{URL}2>; rel="last"'])
+def test_real_transport_to_strict_reader_with_fake_upstream(link):
+    from email.message import Message
+    from io import BytesIO
+    calls=[]
+    class Opener:
+        def open(self,request,timeout):
+            calls.append((request.get_method(),request.full_url,dict(request.header_items()),timeout))
+            response=BytesIO(BODY)
+            response.status=200
+            response.url=URL+'1'
+            response.headers=Message()
+            response.headers['Content-Type']='application/json; charset=utf-8'
+            if link: response.headers['Link']=link
+            response.headers['Set-Cookie']='excluded'
+            return response
+    page=reader.read_comment_page(ProductionHTTPTransport(Opener()),'SGGlobal/QLA',23,strict_response=True)
+    assert page.body==BODY
+    assert page.pagination==('NEXT_OBSERVED' if link else 'UNKNOWN')
+    assert page.next_token==(URL+'2' if link else None)
+    assert calls==[('GET',URL+'1',{'Accept':'application/vnd.github+json'},10)]
+
+@pytest.mark.parametrize('body', [b'not JSON', b'\xff', b'{}', b'[{"id":true,"body":"x"}]'])
+def test_strict_media_type_does_not_replace_json_shape_checks(body):
+    transport=Transport(HTTPResponse(200,body,{'Content-Type':'application/json'}))
+    with pytest.raises(reader.ReaderRefusal) as exc:
+        reader.read_comment_page(transport,'SGGlobal/QLA',23,strict_response=True)
+    assert exc.value.calls==1 and len(transport.calls)==1
+
+@pytest.mark.parametrize('link', [f'<{URL}3>; rel="next"', f'<{URL}2>; rel="next", <{URL}1>; rel="last"'])
+def test_strict_fake_opener_bad_links_stop_after_original_request(link):
+    from email.message import Message
+    from io import BytesIO
+    calls=[]
+    class Opener:
+        def open(self,request,timeout):
+            calls.append((request.get_method(),request.full_url,dict(request.header_items()),timeout))
+            response=BytesIO(BODY)
+            response.status=200
+            response.url=URL+'1'
+            response.headers=Message()
+            response.headers['Content-Type']='application/json'
+            response.headers['Link']=link
+            return response
+    with pytest.raises(reader.ReaderRefusal) as exc:
+        reader.read_comment_page(ProductionHTTPTransport(Opener()),'SGGlobal/QLA',23,strict_response=True)
+    assert exc.value.calls==1
+    assert calls==[('GET',URL+'1',{'Accept':'application/vnd.github+json'},10)]
