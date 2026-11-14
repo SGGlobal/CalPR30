@@ -1,0 +1,121 @@
+"""Offline only: injected transports and an injected production opener, no network."""
+import json
+import pytest
+from skippy.collaboration import github_issue_comment_reader as reader
+from skippy.collaboration.github_live_provider import HTTPResponse
+from skippy.collaboration.github_http_transport import ProductionHTTPTransport
+
+URL = 'https://api.github.com/repos/SGGlobal/QLA/issues/23/comments?per_page=25&page='
+BODY = b'[ {"id": 1, "body": "original bytes"} ]'
+
+class Transport:
+    def __init__(self, response=None, error=None):
+        self.response = response if response is not None else HTTPResponse(200, BODY, {})
+        self.error = error
+        self.calls = []
+    def __call__(self, *args):
+        self.calls.append(args)
+        if self.error: raise self.error
+        return self.response
+
+def test_raw_bytes_and_explicit_next_call():
+    t = Transport(HTTPResponse(200, BODY, {'Link': f'<{URL}2>; rel="next", <{URL}3>; rel="last"'}))
+    first = reader.read_comment_page(t, 'SGGlobal/QLA', 23)
+    assert first.body is BODY and first.next_token == URL+'2'
+    assert first.pagination == 'NEXT_OBSERVED' and len(t.calls) == 1
+    assert t.calls[0] == ('GET', URL+'1', {'Accept':'application/vnd.github+json'}, 10)
+    t.response = HTTPResponse(200, b'[]', {})
+    second = reader.read_comment_page(t, 'SGGlobal/QLA', 23, first.next_token)
+    assert len(t.calls) == 2 and t.calls[1][1] == URL+'2'
+    assert second.pagination == 'UNKNOWN'
+
+@pytest.mark.parametrize('number', [23, 26])
+def test_missing_link_never_means_exhausted(number):
+    t = Transport(HTTPResponse(200, b'[]', {}))
+    page = reader.read_comment_page(t, 'SGGlobal/QLA', number)
+    assert page.pagination == 'UNKNOWN' and page.next_token is None
+    assert len(t.calls) == 1 and f'/issues/{number}/comments?' in t.calls[0][1]
+
+@pytest.mark.parametrize('repo,number,token', [
+    ('other/repo',23,None), ('SGGlobal/QLA',True,None), ('SGGlobal/QLA',24,None),
+    ('SGGlobal/QLA',23,URL+'0'), ('SGGlobal/QLA',23,URL+'01'),
+    ('SGGlobal/QLA',23,URL+'2&x=1'), ('SGGlobal/QLA',26,URL+'2'),
+    ('SGGlobal/QLA',23,'https://evil.example/?page=2'),
+    ('SGGlobal/QLA',23,URL.replace('api.github.com','api.github.com.evil')+'2'),
+    ('SGGlobal/QLA',23,URL+'2#x'), ('SGGlobal/QLA',23,7),
+    ('SGGlobal/QLA',23,URL+'10000'),
+])
+def test_bad_input_calls_nothing(repo,number,token):
+    t = Transport()
+    with pytest.raises(reader.ReaderRefusal) as e: reader.read_comment_page(t,repo,number,token)
+    assert e.value.calls == 0 and t.calls == []
+
+@pytest.mark.parametrize('link', [
+    '<https://evil.example/>; rel="next"', f'<{URL}2>; rel="next", <{URL}2>; rel="next"',
+    f'<{URL}3>; rel="next"', f'<{URL}2>; rel="next"\r\n', '', 'x'*8193,
+    f'<{URL}2>; rel="unknown"', f'<{URL}2>; rel="first"',
+    f'<{URL}2>; rel="prev"', f'<{URL}2&token=secret>; rel="next"',
+    f'<{URL.replace("/23/","/26/")}2>; rel="next"',
+])
+def test_bad_links_never_followed(link):
+    t = Transport(HTTPResponse(200,BODY,{'Link':link}))
+    with pytest.raises(reader.ReaderRefusal) as e: reader.read_comment_page(t,'SGGlobal/QLA',23)
+    assert e.value.calls == 1 and len(t.calls) == 1
+
+@pytest.mark.parametrize('response', [
+    HTTPResponse(s,b'[]',{}) for s in [201,204,301,302,307,401,403,404,429,500,True]
+] + [HTTPResponse(200,b'x'*1_000_001,{}),HTTPResponse(200,'[]',{}),None,
+     HTTPResponse(200,BODY,{'Link':f'<{URL}2>; rel="next"','link':f'<{URL}2>; rel="next"'})])
+def test_bad_responses_stop(response):
+    t = Transport(); t.response = response
+    with pytest.raises(reader.ReaderRefusal) as e: reader.read_comment_page(t,'SGGlobal/QLA',23)
+    assert e.value.calls == 1 and len(t.calls) == 1
+
+@pytest.mark.parametrize('body', [b'{',b'\xff',b'{}',b'[1]',b'[{"id":true,"body":"a"}]',
+    b'[{"id":1,"id":2,"body":"a"}]',b'[{"id":1,"body":NaN}]',
+    b'[{"id":1}]', b'[{"id":1,"body":"a"},{"id":1,"body":"b"}]',
+    json.dumps([{'id':i+1,'body':None} for i in range(26)]).encode()])
+def test_invalid_json_or_comment_page(body):
+    t=Transport(HTTPResponse(200,body,{}))
+    with pytest.raises(reader.ReaderRefusal): reader.read_comment_page(t,'SGGlobal/QLA',23)
+    assert len(t.calls)==1
+
+@pytest.mark.parametrize('error',[TimeoutError('secret'),RuntimeError('secret')])
+def test_transport_errors_are_static_and_not_retried(error):
+    t=Transport(error=error)
+    with pytest.raises(reader.ReaderRefusal) as e: reader.read_comment_page(t,'SGGlobal/QLA',23)
+    assert str(e.value)=='transport failed' and e.value.__suppress_context__
+    assert e.value.calls==1 and len(t.calls)==1
+
+def test_interrupt_propagates_without_retry():
+    t=Transport(error=KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt): reader.read_comment_page(t,'SGGlobal/QLA',23)
+    assert len(t.calls)==1
+
+def test_execution_flag_and_non_callable_refused(monkeypatch):
+    with pytest.raises(reader.ReaderRefusal) as e: reader.read_comment_page(None,'SGGlobal/QLA',23)
+    assert e.value.calls==0
+    monkeypatch.setattr(reader,'execution_enabled',True)
+    t=Transport()
+    with pytest.raises(reader.ReaderRefusal): reader.read_comment_page(t,'SGGlobal/QLA',23)
+    assert t.calls==[]
+
+def test_existing_production_transport_loses_links_no_completeness_claim():
+    class Response:
+        url=URL+'1'
+        status=200
+        headers={'Link':f'<{URL}2>; rel="next"'}
+        def __enter__(self): return self
+        def __exit__(self,*args): pass
+        def read(self,n):
+            body=getattr(self,'body',BODY); self.body=b''; return body
+    class Opener:
+        calls=0
+        def open(self,request,timeout):
+            self.calls+=1
+            assert request.full_url==URL+'1' and request.get_method()=='GET' and timeout==10
+            return Response()
+    opener=Opener()
+    page=reader.read_comment_page(ProductionHTTPTransport(opener),'SGGlobal/QLA',23)
+    assert opener.calls==1 and page.body==BODY
+    assert page.next_token is None and page.pagination=='UNKNOWN'

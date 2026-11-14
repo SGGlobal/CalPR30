@@ -1708,3 +1708,32 @@ These findings do not authorize resumption, retry, operational store use, or tre
 **Commissioning decision: NOT READY.** Section G implementation, HALT race, schema-to-WAL, trust-root/key custody, real evidence verification, store binding/freshness, cross-database atomicity, ledger lifecycle/manual recovery and cross-process exclusion remain open. Signing/encoding, live read, operational outbox/posting and external confirmation remain separate work. execution_enabled=False. No runner, scheduler, live transport, credentials, merge, deployment or trading is enabled.
 
 **Concrete next proposal:** refine J14.4 into an injected-tests-only reader contract for SGGlobal/QLA issue 23 and PR 26, with zero live calls and no credentials. Resolve the existing transport interface, strict response/Link validation, exact same-origin/endpoint allow-list, request/response bounds, timeout and refusal semantics before implementation. No arbitrary Link URL may become a request target. This proposal does not imply a token exists or authorize a live probe. Operational token custody and operator selection are required only for a later live step; they are not needed to review an offline design.
+
+### J15. T2 injected reader build — 2026-11-14
+
+Chief's instruction after the J14.5 handoff: "Im back at home base begin". This starts the next offline reader step. Homebase availability is user-reported; this implementation and testing run in Linux cloud, not the Homebase Windows terminal. No live probe, credentials, transport activation, runner or trading follows.
+
+**Baseline:** 223b19c96d6d7560e7ff7ea9e22ac7d9cb574ad0. Scope: the two new reader/test paths proposed in J14.4 and this appended contract. Existing runtime, transport, tests, dependencies and workflows remain unchanged. The T1 LOW findings and all commissioning blockers remain open.
+
+#### J15.1 Contract correction established before implementation
+
+The actual ProductionHTTPTransport interface is callable(method, url, headers, timeout) -> HTTPResponse(status, body, headers). Source blob fffbd4bb4f85a5915fde0b7519a91e10aa7ec3d3 returns headers={} even when the upstream response contains Link. A one-call injected-opener probe confirmed that behavior with no network. J14.4's suggestion that the unchanged production transport can return a next-page Link is therefore not currently supported. No protected transport edit is made here.
+
+Missing Link is always UNKNOWN, including an empty page. NEXT_OBSERVED means only that a valid next hint was observed in an injected response, never completeness, freshness or a stable snapshot. Header preservation and separate authenticated live wiring are later integration work; this module does not silently work around either gap.
+
+#### J15.2 Implemented bounded interface
+
+`read_comment_page(transport, repository, number, page_token=None) -> CommentPageBytes` uses an explicitly supplied callable only. There is no default/live transport factory, credential parameter, environment lookup, admission call, frame decoder, database, post, retry or scheduler. execution_enabled=False is required. A callable is a caller-supplied capability, not a sandbox: only fakes/injected openers are authorized for this build.
+
+- Repository is exactly SGGlobal/QLA. Offline test target allow-list is issue 23 and PR 26; PR conversation comments use the same /issues/{number}/comments endpoint. This is not a production authorization expansion.
+- Exactly one GET, per_page=25, timeout argument 10 seconds, at most 1,000,000 response bytes. The injected callable must honor timeout and streaming limits; the reader also checks returned size. It cannot interrupt a malicious/stuck callable. No hidden wall-clock enforcement is claimed.
+- First page is locally constructed. A caller may explicitly supply a canonical next URL for another manual call. Only the exact same host, repository, issue path and query grammar per_page=25&page=N are accepted, with N from 1 through 9999. Tokens are routing hints, not proof of a prior response. No automatic next request occurs.
+- Link is bounded to 8192 UTF-8 bytes. Duplicate case-insensitive Link headers, duplicate relations, unknown relations, malformed syntax and off-target URLs are refused. next must be current page+1; prev current page-1; first page 1; last cannot be earlier than the current page. Arbitrary URLs are never followed.
+- Exact HTTPResponse and status 200 required. UTF-8 JSON must be a list of at most 25 objects with distinct positive integer id and body string or null. Duplicate JSON keys and non-JSON constants are rejected. Other fields remain uninterpreted. Raw response bytes are returned unchanged. This validates a bounded observation shape, not sender identity, signatures or instructions inside comments.
+- ReaderRefusal has a static reason and actual invocation count (0 before transport, 1 after invocation). Transport exceptions suppress arbitrary exception text. KeyboardInterrupt/SystemExit propagate; nothing retries.
+
+#### J15.3 Verification and readiness
+
+Focused author test run: 56 passed. Cases include exact raw bytes and manual next request, both allowed threads, cross-thread/origin/query refusal before a call, malformed/duplicate/oversized Link refusal after one call, redirect/error status handling, oversized/invalid JSON and duplicate comment IDs, timeout/error redaction, interrupt propagation, and the existing production transport's missing-Link behavior via a fake opener. No live request or credential was used.
+
+Full-suite exact-source author evidence and final SHA are recorded on issue 23 with routing on PR 26. Independent review remains pending; author test success is not independent acceptance. This is an offline reader seam, not a commissioned or authenticated bridge. The next review must assess this source and contract, including UNKNOWN pagination and the untrusted callable boundary, before any live integration proposal.
