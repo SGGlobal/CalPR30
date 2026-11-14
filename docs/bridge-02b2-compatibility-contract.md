@@ -1686,3 +1686,25 @@ This is a proposal for a later Chief decision. It does not add code.
 Until those decisions are recorded, T2 is not authorized. T3 posting remains separately unauthorized and would require a protected transport change that this proposal does not include.
 
 **Review note (6874008447).** This T2 proposal was written before independent source review accepted T1. It is premature and unreviewed. It is not a commissioning-readiness claim and it does not authorize a live read. T1 acceptance remains with the reviewer. The proposal stays on the page so the record is intact.
+
+
+### J14.5 Review disposition and corrected handoff — 2026-11-14
+
+Chief instructed Skippy to begin operations after the independent review. This continues the bounded offline Nightshift work order 6873540007; it does not activate the operational bridge.
+
+**Source reviewed:** 949f6897cfb2b8448dd86d98685039db322617c9. Independent correction review: https://github.com/SGGlobal/QLA/issues/23#issuecomment-6882094434 (routing: PR26#issuecomment-6882096454). Skippy inspected that review, the P7/P8 commit diffs, and the source, tests and contract at this exact SHA.
+
+- **P6: accepted with LOW notes for disposable synthetic T1 only.** Colin's review of Skippy's two correction commits reports 52 focused and 1686 full passes, plus 10 expected negative-control failures against the older module. These are Linux cloud results, not CI or Windows. The reviewer authored the parent, so independence applies to the two corrections, not the entire ancestry. Earlier Skippy source reviews cover that parent. Skippy did not repeat execution for this disposition.
+- **P7: bounded source audit accepted at the corrected source above.** Reviewed 94c71bfb3e7507bc7c78f3fcb73319c30f4ab88a and its current descendants. The tests exercise fresh-process inspection of PREPARED/ATTEMPTING, refusal commits before/after commit, same-session concurrent intake and durable body pins. The lock serializes one session only. The constructor sentinel is a Python API guard, not a security boundary; arbitrary callers can access module internals. Neither mechanism proves cross-process exclusion or safe operational restart. P7 tests are included in the reported 52/1686 run; no separate independent P7 execution is claimed.
+- **P8: accepted as a documentation handoff only, with this correction.** J14.1's 36/1670 totals remain historical author evidence at 94c71bfb. Its four-call-bound claim was not valid for the stale-token restart path at that SHA; the later correction is the accepted basis. The earlier premature/unreviewed note records the original sequence, now superseded by this bounded disposition. Acceptance today does not retroactively make the original P7/P8 precondition satisfied.
+
+**LOW findings retained, not fixed or waived for production:**
+1. Inspection accepts a NOCASE unique index on delivery_key; exact collation equivalence is not established.
+2. Inspection accepts a WITHOUT ROWID outbox; exact table-form equivalence is not established.
+3. An in-transaction post-result write error loses the observed returned post ID in the report. It retains the call count/key and manual/unknown stop; this is a reporting limitation, not proof of no remote effect.
+
+These findings do not authorize resumption, retry, operational store use, or treating schema inspection as complete. They remain tracked for correction or explicit design disposition before any production reuse.
+
+**Commissioning decision: NOT READY.** Section G implementation, HALT race, schema-to-WAL, trust-root/key custody, real evidence verification, store binding/freshness, cross-database atomicity, ledger lifecycle/manual recovery and cross-process exclusion remain open. Signing/encoding, live read, operational outbox/posting and external confirmation remain separate work. execution_enabled=False. No runner, scheduler, live transport, credentials, merge, deployment or trading is enabled.
+
+**Concrete next proposal:** refine J14.4 into an injected-tests-only reader contract for SGGlobal/QLA issue 23 and PR 26, with zero live calls and no credentials. Resolve the existing transport interface, strict response/Link validation, exact same-origin/endpoint allow-list, request/response bounds, timeout and refusal semantics before implementation. No arbitrary Link URL may become a request target. This proposal does not imply a token exists or authorize a live probe. Operational token custody and operator selection are required only for a later live step; they are not needed to review an offline design.
