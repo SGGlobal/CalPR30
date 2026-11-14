@@ -878,3 +878,59 @@ Not changed: `offline_admission_gate.py` (P-7 remains BLOCKED), `checkpoint_ledg
 6. Read-only confirmation of the default `synchronous` level (J6 prerequisite (d)).
 
 Still open and not claimed closed: the HALT probe-to-commit race; the schema-to-WAL gap; no cross-database atomicity; store binding and non-atomic freshness; ledger lifecycle and zero appends; synthetic trust and evidence. Shared SGGlobal sender identity is reported identity, not cryptographic authentication, and the nonce is probabilistic and non-authenticating. Adapter-only exclusions (J4) are unchanged. Section G implementation and commissioning remain open. This map sets no new roadmap. execution_enabled=False.
+
+## J9. J6 offline prototype implementation record (work order 6868633069)
+
+**Status: IMPLEMENTED AS AN OFFLINE SYNTHETIC PROTOTYPE ONLY. Not commissioned, not CI, not a Section G decision.** Work order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6868633069, base 4d05c321fecd841f6be85c5e4e103b48ccbefb16, authorized by Chief for exactly three paths: `skippy/collaboration/offline_authenticated_adapter.py` (protected; changed for this prototype only), the new `tests/test_adapter_signed_admission.py`, and this document. Nothing else changed: the gate, ledger, verifier, envelope, B2.2 contract and simulator, every existing test, helper, fixture, workflow and `pyproject.toml` are untouched, and no existing store is migrated. J5 governs the acceptance text; historical G5 does not. execution_enabled=False; transport stays disabled; no recovery API exists.
+
+### J9.1 What was implemented (adapter)
+
+- **P-3 `provision_signed_receipts_store(path, *, journal_mode="delete")`.** Manual entry point, never called by any admission or constructor path. Refuses non-plain paths (`file:` URIs, `:memory:`, bytes, empty), a missing parent directory, any orphan `-journal`/`-wal`/`-shm` sidecar and any existing target (including zero-byte and non-SQLite files) by creating the file with `O_CREAT | O_EXCL`, so concurrent provisioners yield exactly one store. Sets D1 (`delete` or `wal` only), then in one `BEGIN IMMEDIATE` writes the existing receipts DDL verbatim, `fail_stop(1, 0, NULL)` and `signed_admission_marker(1, marker, provisioned_at)`. A failure before COMMIT is classified confirmed rolled back only when rollback returns, otherwise ambiguous; a COMMIT failure is ambiguous. Returns the D1-D3 read-back.
+- **P-4 `OfflineAuthenticatedAdapter.open_signed(ledger, path, *, admission_gate, halt_check, trusted_fixture=False, busy_timeout=5.0)`.** Separate signed-path factory; the legacy constructor and every existing caller are unchanged. Requires an `OfflineAdmissionGate`, a callable HALT check, a bounded busy timeout (0 < t <= 30 s) and pairwise-distinct receipts, ledger and admission paths. It never runs `_init_receipts`, never creates or initializes a store (missing file refused, nothing created), and runs phase 1 inside `BEGIN IMMEDIATE` followed by rollback.
+- **P-2 legacy refusal.** Legacy `accept()` refuses on any store carrying `signed_admission_marker` (checked after the existing fail-stop check, so an armed store still reports "Fail-stop active"), and a signed-mode instance refuses the legacy path. Behaviour on unmarked stores is unchanged.
+- **P-6 `_receipts_connect()`.** Private factory, used only by the signed path: `resolve(strict=True)`, URI `mode=rw` (never creates), explicit transactions, then D3 (`locking_mode = NORMAL`, busy timeout read-back), D1 (`journal_mode` in {delete, wal}) and D2 (`synchronous` FULL or EXTRA) read-back; any mismatch refuses. A fresh connection is opened per transaction (T1, T2, T3, R) and closed afterwards. It is the single receipts fault-injection seam.
+- **C1 single T1.** One receipts `BEGIN IMMEDIATE` covers phase 1 (zero-write gate: marker, exactly one `fail_stop` row with `stopped = 0`, exact schema equality, no PENDING/UNCERTAIN intent, reconcile, signed-record shape validation, Rule U; `fail_stop.reason` is never read), phase 2 (S4 verification, S5 HALT #1, S6(a)-(h), S7 bounded ledger preflight) and phase 3 (arm `UPDATE fail_stop SET stopped = 1, reason = :G WHERE singleton = 1 AND stopped = 0`, rowcount exactly 1, COMMIT = A). G = `SIGNED_ADMISSION_IN_PROGRESS v1 mid=<len>:<mid> idem=<len>:<idem> fp=<sha256(canonical_bytes(snap))> nonce=<token_hex(16)>`.
+- **C3 E1.b.** The genuine-denial branch (S5 HALTED `rejected`, S5 `uncertain`, S6(a)-(h) `rejected`) writes exactly one receipt in T1 and commits without arming. S4 (signature) and S7 (ledger preflight) refuse with zero writes, because E1.b does not enumerate them (see J9.3).
+- **C2 effects after a confirmed A.** T2: exact-G owner predicate and revalidation (marker, intents, captured state, fingerprint), S9 HALT #2, `gate.reserve` while the receipts lock is held, then either S10 (definite rejection: one rejected receipt, no clear) or S11 exact read-back of the reservation (read-only, at most two rows, exact projection) and W1 PENDING. W2: `ledger.record_event` with `expected_revision = R0`, which must return R0 + 1. T3/W3: exact-G predicate, sequence, ACCEPTED, accepted receipt and assignment, no clear. S9 HALT at reacquisition commits one `rejected` receipt ("HALTED at reacquisition (S9); guard retained") and never writes `fail_stop`, so G stays byte-equal (C2); the call ends `stop_retained`, poisoned, with no release. A gate exception, malformed result or `duplicate`, an S11 mismatch, a W2 failure and any receipts commit fault after A keep G, write no explanation or `uncertain` receipt, mark no intent UNCERTAIN, poison the instance and issue no retry, forward work or release.
+- **R.** A separate transaction: exact-G predicate, terminal-record revalidation, `UPDATE fail_stop SET stopped = 0, reason = NULL WHERE singleton = 1 AND stopped = 1 AND reason = :G`, rowcount exactly 1. Issued only after S10 or W3 was confirmed.
+- **J2 classifications** (on `SignedAdmissionError.classification`): `refused`, `rejected`, `stop_retained`, `confirmed_rolled_back` (condition (a)), `ambiguous` ((b), (c) and RF). Every ambiguous or confirmed-rolled-back outcome after a write was issued poisons the instance; a poisoned instance makes no further receipts connection. Messages for ambiguous outcomes never say "rolled back" or "confirmed".
+- **C4 Rule U.** `EXISTS (SELECT 1 FROM audit_receipts WHERE outcome = 'uncertain')` refuses in phase 1, store-wide, for every identity and HALT state, and refuses gated construction. A landed UNCERTAIN intent row is a separate reconcile cause. Recovery is manual; there is no bypass.
+- **J3 owner/contender split.** The armed owner proceeds only on its in-memory G (exact equality); a contender never reads `reason` and is refused while `stopped = 1`.
+- **Unchanged.** The P-5 unused writers `_advance_sequence` and `_record_receipt` are not modified; the source check confirms they have no callers. The legacy constructor and `_reconcile` are unchanged.
+
+### J9.2 BLOCKED and not claimed
+
+- The internal SQLite commit seams inside the gate (GATE:521) and the ledger (`record_event`) are BLOCKED. The tests use whole-call wrappers only (raise without delegating; delegate then raise) and do not claim (a)/(b)/(c) at those seams.
+- Direct gate callers (including the excluded SIM:287) and direct ledger writers are not fenced (H1-B1, H1-B2, P-7, P-8). Multiple receipts bindings (H1-B3) and store identity or freshness (H2-B1) are not addressed; the marker proves provisioning only, not identity or freshness, and the nonce authenticates nothing.
+
+### J9.3 Specification conflicts and stopped parts
+
+1. **Bad-signature receipt.** J5 M2 ("or signature") and the M10 negative control expect a bad-signature input to write a `rejected` receipt. C3/E1.b enumerates only S5 and S6(a)-(h), and 6838692613 S4/§4D/Q5 allow no receipt before verification. The implementation follows C3: S4 failures are refused with no receipt and no arm. The tests use an S6 rejection as the "genuine denial writes its own receipt" case and assert that a bad signature leaves no receipt. **Stopped part, for Skippy's decision;** no assertion was weakened.
+2. **S7 preflight rejections** are refused with zero writes because E1.b does not enumerate them (the 6838692613 §8 row would have written a receipt).
+3. **Legacy constructor on a marked store.** It is unchanged (J4 excluded route). If a marked store's `fail_stop` row were deleted, its `_init_receipts` `INSERT OR IGNORE` would recreate `(1, 0, NULL)`. Legacy `accept()` still refuses on the marked store; the gap is recorded, not fixed (that would change legacy behaviour).
+4. **S6(f)** checks `trusted_fixture` only; evidence is verified by the gate. The authorization matrix tuple is not pre-checked before arming; a gate rejection after A is recorded through S10 and released through R.
+5. **D2.** `synchronous` is set to FULL per connection and read back; it is not a persistent store property.
+
+### J9.4 Test mapping (`tests/test_adapter_signed_admission.py`)
+
+| J5 ID | Tests |
+| --- | --- |
+| P-3/P-4/P-6/P-2 | `test_provisioning_*`, `test_open_signed_refuses_*`, `test_signed_construction_never_creates_*`, `test_legacy_accept_refuses_marked_store_*` |
+| Positive flow | `test_signed_flow_accepts_assignment_implementation_review_*`, `test_definite_gate_rejection_*`, `test_s4_and_s7_refusals_*`, `test_reservation_read_back_mismatch_*`, `test_signed_record_shape_violation_*` |
+| M1 + RF | `test_m1_arm_commit_fault_*[a|b|c|RF]`, `test_m1_negative_control_*` |
+| M2 + Rule U | `test_m2_denial_commit_fault_*[kind-a|b|c]`, `test_m2_unfaulted_denial_*`, `test_rule_u_absence_control_*`, `test_rule_u_uncertain_intent_*` |
+| M3 | `test_m3_post_arm_failure_*` (gate x4 wrappers, W1/S9/S10/W3 x (a)(b)(c), W2 x2 wrappers), `test_s9_halt_at_reacquisition_*`, `test_m3_m4_negative_control_*` |
+| M4 | `test_m4_release_fault_*[a|b|c]` |
+| M5 | `test_m5_owner_predicate_*[T2|T3|R x foreign|stale]`, `test_m5_negative_control_*` |
+| M6 | `test_m6_child_terminated_at_seam[before_A|after_A|after_final_effect|after_R]` |
+| M7a/M7b | `test_m7a_*`, `test_m7a_negative_control_*`, `test_m7b_*` |
+| M8 | `test_m8_storage_fault_*` (healthy control, missing file, marker row, marker table, non-SQLite bytes, `fail_stop` deleted, duplicated, locked past timeout, D1 and D2 read-back mismatch), `test_m8_store_deleted_after_arming_*` |
+| M9 | `test_m9_restart_construction_*[g_present|pending_present|uncertain_receipt_only|released]` |
+| M10 | `test_m10_t1_boundary_two_processes[(i|ii|iii-halted|iii-s6|iii-uncertain) x (bad_signature|halt_active|s6_reject|authorized)]`, `test_m10_negative_control_p2_alone` |
+| J6 criterion 6 | `test_source_check_unused_writers_and_reserve_callers` |
+
+Independent processes and fresh-process observations are `multiprocessing` spawn children with new connections. Barrier waits are bounded (10 s, start-up 60 s). Children are released, terminated and joined in fixture teardown, which asserts that none survives. A P2 busy-wait expiry raises `Inconclusive` and fails, never passes.
+
+### J9.5 Evidence and open items
+
+Colin-executed Windows evidence (commands, interpreter, SQLite, journal_mode and synchronous observations, counts, exit codes and the exact tested SHA) is recorded on issue #23 and in the follow-up record below. It is not Skippy-verified and not CI. Still open and not claimed closed: commissioning; direct gate and ledger fencing; multiple bindings; store identity and freshness; the HALT probe-to-commit race; the schema-to-WAL gap; cross-database atomicity; ledger lifecycle; synthetic trust and evidence; manual recovery procedure (no recovery API); Section G. execution_enabled=False.
