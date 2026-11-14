@@ -124,6 +124,8 @@ class FixtureEvidence:
         self.verdict = verdict
 
     def verify(self, kind, assignment_id, bound_sha, evidence_id, now):
+        if self.verdict == "raise":
+            raise RuntimeError("synthetic evidence dependency failure")
         if not evidence_id.startswith("fixture-") or assignment_id != ASSIGNMENT:
             return "rejected"
         return self.verdict
@@ -148,17 +150,24 @@ class HaltCheck:
         return self.state == "halted"
 
 
-def spec(kind="assignment", tag="p1", *, sequence=None, bad_signature=False, mid=None):
-    """Plain, picklable description of one signed input."""
+def spec(kind="assignment", tag="p1", *, sequence=None, bad_signature=False, mid=None,
+         recipient=None, payload_set=None, payload_drop=()):
+    """Plain, picklable description of one signed input (validly signed unless bad_signature)."""
     return {"kind": kind, "mid": mid or f"j6-{kind}-{tag}", "idem": f"j6-idem-{kind}-{tag}",
             "sequence": SEQUENCE[kind] if sequence is None else sequence,
-            "bad_signature": bad_signature}
+            "bad_signature": bad_signature, "recipient": recipient,
+            "payload_set": dict(payload_set or {}), "payload_drop": tuple(payload_drop)}
 
 
 def sign(item, signers) -> SignedEnvelope:
     sender, role, recipient, payload = KINDS[item["kind"]]
     key_id, signer = signers[sender]
     payload = dict(payload)
+    if item.get("recipient") is not None:
+        recipient = item["recipient"]
+    payload.update(item.get("payload_set") or {})
+    for key in item.get("payload_drop") or ():
+        payload.pop(key, None)
     unsigned = SignedEnvelope(
         schema_version=1, sender=sender, recipient=recipient, role=role, project_id=PROJECT,
         task_id=TASK, checkpoint_id=CHECKPOINT, assignment_id=ASSIGNMENT,
@@ -490,6 +499,22 @@ def spy_ledger(env, mode=None):
 
     env.ledger.record_event = wrapped
     return counts
+
+
+def spy_evidence(env, log=None):
+    """Records every call to the configured gate.evidence_verifier (pre-arm and gate)."""
+    verifier = env.gate.evidence_verifier
+    real = verifier.verify
+    calls = []
+
+    def wrapped(*args):
+        calls.append(args)
+        if log is not None:
+            log.append((0, "evidence", args[:4]))
+        return real(*args)
+
+    verifier.verify = wrapped
+    return calls
 
 
 def run(adapter, env, item, now=NOW):
@@ -876,17 +901,31 @@ def test_signed_flow_accepts_assignment_implementation_review_and_releases_each_
     env.adapter()
 
 
-def test_definite_gate_rejection_records_receipt_then_releases_without_effects(tmp_path, children):
-    env = Env(tmp_path, evidence="rejected")
+def test_post_arm_evidence_change_is_rejected_by_authoritative_gate_under_g(tmp_path, children):
+    """Ruling C: pre-arm evidence passes, then the dependency changes after a
+    confirmed A; the gate re-verifies inside reserve and definitively rejects
+    (S10 receipt, then the separate exact-G release R). Distinct from a
+    pre-arm denial, which never arms."""
+    env = Env(tmp_path)
     adapter = env.adapter()
-    script = install_script(adapter, Script())
+    gate_counts, ledger_counts = spy_gate(env), spy_ledger(env)
+    script = Script(hooks={
+        "before_connect_2": lambda: setattr(env.gate.evidence_verifier, "verdict", "rejected")})
+    install_script(adapter, script)
+    evidence = spy_evidence(env, script.log)
     result, error = run(adapter, env, spec())
-    assert result == "rejected" and error.step == "S10" and not error.poisoned
-    assert [d for _, e, d in script.log if e == "commit"] == ["A", "S10", "R"]
+    assert (result, error.step, error.poisoned) == ("rejected", "S10", False)
+    expected_call = ("chief_authorization", ASSIGNMENT, BASE_SHA, "fixture-assign", NOW)
+    assert evidence == [expected_call, expected_call]          # pre-arm, then the gate
+    order = [(e, d) for _, e, d in script.log if e in ("evidence", "commit")]
+    assert order == [("evidence", expected_call[:4]), ("commit", "A"),
+                     ("evidence", expected_call[:4]), ("commit", "S10"), ("commit", "R")]
+    assert gate_counts == {"reserve": 1} and ledger_counts == {"record_event": 0}
     state = observe(children, env)
     assert released(state)
     assert [(r[8], r[9]) for r in state["audit_receipts"]] == [("rejected", "admission: evidence rejected")]
     assert state["intent_journal"] == [] and state["ledger_events"] == [] and state["reservations"] == []
+    assert state["sequence_state"] == [] and state["assignment_identity"] == []
 
 
 def test_s4_and_s7_refusals_write_nothing_and_never_arm(tmp_path):
@@ -894,14 +933,17 @@ def test_s4_and_s7_refusals_write_nothing_and_never_arm(tmp_path):
     env = Env(tmp_path)
     adapter = env.adapter()
     counts = spy_gate(env)
+    script = install_script(adapter, Script())
+    evidence = spy_evidence(env)
     before = durable_state(env.paths)
     for item, needle in ((spec(bad_signature=True), "invalid signature"),
                          (spec("review", "early", sequence=1), "ledger preflight")):
         result, error = run(adapter, env, item)
         assert result == "refused" and needle in str(error) and not error.poisoned
         assert durable_state(env.paths) == before
-    assert counts == {"reserve": 0}
+    assert counts == {"reserve": 0} and evidence == [] and script.g_values == []
     assert run(adapter, env, spec()) == ("accepted", None)
+    assert len(evidence) == 2
 
 
 def test_reservation_read_back_mismatch_blocks_w1_and_keeps_g(tmp_path):
@@ -1127,7 +1169,7 @@ M3_STEP = {"S9": "S9", "gate": "S10", "W1": "W1", "S10": "S10", "W2": "W2", "W3"
 
 @pytest.mark.parametrize("seam,condition", M3_CASES, ids=[f"{s}-{c}" for s, c in M3_CASES])
 def test_m3_post_arm_failure_retains_g_poisons_and_stops_contender(tmp_path, children, seam, condition):
-    env = Env(tmp_path, evidence="rejected" if seam == "S10" else "verified")
+    env = Env(tmp_path)
     adapter = env.adapter()
     other = contender(children, env, spec(tag="contender"))
     gate_counts = spy_gate(env, mode=condition if seam == "gate" else None)
@@ -1136,6 +1178,8 @@ def test_m3_post_arm_failure_retains_g_poisons_and_stops_contender(tmp_path, chi
     hooks = {}
     if seam == "S9":                       # HALT clear at S5, active at S9 (HALT #2)
         hooks["before_connect_2"] = lambda: setattr(adapter.test_halt, "state", "halted")
+    if seam == "S10":                      # evidence verified pre-arm, rejected at the gate after A
+        hooks["before_connect_2"] = lambda: setattr(env.gate.evidence_verifier, "verdict", "rejected")
     script = install_script(adapter, Script(fault=receipts_fault, hooks=hooks))
     result, error = run(adapter, env, spec())
     g_value = script.g_values[0]
@@ -1687,3 +1731,488 @@ def test_m10_negative_control_p2_alone(tmp_path, children, p2_input):
         assert report["result"] == "refused" and receipts == [] and zero_writes(report)
     else:
         assert report["result"] == "rejected" and [r[8] for r in receipts] == ["rejected"]
+
+
+# =============================================================================
+# Work order 6869856724 item 1 - provisioning outcome classification
+# (real SQLite through the private _provision_connect seam)
+# =============================================================================
+
+
+class _ProvisionFault:
+    """Wraps a real provisioning connection and injects one scripted fault."""
+
+    def __init__(self, real, mode, log):
+        self._real, self._mode, self._log = real, mode, log
+
+    @property
+    def in_transaction(self):
+        return self._real.in_transaction
+
+    def execute(self, sql, params=()):
+        flat = " ".join(sql.split())
+        self._log.append(("execute", flat))
+        if self._mode == "config" and flat.upper().startswith("PRAGMA JOURNAL_MODE"):
+            raise InjectedFault("injected configuration failure")
+        if self._mode == "begin" and flat.startswith("BEGIN"):
+            raise InjectedFault("injected BEGIN failure before delegating")
+        if (self._mode in ("rollback_returns", "rollback_raises")
+                and flat.startswith("INSERT INTO signed_admission_marker")):
+            raise InjectedFault("injected in-transaction failure before commit")
+        return self._real.execute(sql, params)
+
+    def commit(self):
+        self._log.append(("commit", None))
+        if self._mode == "commit_raises":
+            raise InjectedFault("injected commit failure before delegating")
+        self._real.commit()
+        if self._mode == "commit_then_raise":
+            raise InjectedFault("injected failure after real COMMIT")
+
+    def rollback(self):
+        self._log.append(("rollback", None))
+        if self._mode == "rollback_raises":
+            raise InjectedFault("injected rollback failure")
+        return self._real.rollback()
+
+    def close(self):
+        self._log.append(("close", None))
+        return self._real.close()
+
+
+def _store_objects(path):
+    con = _ro(path)
+    try:
+        names = sorted(r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type = 'table'"))
+        marker = (con.execute("SELECT marker FROM signed_admission_marker").fetchall()
+                  if "signed_admission_marker" in names else None)
+        mode = con.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        con.close()
+    return names, marker, mode
+
+
+PROVISION_FAULTS = {
+    # mode: (classification, rollback invoked, commit invoked, landed)
+    "connect": ("pre_transaction_failure", False, False, False),
+    "config": ("pre_transaction_failure", False, False, False),
+    "begin": ("pre_transaction_failure", False, False, False),
+    "rollback_returns": ("confirmed_rolled_back", True, False, False),
+    "rollback_raises": ("ambiguous", True, False, False),
+    "commit_raises": ("ambiguous", False, True, False),
+    "commit_then_raise": ("ambiguous", False, True, True),
+}
+
+
+@pytest.mark.parametrize("mode", list(PROVISION_FAULTS))
+def test_provisioning_fault_classification_never_claims_unobserved_rollback(tmp_path, monkeypatch, mode):
+    classification, rollback_called, commit_called, landed = PROVISION_FAULTS[mode]
+    target = tmp_path / "receipts.db"
+    log = []
+    real_connect = adapter_module._provision_connect
+
+    def connect(uri):
+        log.append(("connect", None))
+        if mode == "connect":
+            raise sqlite3.OperationalError("injected connection failure")
+        return _ProvisionFault(real_connect(uri), mode, log)
+
+    monkeypatch.setattr(adapter_module, "_provision_connect", connect)
+    with pytest.raises(SignedAdmissionError) as info:
+        provision_signed_receipts_store(target)
+    error = info.value
+    assert (error.classification, error.step) == (classification, "provision")
+    events = [event for event, _ in log]
+    assert events.count("rollback") == (1 if rollback_called else 0)
+    assert events.count("commit") == (1 if commit_called else 0)
+    assert mode == "connect" or events[-1] == "close"           # connection always cleaned up
+    if classification != "confirmed_rolled_back":
+        assert "rolled back" not in str(error) and "confirmed" not in str(error)
+    # Observer (separate read-only connection): side effects reported, never removed.
+    assert target.exists()
+    if mode == "connect":
+        assert target.stat().st_size == 0
+    else:
+        names, marker, journal = _store_objects(target)
+        if landed:
+            assert marker == [(SIGNED_MARKER_VALUE,)] and "fail_stop" in names
+        else:
+            assert names == [] and marker is None
+        if mode != "config":
+            assert journal == "delete"                           # D1 applied before BEGIN
+    # Never overwrites: a second provisioning attempt refuses the existing file.
+    monkeypatch.undo()
+    with pytest.raises(SignedAdmissionError, match="target exists"):
+        provision_signed_receipts_store(target)
+
+
+def test_provisioning_unfaulted_control_through_the_same_seam(tmp_path, monkeypatch):
+    log = []
+    real_connect = adapter_module._provision_connect
+    monkeypatch.setattr(adapter_module, "_provision_connect",
+                        lambda uri: _ProvisionFault(real_connect(uri), None, log))
+    config = provision_signed_receipts_store(tmp_path / "receipts.db")
+    assert config["journal_mode"] == "delete"
+    assert [e for e, _ in log if e in ("commit", "rollback", "close")] == ["commit", "close"]
+    assert _store_objects(tmp_path / "receipts.db")[1] == [(SIGNED_MARKER_VALUE,)]
+
+
+# =============================================================================
+# Item 2 - pre-arm assignment evidence (S6(f), ruling C)
+# =============================================================================
+
+GATE_CALL = ("chief_authorization", ASSIGNMENT, BASE_SHA, "fixture-assign", NOW)
+
+PREARM_DENIALS = {
+    "trusted_fixture_false": ({"trusted_fixture": False}, None, {}, 0,
+                              "Assignment requires trusted fixture"),
+    "invalid_tuple_recipient": ({}, None, {"recipient": "skippy"}, 0,
+                                "Assignment authorization tuple not permitted"),
+    "evidence_id_missing": ({}, None, {"payload_drop": ("evidence_id",)}, 0,
+                            "Assignment evidence input invalid: missing or empty evidence_id"),
+    "evidence_id_wrong_type": ({}, None, {"payload_set": {"evidence_id": 7}}, 0,
+                               "Assignment evidence input invalid: missing or empty evidence_id"),
+    "evidence_id_whitespace": ({}, None, {"payload_set": {"evidence_id": " fixture-assign"}}, 0,
+                               "Assignment evidence input invalid: evidence_id has surrounding whitespace"),
+    "base_sha_missing": ({}, None, {"payload_drop": ("base_sha",)}, 0,
+                         "Assignment evidence input invalid: invalid base_sha"),
+    "base_sha_wrong_type": ({}, None, {"payload_set": {"base_sha": 12345}}, 0,
+                            "Assignment evidence input invalid: invalid base_sha"),
+    "base_sha_uppercase": ({}, None, {"payload_set": {"base_sha": BASE_SHA.upper()}}, 0,
+                           "Assignment evidence input invalid: invalid base_sha"),
+    "forbidden_implementation_sha": ({}, None, {"payload_set": {"implementation_sha": IMPL_SHA}}, 0,
+                                     "Assignment evidence input invalid: forbidden field: implementation_sha"),
+    "sha_alias": ({}, None, {"payload_set": {"sha": BASE_SHA}}, 0,
+                  "Assignment evidence input invalid: adapter sha alias not accepted"),
+    "dependency_rejected": ({}, "rejected", {}, 1, "Assignment evidence rejected"),
+    "dependency_unavailable": ({}, "unavailable", {}, 1, "Assignment evidence unavailable"),
+    "dependency_raises": ({}, "raise", {}, 1, "Assignment evidence verification failed closed"),
+    "dependency_non_string": ({}, True, {}, 1, "Assignment evidence indeterminate"),
+    "dependency_unknown_evidence_id": ({}, None, {"payload_set": {"evidence_id": "other-evidence"}}, 1,
+                                       "Assignment evidence rejected"),
+}
+
+
+@pytest.mark.parametrize("case", list(PREARM_DENIALS))
+def test_prearm_assignment_evidence_denial_never_arms(tmp_path, case):
+    adapter_kwargs, verdict, overrides, evidence_calls, reason = PREARM_DENIALS[case]
+    env = Env(tmp_path)
+    adapter = env.adapter(**adapter_kwargs)
+    control = env.adapter()
+    if verdict is not None:
+        env.gate.evidence_verifier.verdict = verdict
+    gate_counts, ledger_counts = spy_gate(env), spy_ledger(env)
+    script = install_script(adapter, Script())
+    evidence = spy_evidence(env, script.log)
+    item = spec(**overrides)
+    before = durable_state(env.paths)
+    result, error = run(adapter, env, item)
+    assert (result, error.step, error.poisoned) == ("rejected", "E1.b", False)
+    assert len(evidence) == evidence_calls
+    if evidence_calls:
+        expected = list(GATE_CALL)
+        expected[3] = item["payload_set"].get("evidence_id", "fixture-assign")
+        assert evidence == [tuple(expected)]
+    assert gate_counts == {"reserve": 0} and ledger_counts == {"record_event": 0}
+    assert script.g_values == [] and [d for _, e, d in script.log if e == "commit"] == ["E1.b"]
+    assert not any(s.startswith(("UPDATE fail_stop", "INSERT INTO intent_journal")) for s in statements(script))
+    after = durable_state(env.paths)
+    assert {k: v for k, v in after.items() if k != "audit_receipts"} == {
+        k: v for k, v in before.items() if k != "audit_receipts"}
+    assert [(r[1], r[8], r[9]) for r in after["audit_receipts"]] == [(item["mid"], "rejected", reason)]
+    assert released(after) and after["reservations"] == [] and after["intent_journal"] == []
+    # Valid control on the same store (rejected receipts do not trigger Rule U).
+    env.gate.evidence_verifier.verdict = "verified"
+    assert run(control, env, spec(tag="control")) == ("accepted", None)
+
+
+def test_prearm_valid_control_calls_the_same_mapping_before_a_and_again_at_the_gate(tmp_path):
+    env = Env(tmp_path)
+    adapter = env.adapter()
+    gate_counts = spy_gate(env)
+    script = install_script(adapter, Script())
+    evidence = spy_evidence(env, script.log)
+    assert run(adapter, env, spec()) == ("accepted", None)
+    assert evidence == [GATE_CALL, GATE_CALL] and gate_counts == {"reserve": 1}
+    order = [(e, d) for _, e, d in script.log if e in ("evidence", "commit")]
+    assert order == [("evidence", GATE_CALL[:4]), ("commit", "A"), ("evidence", GATE_CALL[:4]),
+                     ("commit", "W1"), ("commit", "W3"), ("commit", "R")]
+    # Non-assignment types keep their existing boundary: evidence only at the gate.
+    evidence.clear()
+    assert run(adapter, env, spec("implementation")) == ("accepted", None)
+    assert evidence == [("chief_authorization", ASSIGNMENT, IMPL_SHA, "fixture-impl", NOW)]
+
+
+@pytest.mark.parametrize("verdict", ["verified", "rejected", "raise"])
+def test_bad_signature_is_zero_write_with_zero_evidence_arm_and_reserve_calls(tmp_path, verdict):
+    env = Env(tmp_path)
+    adapter = env.adapter()
+    env.gate.evidence_verifier.verdict = verdict
+    gate_counts, ledger_counts = spy_gate(env), spy_ledger(env)
+    script = install_script(adapter, Script())
+    evidence = spy_evidence(env)
+    before = durable_state(env.paths)
+    result, error = run(adapter, env, spec(bad_signature=True))
+    assert result == "refused" and "invalid signature" in str(error) and not error.poisoned
+    assert evidence == [] and script.g_values == [] and gate_counts == {"reserve": 0}
+    assert ledger_counts == {"record_event": 0} and durable_state(env.paths) == before
+    assert [d for _, e, d in script.log if e == "commit"] == []
+
+
+# =============================================================================
+# Item 3a - exact read-only reservation projection (T38)
+# =============================================================================
+
+
+def _tamper(column, value):
+    return [(f"UPDATE reservations SET {column} = ? WHERE message_id = ?", "value", value)]
+
+
+READBACK_MUTATIONS = {
+    **{f"field_{c}": [(f"UPDATE reservations SET {c} = {c} || '-x' WHERE message_id = ?", "mid", None)]
+       for c in ("project_id", "task_id", "checkpoint_id", "assignment_id", "message_id",
+                 "idempotency_key", "sender", "recipient", "role")},
+    "field_payload_digest": _tamper("payload_digest", bytes(32)),
+    "field_sequence": _tamper("sequence", 2),
+    "type_sequence_text": _tamper("sequence", "one"),
+    "type_payload_digest_text": _tamper("payload_digest", "00" * 32),
+    "type_sender_blob": _tamper("sender", b"chief"),
+    "state_pending": _tamper("state", "PENDING"),
+    "state_lowercase": _tamper("state", "reserved"),
+    "id_zero": _tamper("id", 0),
+    "id_negative": _tamper("id", -3),
+    "recorded_at_not_iso": _tamper("recorded_at", "not-a-time"),
+    "recorded_at_naive": _tamper("recorded_at", "2026-11-13T12:00:00"),
+    "recorded_at_non_utc": _tamper("recorded_at", "2026-11-13T12:00:00+01:00"),
+    "recorded_at_blob": _tamper("recorded_at", b"2026-11-13T12:00:00+00:00"),
+    "cardinality_zero": [("DELETE FROM reservations WHERE message_id = ?", "mid", None)],
+    "cardinality_two": [
+        ("UPDATE reservations SET idempotency_key = 'j6-idem-other' WHERE message_id = ?", "mid", None),
+        ("INSERT INTO reservations (project_id, task_id, checkpoint_id, assignment_id, message_id, "
+         "idempotency_key, sender, recipient, role, payload_digest, sequence, state, recorded_at) "
+         "SELECT project_id, task_id, checkpoint_id, assignment_id, 'j6-mid-other', ?, sender, "
+         "recipient, role, payload_digest, sequence, state, recorded_at FROM reservations "
+         "WHERE idempotency_key = 'j6-idem-other'", "idem", None),
+    ],
+}
+
+
+@pytest.mark.parametrize("case", list(READBACK_MUTATIONS))
+def test_readback_projection_mutation_fails_before_w1_and_keeps_g(tmp_path, case):
+    env = Env(tmp_path)
+    adapter = env.adapter()
+    seen = {}
+
+    def tamper(snap):
+        statements_ = []
+        for sql, kind, value in READBACK_MUTATIONS[case]:
+            param = {"mid": snap.message_id, "idem": snap.idempotency_key}.get(kind)
+            statements_.append((sql, (param,) if kind != "value" else (value, snap.message_id)))
+        raw_write(env.admission, *statements_)
+        seen["tampered"] = durable_state(env.paths)
+
+    gate_counts = spy_gate(env, after=tamper)
+    ledger_counts = spy_ledger(env)
+    script = install_script(adapter, Script())
+    result, error = run(adapter, env, spec())
+    assert (result, error.step, error.poisoned) == ("refused", "S11", True), (result, error)
+    after = durable_state(env.paths)
+    assert after == seen["tampered"]                          # read-back wrote nothing
+    assert after["fail_stop"] == [(1, 1, script.g_values[0])] and after["intent_journal"] == []
+    assert gate_counts == {"reserve": 1} and ledger_counts == {"record_event": 0}
+    assert script.calls == 2 and [d for _, e, d in script.log if e == "commit"] == ["A"]
+    expected_rows = 0 if case == "cardinality_zero" else (2 if case == "cardinality_two" else 1)
+    assert len(after["reservations"]) == expected_rows
+
+
+class _ReadbackShim:
+    """In-module seam for read-back cases the frozen gate schema cannot hold."""
+
+    def __init__(self, admission, mode):
+        self._admission = str(Path(admission).resolve().as_uri())
+        self._mode = mode
+        self._real = sqlite3.connect
+
+    def connect(self, target, *args, **kwargs):
+        if isinstance(target, str) and target.startswith(self._admission):
+            if self._mode == "open_failure":
+                raise sqlite3.OperationalError("injected mode=ro open failure")
+            return _RowRewrite(self._real(target, *args, **kwargs))
+        return self._real(target, *args, **kwargs)
+
+
+class _RowRewrite:
+    def __init__(self, real):
+        self._real = real
+
+    def execute(self, sql, params=()):
+        cursor = self._real.execute(sql, params)
+        if "FROM reservations" in sql:
+            rows = [("7",) + tuple(row[1:]) for row in cursor.fetchall()]
+            return _Rows(rows)
+        return cursor
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+class _Rows:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+@pytest.mark.parametrize("mode", ["id_as_str", "open_failure"])
+def test_readback_shimmed_cases_fail_before_w1_and_keep_g(tmp_path, monkeypatch, mode):
+    env = Env(tmp_path)
+    adapter = env.adapter()
+    shim = _ReadbackShim(env.admission, mode)
+    module_shim = type(sqlite3)("sqlite3_shim")
+    module_shim.__dict__.update({k: v for k, v in vars(sqlite3).items() if not k.startswith("__")})
+    module_shim.connect = shim.connect
+    monkeypatch.setattr(adapter_module, "sqlite3", module_shim)
+    ledger_counts = spy_ledger(env)
+    script = install_script(adapter, Script())
+    result, error = run(adapter, env, spec())
+    assert (result, error.step, error.poisoned) == ("refused", "S11", True), (result, error)
+    after = durable_state(env.paths)
+    assert after["fail_stop"] == [(1, 1, script.g_values[0])] and after["intent_journal"] == []
+    assert len(after["reservations"]) == 1 and ledger_counts == {"record_event": 0}
+
+
+def test_readback_valid_control_leaves_reservation_rows_unchanged(tmp_path):
+    env = Env(tmp_path)
+    adapter = env.adapter()
+    seen = {}
+    spy_gate(env, after=lambda snap: seen.update(rows=durable_state(env.paths)["reservations"]))
+    assert run(adapter, env, spec()) == ("accepted", None)
+    assert durable_state(env.paths)["reservations"] == seen["rows"]
+
+
+def test_reservations_schema_persists_no_signed_bytes_documentation():
+    """The read-back is stored-row equality only: these values are never persisted,
+    so no claim about reconstructed signature authenticity is possible."""
+    import skippy.collaboration.offline_admission_gate as gate_module
+    con = sqlite3.connect(":memory:")
+    try:
+        con.execute(gate_module._TABLE_DDL)
+        columns = {row[1] for row in con.execute("PRAGMA table_info(reservations)")}
+    finally:
+        con.close()
+    assert not columns & {"signature", "key_id", "schema_version", "timestamp", "expiry", "payload"}
+
+
+# =============================================================================
+# Item 3b - signed-record shape and marker validation (T17, T39)
+# =============================================================================
+
+import json as _json
+
+A_MID, I_MID = spec("assignment")["mid"], spec("implementation")["mid"]
+
+
+def _signed_history(tmp_path):
+    env = Env(tmp_path)
+    adapter = env.adapter()
+    assert run(adapter, env, spec("assignment")) == ("accepted", None)
+    assert run(adapter, env, spec("implementation")) == ("accepted", None)
+    return env, adapter
+
+
+def _rewrite(env, mid, mutate=None, actor=None, raw=None):
+    con = sqlite3.connect(env.ledger_path)
+    try:
+        payload = _json.loads(con.execute("SELECT payload FROM events WHERE message_id = ?", (mid,)).fetchone()[0])
+        if mutate is not None:
+            mutate(payload)
+        text = raw(payload) if raw else _json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        con.execute("UPDATE events SET payload = ? WHERE message_id = ?", (text, mid))
+        if actor is not None:
+            con.execute("UPDATE events SET actor = ? WHERE message_id = ?", (actor, mid))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _drop(key):
+    return lambda p: p.pop(key)
+
+
+def _set(key, value):
+    return lambda p: p.__setitem__(key, value)
+
+
+ASSIGNMENT_KEYS = ("synthetic", "schema_version", "digest_kind", "type", "assignment_id", "recipient",
+                   "role", "evidence_kind", "evidence_id", "base_sha")
+SIGNED_RECORD_REFUSALS = {
+    **{f"missing_{k}": (A_MID, _drop(k), None, "closed key set") for k in ASSIGNMENT_KEYS
+       if k not in ("digest_kind", "type", "assignment_id")},
+    # assignment_id is a legacy stored-equality field: legacy reconcile refuses first.
+    "missing_assignment_id": (A_MID, _drop("assignment_id"), None, "Identity mismatch"),
+    "missing_type": (A_MID, _drop("type"), None, "type"),
+    "missing_digest_kind": (A_MID, _drop("digest_kind"), None, "digest_kind"),
+    "missing_digest": (A_MID, _drop("digest"), None, "Identity mismatch"),
+    "missing_adapter_origin": (A_MID, _drop("adapter_origin"), None, "ACCEPTED intent without matching ledger event"),
+    "missing_sha_on_implementation": (I_MID, _drop("sha"), None, "closed key set"),
+    "extra_key": (A_MID, _set("verdict", "approved"), None, "closed key set"),
+    "extra_both_sha_fields": (A_MID, _set("implementation_sha", IMPL_SHA), None, "closed key set"),
+    "extra_base_sha_on_implementation": (I_MID, _set("base_sha", BASE_SHA), None, "closed key set"),
+    "type_synthetic_int": (A_MID, _set("synthetic", 1), None, "synthetic"),
+    "type_schema_version_str": (A_MID, _set("schema_version", "1"), None, "schema_version"),
+    "type_schema_version_bool": (A_MID, _set("schema_version", True), None, "schema_version"),
+    "type_assignment_id_int": (A_MID, _set("assignment_id", 5), None, "Identity mismatch"),
+    "empty_role": (A_MID, _set("role", ""), None, "role"),
+    "empty_evidence_id": (A_MID, _set("evidence_id", ""), None, "evidence_id"),
+    "type_evidence_kind_int": (A_MID, _set("evidence_kind", 3), None, "evidence_kind"),
+    "base_sha_uppercase": (A_MID, _set("base_sha", BASE_SHA.upper()), None, "base_sha"),
+    "implementation_sha_short": (I_MID, _set("implementation_sha", IMPL_SHA[:39]), None, "implementation_sha"),
+    "mapping_role": (A_MID, _set("role", "implementer"), None, "authorization tuple"),
+    "mapping_recipient": (A_MID, _set("recipient", "skippy"), None, "authorization tuple"),
+    "mapping_evidence_kind": (A_MID, _set("evidence_kind", "skippy_review"), None, "authorization tuple"),
+    "mapping_type_event": (I_MID, _set("type", "review"), None, "event mapping"),
+    "mapping_type_unknown": (A_MID, _set("type", "bogus"), None, "type"),
+    "mapping_type_keyset": (I_MID, _set("type", "assignment"), None, "closed key set"),
+    "derived_sha_mismatch": (I_MID, _set("sha", BASE_SHA), None, "derived sha"),
+    "derived_from_wrong": (I_MID, _set("sha_derived_from", "base_sha"), None, "derived sha"),
+    "marker_admission_path": (A_MID, _set("admission_path", "bridge-02b-other"), None, "admission_path"),
+    "marker_digest_kind": (A_MID, _set("digest_kind", "sha256"), None, "digest_kind"),
+    "marker_adapter_origin": (A_MID, _set("adapter_origin", "bridge-02x"), None,
+                              "ACCEPTED intent without matching ledger event"),
+    "fabricated_marker_wrong_digest": (A_MID, _set("digest", "ab" * 32), None, "Identity mismatch"),
+    "fabricated_marker_wrong_actor": (A_MID, None, "jason", "Sender mismatch"),
+}
+
+
+@pytest.mark.parametrize("case", list(SIGNED_RECORD_REFUSALS))
+def test_signed_record_shape_and_marker_violation_refuses(tmp_path, case):
+    mid, mutate, actor, needle = SIGNED_RECORD_REFUSALS[case]
+    env, earlier = _signed_history(tmp_path)
+    _rewrite(env, mid, mutate=mutate, actor=actor)
+    before = durable_state(env.paths)
+    with pytest.raises(SignedAdmissionError) as info:
+        env.adapter()
+    assert info.value.classification == "refused" and needle in str(info.value), str(info.value)
+    gate_counts = spy_gate(env)
+    result, error = run(earlier, env, spec("review"))
+    assert result == "refused" and error.step == "T1" and needle in str(error)
+    assert gate_counts == {"reserve": 0} and durable_state(env.paths) == before
+
+
+SIGNED_RECORD_ACCEPTED = {
+    # T17 group 3: shape-only, no verification claim.
+    "tampered_evidence_id_shape_valid": (A_MID, _set("evidence_id", "fixture-other"), None),
+    # Semantic JSON round trip is not signed-byte preservation.
+    "json_reserialized": (A_MID, None, lambda p: _json.dumps(p, indent=2)),
+    # T39(d): a marker removed from a signed record leaves legacy rules only (undetectable).
+    "marker_removed_admission_path": (A_MID, _drop("admission_path"), None),
+}
+
+
+@pytest.mark.parametrize("case", list(SIGNED_RECORD_ACCEPTED))
+def test_signed_record_documented_shape_only_limits(tmp_path, case):
+    mid, mutate, raw = SIGNED_RECORD_ACCEPTED[case]
+    env, _ = _signed_history(tmp_path)
+    _rewrite(env, mid, mutate=mutate, raw=raw)
+    env.adapter()                                              # construction passes: shape-only check

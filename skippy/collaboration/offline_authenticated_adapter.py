@@ -52,6 +52,8 @@ from skippy.collaboration.offline_admission_gate import (
     AUTHORIZATION_MATRIX,
     OfflineAdmissionGate,
     ReservationResult,
+    _evidence_id_problem,
+    _sha_problem,
     _snapshot,
 )
 from skippy.collaboration.offline_signature_verifier import (
@@ -1317,8 +1319,8 @@ class OfflineAuthenticatedAdapter:
         }
         if checkpoints - {snap.checkpoint_id}:
             return "journal checkpoint mismatch"
-        # (f) assignment requires the trusted fixture dependency (the gate
-        # still verifies evidence itself inside reserve).
+        # (f) part 1: an assignment requires the trusted fixture dependency.
+        # Part 2 (gate evidence before A) runs last in S6, below.
         if msg_type == "assignment" and not self._trusted_fixture:
             return "Assignment requires trusted fixture"
         # (g) narrowed age bound.
@@ -1343,6 +1345,46 @@ class OfflineAuthenticatedAdapter:
             return "provenance: legacy history in stream"
         if len(kinds) > 1:
             return "provenance: mixed stream"
+        # (f) part 2 (6838692613 S6(f); ruling C of work order 6869856724): an
+        # ASSIGNMENT must also satisfy gate evidence BEFORE A. Evaluated last
+        # in S6 so that cheaper local denials never invoke the dependency.
+        if msg_type == "assignment":
+            return self._signed_assignment_evidence_problem(snap, now)
+        return None
+
+    def _signed_assignment_evidence_problem(self, snap, now) -> str | None:
+        """Pre-arm assignment evidence: the frozen gate's own mapping, called before A.
+
+        Uses the same configured ``gate.evidence_verifier``, the closed
+        AUTHORIZATION_MATRIX tuple and the gate's strict evidence_id and SHA
+        rules, and passes exactly the gate's scalars (evidence kind,
+        assignment_id, bound SHA, evidence_id, now). The tuple and scalars are
+        validated before the call; a valid signature alone never authorizes.
+        Rejected, unavailable, non-string or raising results deny here (an
+        S6(f) receipt in T1, no arm). This is not a new evidence authority and
+        not a reservation: the gate re-verifies authoritatively inside
+        ``reserve`` after A, and a pre-arm approval does not make later
+        evidence or HALT immutable.
+        """
+        row = AUTHORIZATION_MATRIX.get((snap.sender, snap.role, snap.recipient, "assignment"))
+        if row is None:
+            return "Assignment authorization tuple not permitted"
+        evidence_kind, sha_field = row
+        payload = snap.payload
+        problem = _evidence_id_problem(payload)
+        if problem is None:
+            problem = _sha_problem(payload, sha_field)
+        if problem is not None:
+            return f"Assignment evidence input invalid: {problem}"
+        try:
+            verdict = self._signed_gate.evidence_verifier.verify(
+                evidence_kind, snap.assignment_id, payload[sha_field], payload["evidence_id"], now
+            )
+        except Exception:  # noqa: BLE001 - fail closed before A
+            return "Assignment evidence verification failed closed"
+        if type(verdict) is not str or verdict != "verified":
+            shown = verdict if type(verdict) is str and verdict in ("rejected", "unavailable") else "indeterminate"
+            return f"Assignment evidence {shown}"
         return None
 
     def _signed_capture(self, connection, snap) -> tuple:
@@ -2051,15 +2093,25 @@ def provision_signed_receipts_store(database_path, *, journal_mode: str = "delet
         raise SignedAdmissionError(f"target not creatable: {type(exc).__name__}", step="provision",
                                    classification="refused") from exc
     os.close(fd)
-    uri = path.resolve(strict=True).as_uri() + "?mode=rw"
-    connection = sqlite3.connect(uri, uri=True, timeout=5.0, isolation_level=None)
+    left = "the newly created unmarked disposable file is left in place for manual inspection"
     try:
+        uri = path.resolve(strict=True).as_uri() + "?mode=rw"
+        connection = _provision_connect(uri)
+    except Exception as exc:
+        raise SignedAdmissionError(
+            f"provisioning failed before any transaction (connection): {type(exc).__name__}; {left}",
+            step="provision", classification="pre_transaction_failure",
+        ) from exc
+    try:
+        phase = "configure"
         try:
             mode = connection.execute(f"PRAGMA journal_mode = {journal_mode.upper()}").fetchone()
             if mode is None or str(mode[0]).lower() != journal_mode:
                 raise OfflineAdapterError(f"D1 journal_mode not applied: {mode!r}")
             config = _apply_signed_connection_config(connection, 5.0)
+            phase = "begin"
             connection.execute("BEGIN IMMEDIATE")
+            phase = "transaction"
             existing = connection.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()[0]
             if existing != 0:
                 raise OfflineAdapterError("target is not an empty new store")
@@ -2074,16 +2126,35 @@ def provision_signed_receipts_store(database_path, *, journal_mode: str = "delet
             if problem is not None:
                 raise OfflineAdapterError(f"provisioned schema check failed: {problem}")
         except Exception as exc:
-            rolled_back = True
-            if connection.in_transaction:
+            active = True
+            if phase != "transaction":
                 try:
-                    connection.rollback()
-                except Exception:
-                    rolled_back = False
+                    active = bool(connection.in_transaction)
+                except Exception:  # noqa: BLE001 - unknown: treat as possibly active
+                    active = True
+            if not active:
+                # No transaction was ever active: rollback is not invoked and
+                # nothing is claimed about one. D1 may already be applied to
+                # the new file (journal_mode is persistent for WAL).
+                raise SignedAdmissionError(
+                    f"provisioning failed before any transaction ({phase}): {exc}; {left}",
+                    step="provision", classification="pre_transaction_failure",
+                ) from exc
+            # commit() was never invoked: confirmed rolled back only when
+            # rollback() actually returned; otherwise ambiguous (J2, RF).
+            try:
+                connection.rollback()
+                rolled_back = True
+            except Exception:  # noqa: BLE001
+                rolled_back = False
+            if rolled_back:
+                raise SignedAdmissionError(
+                    f"provisioning failed before commit and rollback returned: {exc}; {left}",
+                    step="provision", classification="confirmed_rolled_back",
+                ) from exc
             raise SignedAdmissionError(
-                f"provisioning failed before commit: {exc}; the unmarked file is left for manual inspection",
-                step="provision",
-                classification="confirmed_rolled_back" if rolled_back else "ambiguous",
+                f"provisioning failed before commit; rollback raised; outcome unknown: {exc}; {left}",
+                step="provision", classification="ambiguous",
             ) from exc
         try:
             connection.commit()
@@ -2093,5 +2164,13 @@ def provision_signed_receipts_store(database_path, *, journal_mode: str = "delet
                 step="provision", classification="ambiguous",
             ) from exc
     finally:
-        connection.close()
+        try:
+            connection.close()
+        except Exception:  # noqa: BLE001 - cleanup only; outcome already classified
+            pass
     return config
+
+
+def _provision_connect(uri: str):
+    """Private P-3 connection seam (test fault injection only; not a public interface)."""
+    return sqlite3.connect(uri, uri=True, timeout=5.0, isolation_level=None)
