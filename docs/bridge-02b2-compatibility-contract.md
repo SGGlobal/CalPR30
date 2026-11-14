@@ -977,3 +977,83 @@ Work order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6869856724 res
 - The internal gate (GATE:521) and ledger commit seams remain BLOCKED (whole-call wrappers only). Direct gate and ledger participants remain excluded.
 
 The HALT probe-to-commit race, schema-to-WAL, synthetic trust and evidence, binding and freshness, cross-database atomicity, ledger lifecycle and manual-recovery limits remain open. No count is a claim of exhaustive security. Commissioning and Section G remain open. execution_enabled=False.
+
+## J10. Post-prototype participant-exclusion audit (work order 6870551177)
+
+Work order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6870551177; base `832de25b24a2d6ed10ddc455d72affe7dfe9408a`. **Documentation only:** no code, test, schema or workflow change and no test run. Source was read READ-ONLY on Homebase (`git show`, `git grep`). ADP lines are at 832de25 (blob `2426cae16bbcc0a3e4a3748e5d6bc137b1e0d6dc`); GATE, LED and SIM are unchanged since 0ab7358. **Observed callers come from static `git grep` of non-test source** (`tests/`, `docs/` excluded). That is not runtime, dynamic-call or exhaustive proof. "Available" means callable, not called.
+
+### J10.1 Participant table at 832de25
+
+No observed non-test caller exists for the constructor, `open_signed`, `accept_signed`, legacy `accept`, provisioning or `SyntheticBridgeSimulator`; only tests reach them (`orchestrator.py:156` calls a different class's `accept`).
+
+| Entrypoint | Observed non-test caller | Store | Existing checks | Transaction / lock | Marked signed store |
+| --- | --- | --- | --- | --- | --- |
+| `provision_signed_receipts_store` ADP:2061-2171 | none | new receipts file | plain path; parent exists; no sidecars; `O_CREAT\|O_EXCL`; empty `sqlite_master` | one `BEGIN IMMEDIATE` after D1-D3 | creates only a NEW marked store; refuses any existing path |
+| `open_signed` ADP:795-874, phase 1 ADP:996-1048 | none | receipts (`mode=rw`, ADP:909-936); ledger and gate reads | types, distinct paths, marker row, one `fail_stop` row with `stopped = 0`, exact schema, no PENDING/UNCERTAIN, reconcile, record shape, Rule U | `BEGIN IMMEDIATE`, then rollback | reads; never creates, repairs or writes |
+| `accept_signed` ADP:1080-1123 (T1 ADP:1127-1180, T2 ADP:1426-, W2 ADP:1604-, R ADP:1724-1772) | none | receipts, gate (ADP:1475), ledger (ADP:1629) | phase 1 again, S4-S7, pre-arm evidence; owner-G recheck at T2/T3/R | T1, T2, T3 and R each in one receipts `BEGIN IMMEDIATE`; the gate and ledger commit inside their own transactions while the receipts lock is held | writes (arm, receipts, intent, sequence, release); never creates |
+| Legacy constructor ADP:103-128 (`_init_receipts` ADP:380-463) | none | receipts (plain `sqlite3.connect`, creates a missing file) | callable HALT check only; **no marker check** | DDL autocommits per statement; `INSERT OR IGNORE` (ADP:433-435) opens an implicit transaction that commits when the block exits; then `_schema_preflight` (read) and `_reconcile` (`BEGIN IMMEDIATE`, then rollback, ADP:294-310) | **can create and repair; can write** (J10.2) |
+| Legacy `accept` ADP:549-780 | none | receipts, ledger (ADP:715) | signed-instance refusal ADP:563-566; reconcile ADP:578; active stop ADP:580-584; marker table ADP:589-594 | one `BEGIN IMMEDIATE` (ADP:573); refusals raise before the first write (ADP:608) and the context manager rolls back | reads, then refuses with zero writes while the marker table exists |
+| Unused writers `_advance_sequence` ADP:480-489, `_record_receipt` ADP:520-547 (readers `_seen_ids`, `_expected_sequence` ADP:465-478) | none, including inside the adapter; tests reference them only in the source check | receipts | none (no stop or marker check) | own connection, implicit transaction | would write if called (available, not observed) |
+| `OfflineAdmissionGate.reserve` GATE:365-532 | SIM:287 (SIM itself has no non-test caller) and ADP:1475 | admission DB | own checks; constructor I1 exact-schema read-only preflight (GATE:268-293) | own `BEGIN IMMEDIATE`; commit at GATE:521 | no receipts reference; a receipts file given as the gate path is refused at I1 before any write |
+| `CheckpointLedger.record_event` LED:280-497 | ADP:715 (legacy), ADP:1629 (signed) | ledger DB | own checks and revision compare | own `BEGIN IMMEDIATE` (LED:314-315) | no receipts reference; `CheckpointLedger(path)` runs `CREATE ... IF NOT EXISTS` plus `INSERT OR IGNORE` (LED:157-211) on any path, so a ledger constructed on a receipts path would add tables (signed phase 1 then refuses: unexpected schema objects) |
+
+### J10.2 The legacy-constructor gap (source trace; not executed)
+
+**Answer: yes.** Legacy construction on a marked signed store can write before any refusal, including recreating a deleted `fail_stop` row.
+
+1. `__init__` checks only `halt_check`, then calls `_init_receipts()` (ADP:118-125); nothing reads `signed_admission_marker`.
+2. Under default Python `sqlite3` transaction control, its `CREATE ... IF NOT EXISTS` statements autocommit individually. `INSERT OR IGNORE INTO fail_stop ... (1, 0, NULL)` (ADP:433-435) opens an implicit transaction that commits when the `with` block exits.
+3. On a marked store, a present row (including an armed G) is unchanged. A **deleted** row is recreated as `(1, 0, NULL)`. A dropped receipts table or trigger is recreated from legacy DDL that equals the signed expected schema after normalisation (ADP:1831-1945).
+4. These writes commit before `_schema_preflight` and `_reconcile`, so they persist even if the constructor then raises. Legacy `accept()` refuses only later (ADP:589-594). A missing file is created unmarked, and `open_signed` refuses it.
+
+**Consequence.** No source path deletes a `fail_stop` row, so deletion needs an excluded out-of-band writer. Without the constructor, phase 1 refuses zero rows (ADP:1012-1014) until manual recovery. After it, that store becomes admissible: if the deleted row held G and nothing else refuses, the stop evidence is lost and signed admission resumes. A dropped `audit_receipts` recreated empty could likewise erase a Rule U `uncertain` receipt. An in-flight attempt's T2/T3/R owner-G checks still refuse. The J4 exclusion and ruling D therefore cover a **real repair path**. Prototype claims stay limited to cooperative `open_signed`/`accept_signed` participants on an intact store.
+
+### J10.3 PROPOSED next enforcement checkpoint (PROPOSED, NOT IMPLEMENTED)
+
+**P-9: legacy constructor refuses a marked store before any write.**
+- **Files:** `skippy/collaboration/offline_authenticated_adapter.py` (protected; constructor path only), `tests/test_adapter_signed_admission.py`, and this document. The gate, ledger, verifier, envelope, existing tests and workflows stay frozen. No gate callback.
+- **Behaviour:** `_init_receipts` issues `BEGIN IMMEDIATE` before any DDL and reads `sqlite_master` for a table named `signed_admission_marker`.
+  - If the table is present, it rolls back, closes and raises `OfflineAdapterError("Legacy constructor refused: receipts store carries signed_admission_marker")`. There is no DDL or insert, and `_schema_preflight` and `_reconcile` are never reached.
+  - If the table is absent, the existing statements run unchanged in that transaction and commit. The unmarked end state is identical, now all-or-nothing.
+  - A missing file is still created unmarked. `open_signed` never calls `__init__`, so it is unaffected.
+- **Marker cases:**
+  - Table present but malformed, empty or wrong value: refuse (the same table-presence rule as P-2).
+  - Table dropped: indistinguishable from an unmarked store, so construction proceeds and phase 1 refuses (marker missing). This is a stated limit.
+  - Unreadable store (not SQLite, busy beyond the 5 s default, or a read error): raise before any write. Only the error type changes to `OfflineAdapterError`.
+- **Races and limitations:** The in-transaction check serialises against P-3 for cooperative SQLite writers: either the constructor refuses, or P-3 refuses a non-empty or existing target. P-9 does not prevent out-of-band deletion. It does not fence `CheckpointLedger(receipts_path)`, the direct gate or ledger, file replacement before `BEGIN`, multiple bindings or stale stores. The constructor may wait up to 5 s behind a signed transaction, as today's `INSERT` already can.
+- **Regression acceptance (proposed; disposable P-3 stores only):**
+  1. Deleted `fail_stop` row: the constructor raises; file SHA-256, schema and zero rows are unchanged; `open_signed` still refuses. Base control: 832de25 recreates `(1, 0, NULL)` and `open_signed` succeeds.
+  2. Dropped table or trigger: nothing is recreated.
+  3. Healthy and armed-G stores: byte-identical; G retained.
+  4. Malformed or empty marker: refused.
+  5. Dropped marker: the stated limit.
+  6. Non-SQLite bytes: unchanged.
+  7. Two processes, P-3 against the constructor: never both succeed.
+  8. Missing-file and unmarked-store results identical; all existing tests pass unmodified.
+- **Boundary:** This **changes a currently excluded boundary.** The J4 constructor row and ruling D move to "adapter-enforced refusal" for legacy construction only. It needs Skippy's separately scoped order, and it is not global participant fencing.
+
+### J10.4 Adapter-enforceable versus wider-scope gaps
+
+- **Adapter-enforceable (cooperative callers only):**
+  - legacy `accept` on a marked store (P-2, implemented);
+  - legacy construction on a marked store (P-9, proposed);
+  - the unused writers (P-5, separate decision; zero-caller source check only).
+- **Needing wider design or scope (unchanged):**
+  - direct gate callers, including SIM:287 (H1-B1);
+  - direct ledger writers and ledger construction on a foreign path (H1-B2);
+  - the internal gate and ledger commit seams;
+  - multiple bindings (H1-B3), all BLOCKED;
+  - stale, restored or substituted stores and the freshness anchor (H2-B1, undesigned);
+  - out-of-band, file-level, hostile and test writers.
+
+  The marker proves provisioning only, and the nonce authenticates nothing. These are assumptions, not claims.
+
+### J10.5 Verified prototype evidence (recorded; no test run for J10)
+
+- **Skippy-executed** (issue #23 6870541155; PR #26 6870543618): full 171-file tree at `832de25b`, Linux CPython 3.12.14 / SQLite 3.53.1, **1489 passed in 101.62 s, exit 0**. This is not CI, not OS-equivalence and not exhaustive security.
+- **Colin-executed Windows, separate** (issue #23 6870329388): 1489 passed in 370.30 s, exit 0, plus focused 497.
+- **Retained non-blocking notes (6870361996):**
+  - An ambiguous provisioning COMMIT may leave an **already marked** file; a retained file is not proof of failure and gives no retry authority.
+  - The SQLite text `sequence` case is wrong-type evidence, not Python-bool storage proof.
+
+Gate and ledger commit seams remain BLOCKED. Direct participants and multiple bindings remain excluded. The marker and nonce are not identity or freshness. The HALT-to-commit race, the schema-to-WAL gap, synthetic trust, cross-database atomicity, ledger lifecycle, manual recovery and Section G remain open. No choice is made silently. execution_enabled=False.
