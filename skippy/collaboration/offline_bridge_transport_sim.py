@@ -9,17 +9,24 @@ This module is a disposable fixture. It does not open a remote connection, read
 secrets, post to a carrier, or schedule work. Signed admission stays with the
 unchanged ingress ``deliver`` path. ``execution_enabled`` remains False.
 
-P3 (this revision): bounded fake pages, exact frame extraction, and delivery
-identity (body digest, duplicate collapse, contradictory-body hold). Later
-priorities add the disposable journal and the fake poster. Nothing here is a
-live transport or a claim of source completeness.
+P3: bounded fake pages, exact frame extraction, and delivery identity.
+P4: one disposable transport database, PREPARED before ``deliver``, a local
+outbox sink, FINAL, and a continuation hint written only after confirmed
+finals. The fake poster is a later priority. Nothing here is a live transport
+or a claim of source completeness, freshness, or exactly-once delivery.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import re
+import sqlite3
 from dataclasses import dataclass
+from pathlib import Path
+
+from skippy.collaboration.offline_bridge_ingress import deliver as deliver_frame
 
 execution_enabled = False
 
@@ -417,3 +424,557 @@ def collect_observations(
     return _collect_once(
         source, repository, thread, None, None, counter, allow_restart=False,
     )
+
+
+# --- disposable journal, outbox and continuation (P4) -------------------------
+
+FIXTURE_VERSION = 1
+_SCHEMA = {
+    "fixture_meta": ("version", "repository", "allowed_threads"),
+    "deliveries": (
+        "repository", "thread", "comment_id", "body_digest", "frame_digest", "state", "result_json",
+    ),
+    "outbox": (
+        "delivery_key", "ack_json", "ack_digest", "post_state", "external_id", "confirmation",
+    ),
+    "continuation": ("thread", "snapshot_id", "token"),
+}
+_SAFE_NULL_POISON = {
+    ("ADMITTED", "CONFIRMED_BY_SINK"),
+    ("MALFORMED", "NOT_ATTEMPTED"),
+}
+
+
+class InspectionError(TransportFixtureError):
+    """Existing fixture file cannot be inspected. Nothing was repaired."""
+
+
+@dataclass(frozen=True)
+class Disposition:
+    """One observation's transport outcome. ``author`` is audit text only."""
+
+    thread: int
+    comment_id: int
+    kind: str
+    adapter_calls: int
+    author: str
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class PollReport:
+    """Intake result. ``manual_required`` means this pass must not continue itself."""
+
+    dispositions: tuple[Disposition, ...]
+    complete: bool
+    continuation_token: str | None
+    snapshot_id: str | None
+    manual_required: bool
+    deliver_calls: int
+    source_calls: int
+    status: str
+
+
+@dataclass(frozen=True)
+class Inspection:
+    """Read-only view. Has no poll, post, or resume operation."""
+
+    version: int
+    repository: str
+    allowed_threads: tuple[int, ...]
+    deliveries: tuple[tuple, ...]
+    outbox: tuple[tuple, ...]
+    continuation: tuple[tuple, ...]
+    blocking: bool
+
+
+def commit_prepared(connection) -> None:
+    """Transaction A. Tests may wrap this seam; a whole-poll wrapper is not a substitute."""
+    connection.commit()
+
+
+def commit_outbox(connection) -> None:
+    """Transaction B, inside the ingress sink, before control returns to the poll."""
+    connection.commit()
+
+
+def commit_final(connection) -> None:
+    """Transaction C. Records the IngressResult returned by ``deliver``."""
+    connection.commit()
+
+
+def commit_refusal(connection) -> None:
+    """Direct FINAL for a frame the fixture refused before ``deliver``."""
+    connection.commit()
+
+
+def commit_continuation(connection) -> None:
+    """Transaction D. Runs only after every processed observation has a confirmed FINAL."""
+    connection.commit()
+
+
+def delivery_key(repository: str, thread: int, comment_id: int) -> str:
+    return f"{repository}\x1f{thread}\x1f{comment_id}"
+
+
+def _require_disabled() -> None:
+    if execution_enabled is not False:
+        raise TransportFixtureError("execution is disabled")
+
+
+def _connect(path: Path) -> sqlite3.Connection:
+    connection = sqlite3.connect(path, isolation_level=None, timeout=5.0)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=5000")
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=FULL")
+    return connection
+
+
+def _rollback(connection) -> None:
+    try:
+        connection.rollback()
+    except Exception:
+        return
+
+
+def _dump(payload: dict) -> str:
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _ack_bytes(record) -> bytes:
+    correlation = None
+    if record.correlation is not None:
+        correlation = {
+            "message_id": record.correlation.message_id,
+            "idempotency_key": record.correlation.idempotency_key,
+            "sequence": record.correlation.sequence,
+        }
+    return _dump({
+        "record_version": record.record_version,
+        "admission": record.admission.value,
+        "adapter_step": record.adapter_step,
+        "correlation": correlation,
+        "correlation_verified": bool(record.correlation_verified),
+    }).encode("utf-8")
+
+
+def _ingress_payload(result) -> dict:
+    correlation = None
+    if result.correlation is not None:
+        correlation = {
+            "message_id": result.correlation.message_id,
+            "idempotency_key": result.correlation.idempotency_key,
+            "sequence": result.correlation.sequence,
+        }
+    return {
+        "admission": result.admission.value,
+        "adapter_step": result.adapter_step,
+        "adapter_classification": result.adapter_classification,
+        "poisoned": result.poisoned,
+        "adapter_calls": result.adapter_calls,
+        "correlation": correlation,
+        "correlation_verified": bool(result.correlation_verified),
+        "ack": result.ack.value,
+        "detail": result.detail,
+    }
+
+
+def _blocks_payload(payload: dict) -> bool:
+    """True when a FINAL row must stop later automatic intake."""
+    if "transport_disposition" in payload and "admission" not in payload:
+        return False
+    admission = payload.get("admission")
+    ack = payload.get("ack")
+    poisoned = payload.get("poisoned", None)
+    if admission in ("UNCERTAIN", "STOP_RETAINED") or ack == "NOT_CONFIRMED" or poisoned is True:
+        return True
+    if poisoned is None and (admission, ack) in _SAFE_NULL_POISON:
+        return False
+    if poisoned is False and ack == "CONFIRMED_BY_SINK" and admission in ("ADMITTED", "REFUSED", "REJECTED"):
+        return False
+    return True
+
+
+def _result_blocks(result) -> bool:
+    return _blocks_payload(_ingress_payload(result))
+
+
+class _OutboxSink:
+    """J12 recording sink. One local ack row. No posting."""
+
+    def __init__(self, path: Path, key: str):
+        self.path = path
+        self.key = key
+        self.calls = 0
+
+    def record(self, record) -> None:
+        self.calls += 1
+        if self.calls != 1:
+            raise TransportFixtureError("sink already recorded")
+        raw = _ack_bytes(record)
+        connection = _connect(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                "INSERT INTO outbox(delivery_key, ack_json, ack_digest, post_state, external_id, confirmation) "
+                "VALUES (?, ?, ?, 'NOT_ATTEMPTED', NULL, 'NOT_CHECKED')",
+                (self.key, raw.decode("utf-8"), hashlib.sha256(raw).digest()),
+            )
+            commit_outbox(connection)
+        finally:
+            connection.close()
+
+
+class _BoundSource:
+    def __init__(self, inner):
+        self.inner = inner
+        self.calls = 0
+
+    def page(self, repository, thread, token):
+        self.calls += 1
+        return self.inner.page(repository, thread, token)
+
+
+def _columns(connection, table: str) -> tuple[str, ...]:
+    return tuple(row[1] for row in connection.execute(f"PRAGMA table_info({table})"))
+
+
+def _validate_connection(connection) -> sqlite3.Row:
+    names = {
+        row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    if names != set(_SCHEMA):
+        raise InspectionError("schema")
+    for table, columns in _SCHEMA.items():
+        if _columns(connection, table) != columns:
+            raise InspectionError(table)
+    mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+    sync = connection.execute("PRAGMA synchronous").fetchone()[0]
+    if str(mode).lower() != "wal" or sync != 2:
+        raise InspectionError("durability")
+    rows = connection.execute(
+        "SELECT version, repository, allowed_threads FROM fixture_meta"
+    ).fetchall()
+    if len(rows) != 1 or rows[0]["version"] != FIXTURE_VERSION:
+        raise InspectionError("meta")
+    states = {row[0] for row in connection.execute("SELECT DISTINCT state FROM deliveries")}
+    if not states <= {"PREPARED", "FINAL"}:
+        raise InspectionError("state")
+    return rows[0]
+
+
+def _row_blocks(state: str, result_json: str | None) -> bool:
+    if state == "PREPARED":
+        return True
+    if state != "FINAL":
+        return True
+    if result_json is None:
+        return True
+    try:
+        payload = json.loads(result_json)
+    except json.JSONDecodeError:
+        return True
+    if type(payload) is not dict:
+        return True
+    return _blocks_payload(payload)
+
+
+def _store_blocks(connection) -> bool:
+    rows = connection.execute("SELECT state, result_json FROM deliveries").fetchall()
+    return any(_row_blocks(row["state"], row["result_json"]) for row in rows)
+
+
+def create_fresh(path, repository: str, threads: tuple[int, ...]) -> "FixtureSession":
+    """Create one disposable transport file. An existing path is refused."""
+    _require_disabled()
+    if type(repository) is not str or repository != REPOSITORY:
+        raise TransportFixtureError("repository")
+    if type(threads) is not tuple or not threads:
+        raise TransportFixtureError("threads")
+    cleaned: list[int] = []
+    for thread in threads:
+        if type(thread) is not int or thread <= 0 or thread in cleaned:
+            raise TransportFixtureError("thread")
+        cleaned.append(thread)
+    target = Path(path)
+    if target.exists() or target.is_symlink():
+        raise TransportFixtureError("path exists")
+    for suffix in ("-wal", "-shm", "-journal"):
+        if Path(str(target) + suffix).exists():
+            raise TransportFixtureError("sidecar")
+    if not target.parent.is_dir():
+        raise TransportFixtureError("parent")
+    fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.close(fd)
+    connection = _connect(target)
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        for statement in (
+            "CREATE TABLE fixture_meta (version INTEGER NOT NULL, repository TEXT NOT NULL, "
+            "allowed_threads TEXT NOT NULL)",
+            "CREATE TABLE deliveries (repository TEXT NOT NULL, thread INTEGER NOT NULL, "
+            "comment_id INTEGER NOT NULL, body_digest BLOB NOT NULL, frame_digest BLOB, "
+            "state TEXT NOT NULL, result_json TEXT, PRIMARY KEY (repository, thread, comment_id))",
+            "CREATE TABLE outbox (delivery_key TEXT NOT NULL UNIQUE, ack_json TEXT NOT NULL, "
+            "ack_digest BLOB NOT NULL, post_state TEXT NOT NULL, external_id INTEGER, "
+            "confirmation TEXT NOT NULL)",
+            "CREATE TABLE continuation (thread INTEGER NOT NULL PRIMARY KEY, snapshot_id TEXT NOT NULL, "
+            "token TEXT)",
+        ):
+            connection.execute(statement)
+        connection.execute(
+            "INSERT INTO fixture_meta(version, repository, allowed_threads) VALUES (?, ?, ?)",
+            (FIXTURE_VERSION, repository, json.dumps(cleaned)),
+        )
+        connection.commit()
+    except Exception:
+        _rollback(connection)
+        raise
+    finally:
+        connection.close()
+    return FixtureSession(target, repository, tuple(cleaned))
+
+
+def open_existing(path) -> Inspection:
+    """Validate a fixture file and return rows. Does not poll, post, or repair."""
+    _require_disabled()
+    target = Path(path)
+    if not target.is_file():
+        raise InspectionError("missing")
+    connection = sqlite3.connect(
+        target.resolve().as_uri() + "?mode=ro", uri=True, timeout=5.0,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        meta = _validate_connection(connection)
+        try:
+            threads = tuple(json.loads(meta["allowed_threads"]))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise InspectionError("threads") from exc
+        if type(threads) is not tuple or not all(type(item) is int and item > 0 for item in threads):
+            raise InspectionError("threads")
+        deliveries = tuple(
+            tuple(row) for row in connection.execute(
+                "SELECT repository, thread, comment_id, body_digest, frame_digest, state, result_json "
+                "FROM deliveries ORDER BY thread, comment_id"
+            )
+        )
+        outbox = tuple(
+            tuple(row) for row in connection.execute(
+                "SELECT delivery_key, ack_json, ack_digest, post_state, external_id, confirmation "
+                "FROM outbox ORDER BY delivery_key"
+            )
+        )
+        continuation = tuple(
+            tuple(row) for row in connection.execute(
+                "SELECT thread, snapshot_id, token FROM continuation ORDER BY thread"
+            )
+        )
+        blocking = _store_blocks(connection)
+    finally:
+        connection.close()
+    return Inspection(
+        version=FIXTURE_VERSION, repository=meta["repository"], allowed_threads=threads,
+        deliveries=deliveries, outbox=outbox, continuation=continuation, blocking=blocking,
+    )
+
+
+class FixtureSession:
+    """One owner of one fresh transport file. Reopening is ``open_existing`` only."""
+
+    def __init__(self, path: Path, repository: str, threads: tuple[int, ...]):
+        self.path = path
+        self.repository = repository
+        self.threads = threads
+        self.manual_required = False
+
+    def _blocked(self) -> bool:
+        if self.manual_required:
+            return True
+        connection = _connect(self.path)
+        try:
+            return _store_blocks(connection)
+        finally:
+            connection.close()
+
+    def _prior(self, thread: int, comment_id: int):
+        connection = _connect(self.path)
+        try:
+            return connection.execute(
+                "SELECT body_digest, state FROM deliveries "
+                "WHERE repository = ? AND thread = ? AND comment_id = ?",
+                (self.repository, thread, comment_id),
+            ).fetchone()
+        finally:
+            connection.close()
+
+    def _write(self, sql: str, params: tuple, committer) -> bool:
+        connection = _connect(self.path)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(sql, params)
+            if cursor.rowcount != 1:
+                raise TransportFixtureError("rowcount")
+            committer(connection)
+            return True
+        except Exception:
+            _rollback(connection)
+            return False
+        finally:
+            connection.close()
+
+    def poll_once(self, source, adapter, now, *, thread: int) -> PollReport:
+        """One bounded intake pass. Does not post and does not retry inside the pass."""
+        _require_disabled()
+        if self._blocked():
+            return self._manual(source_calls=0, deliver_calls=0)
+        if type(thread) is not int or thread not in self.threads:
+            self.manual_required = True
+            return self._manual(source_calls=0, deliver_calls=0, status="SOURCE_REFUSED")
+        connection = _connect(self.path)
+        try:
+            saved = connection.execute(
+                "SELECT snapshot_id, token FROM continuation WHERE thread = ?", (thread,)
+            ).fetchone()
+        finally:
+            connection.close()
+        start_token = None
+        stored_snapshot = None
+        if saved is not None and saved["token"] is not None:
+            start_token = saved["token"]
+            stored_snapshot = saved["snapshot_id"]
+        bound = _BoundSource(source)
+        try:
+            batch = collect_observations(
+                bound, self.repository, thread, start_token=start_token,
+                stored_snapshot=stored_snapshot,
+            )
+        except ContradictoryObservations as exc:
+            self.manual_required = True
+            return PollReport(
+                dispositions=(Disposition(thread, exc.comment_id, "EDIT_HELD", 0, "", "contradictory"),),
+                complete=False, continuation_token=None, snapshot_id=None, manual_required=True,
+                deliver_calls=0, source_calls=bound.calls, status="MANUAL",
+            )
+        except SourceRefusal:
+            self.manual_required = True
+            return PollReport(
+                dispositions=(), complete=False, continuation_token=None, snapshot_id=None,
+                manual_required=True, deliver_calls=0, source_calls=bound.calls, status="SOURCE_REFUSED",
+            )
+        except Exception:
+            self.manual_required = True
+            return PollReport(
+                dispositions=(), complete=False, continuation_token=None, snapshot_id=None,
+                manual_required=True, deliver_calls=0, source_calls=bound.calls, status="MANUAL",
+            )
+        dispositions: list[Disposition] = []
+        deliver_calls = 0
+        for observation in batch.observations:
+            outcome = self._one(observation, thread, adapter, now)
+            deliver_calls += outcome[0]
+            if outcome[1] is not None:
+                dispositions.append(outcome[1])
+            if self.manual_required:
+                break
+        report_complete = False
+        token = None
+        if not self.manual_required:
+            wrote = self._write(
+                "INSERT INTO continuation(thread, snapshot_id, token) VALUES (?, ?, ?) "
+                "ON CONFLICT(thread) DO UPDATE SET snapshot_id = excluded.snapshot_id, "
+                "token = excluded.token",
+                (thread, batch.snapshot_id, batch.next_token),
+                commit_continuation,
+            )
+            if not wrote:
+                self.manual_required = True
+            else:
+                report_complete = batch.complete
+                token = batch.next_token
+        status = "MANUAL" if self.manual_required else ("COMPLETE" if report_complete else "INCOMPLETE")
+        return PollReport(
+            dispositions=tuple(dispositions), complete=report_complete and not self.manual_required,
+            continuation_token=token, snapshot_id=batch.snapshot_id, manual_required=self.manual_required,
+            deliver_calls=deliver_calls, source_calls=bound.calls, status=status,
+        )
+
+    def _manual(self, *, source_calls: int, deliver_calls: int, status: str = "MANUAL") -> PollReport:
+        return PollReport(
+            dispositions=(), complete=False, continuation_token=None, snapshot_id=None,
+            manual_required=True, deliver_calls=deliver_calls, source_calls=source_calls, status=status,
+        )
+
+    def _one(self, observation: CommentObservation, thread: int, adapter, now) -> tuple[int, Disposition | None]:
+        prior = self._prior(thread, observation.comment_id)
+        digest = body_digest(observation.body)
+        if prior is not None and prior["state"] == "PREPARED":
+            self.manual_required = True
+            return 0, None
+        if prior is not None and prior["state"] == "FINAL":
+            decision = classify_delivery(bytes(prior["body_digest"]), observation.body)
+            if decision == "duplicate":
+                return 0, Disposition(
+                    thread, observation.comment_id, "DUPLICATE", 0, observation.author, None,
+                )
+            self.manual_required = True
+            return 0, Disposition(
+                thread, observation.comment_id, "EDIT_HELD", 0, observation.author, "changed-body",
+            )
+        extracted = extract_frame(observation.body)
+        if isinstance(extracted, FrameRefusal):
+            payload = _dump({
+                "transport_disposition": "FRAME_REFUSED",
+                "reason": extracted.reason,
+                "author": observation.author,
+            })
+            wrote = self._write(
+                "INSERT INTO deliveries(repository, thread, comment_id, body_digest, frame_digest, "
+                "state, result_json) VALUES (?, ?, ?, ?, NULL, 'FINAL', ?)",
+                (self.repository, thread, observation.comment_id, digest, payload),
+                commit_refusal,
+            )
+            if not wrote:
+                self.manual_required = True
+                return 0, None
+            return 0, Disposition(
+                thread, observation.comment_id, "TRANSPORT_REFUSED", 0, observation.author, extracted.reason,
+            )
+        key = delivery_key(self.repository, thread, observation.comment_id)
+        prepared = self._write(
+            "INSERT INTO deliveries(repository, thread, comment_id, body_digest, frame_digest, "
+            "state, result_json) VALUES (?, ?, ?, ?, ?, 'PREPARED', NULL)",
+            (self.repository, thread, observation.comment_id, digest, frame_digest(extracted.frame)),
+            commit_prepared,
+        )
+        if not prepared:
+            self.manual_required = True
+            return 0, None
+        sink = _OutboxSink(self.path, key)
+        try:
+            result = deliver_frame(extracted.frame, adapter, sink, now)
+        except Exception:
+            self.manual_required = True
+            return 1, None
+        except BaseException:
+            self.manual_required = True
+            raise
+        payload = _dump(_ingress_payload(result))
+        wrote = self._write(
+            "UPDATE deliveries SET state = 'FINAL', result_json = ? "
+            "WHERE repository = ? AND thread = ? AND comment_id = ? AND state = 'PREPARED'",
+            (payload, self.repository, thread, observation.comment_id),
+            commit_final,
+        )
+        if not wrote:
+            self.manual_required = True
+            return 1, None
+        kind = result.admission.value
+        if _result_blocks(result):
+            self.manual_required = True
+        return 1, Disposition(
+            thread, observation.comment_id, kind, result.adapter_calls, observation.author, result.ack.value,
+        )
