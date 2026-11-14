@@ -24,7 +24,7 @@ import os
 import re
 import sqlite3
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from skippy.collaboration.offline_bridge_ingress import deliver as deliver_frame
@@ -447,6 +447,14 @@ _SCHEMA = {
     ),
     "continuation": ("thread", "snapshot_id", "token"),
 }
+_COLUMN_PROPERTIES = {
+    "fixture_meta": (("INTEGER", 1), ("TEXT", 1), ("TEXT", 1)),
+    "deliveries": (("TEXT", 1), ("INTEGER", 1), ("INTEGER", 1), ("BLOB", 1),
+                   ("BLOB", 0), ("TEXT", 1), ("TEXT", 0)),
+    "outbox": (("TEXT", 1), ("TEXT", 1), ("BLOB", 1), ("TEXT", 1),
+               ("INTEGER", 0), ("TEXT", 1)),
+    "continuation": (("INTEGER", 1), ("TEXT", 1), ("TEXT", 0)),
+}
 _SAFE_NULL_POISON = {
     ("ADMITTED", "CONFIRMED_BY_SINK"),
     ("MALFORMED", "NOT_ATTEMPTED"),
@@ -514,6 +522,27 @@ class ReadReport:
     manual_required: bool
     unknown: bool
     reader_calls: int
+
+
+@dataclass
+class _PollProgress:
+    source: object
+    deliver_calls: int = 0
+    dispositions: list[Disposition] = field(default_factory=list)
+    pending: Disposition | None = None
+    snapshot_id: str | None = None
+
+
+@dataclass
+class _PostProgress:
+    calls: int = 0
+    key: str | None = None
+    external_id: int | None = None
+
+
+@dataclass
+class _ReadProgress:
+    calls: int = 0
 
 
 @dataclass(frozen=True)
@@ -717,7 +746,8 @@ def _columns(connection, table: str) -> tuple[str, ...]:
 
 
 def _index_columns(connection, index_name: str) -> tuple[str, ...]:
-    return tuple(row[2] for row in connection.execute(f"PRAGMA index_info({index_name})"))
+    quoted = index_name.replace('"', '""')
+    return tuple(row[2] for row in connection.execute(f'PRAGMA index_info("{quoted}")'))
 
 
 def _primary_key(connection, table: str) -> tuple[str, ...]:
@@ -732,7 +762,7 @@ def _primary_key(connection, table: str) -> tuple[str, ...]:
 
 def _require_unique(connection, table: str, columns: tuple[str, ...]) -> None:
     for row in connection.execute(f"PRAGMA index_list({table})"):
-        if row[2] != 1:
+        if row[2] != 1 or row[4] != 0:
             continue
         if _index_columns(connection, row[1]) == columns:
             return
@@ -763,9 +793,13 @@ def _validate_connection(connection) -> sqlite3.Row:
     if names != set(_SCHEMA):
         raise InspectionError("schema")
     for table, columns in _SCHEMA.items():
-        info = connection.execute(f"PRAGMA table_info({table})").fetchall()
+        info = connection.execute(f"PRAGMA table_xinfo({table})").fetchall()
         if tuple(row[1] for row in info) != columns:
             raise InspectionError(table)
+        if tuple((row[2].upper(), row[3]) for row in info) != _COLUMN_PROPERTIES[table]:
+            raise InspectionError("column properties")
+        if any(row[4] is not None or row[6] != 0 for row in info):
+            raise InspectionError("column defaults/visibility")
     if _primary_key(connection, "deliveries") != ("repository", "thread", "comment_id"):
         raise InspectionError("constraint")
     if _primary_key(connection, "continuation") != ("thread",):
@@ -1021,16 +1055,25 @@ class FixtureSession:
     def poll_once(self, source, adapter, now, *, thread: int) -> PollReport:
         """One bounded intake pass. Does not post and does not retry inside the pass."""
         _require_disabled()
+        progress = _PollProgress(_BoundSource(source))
         try:
-            return self._poll_once_locked(source, adapter, now, thread=thread)
+            return self._poll_once_locked(source, adapter, now, thread=thread, progress=progress)
         except Exception:
             self.manual_required = True
-            return self._manual(source_calls=0, deliver_calls=0)
+            known = tuple(progress.dispositions)
+            if progress.pending is not None:
+                known += (progress.pending,)
+            return PollReport(
+                dispositions=known, complete=False, continuation_token=None,
+                snapshot_id=progress.snapshot_id, manual_required=True,
+                deliver_calls=progress.deliver_calls, source_calls=progress.source.calls,
+                status="MANUAL",
+            )
         except BaseException:
             self.manual_required = True
             raise
 
-    def _poll_once_locked(self, source, adapter, now, *, thread: int) -> PollReport:
+    def _poll_once_locked(self, source, adapter, now, *, thread: int, progress: _PollProgress) -> PollReport:
         if self._blocked():
             return self._manual(source_calls=0, deliver_calls=0)
         if type(thread) is not int or thread not in self.threads:
@@ -1048,7 +1091,7 @@ class FixtureSession:
         if saved is not None and saved["token"] is not None:
             start_token = saved["token"]
             stored_snapshot = saved["snapshot_id"]
-        bound = _BoundSource(source)
+        bound = progress.source
         try:
             batch = collect_observations(
                 bound, self.repository, thread, start_token=start_token,
@@ -1073,13 +1116,15 @@ class FixtureSession:
                 dispositions=(), complete=False, continuation_token=None, snapshot_id=None,
                 manual_required=True, deliver_calls=0, source_calls=bound.calls, status="MANUAL",
             )
-        dispositions: list[Disposition] = []
-        deliver_calls = 0
+        progress.snapshot_id = batch.snapshot_id
+        dispositions = progress.dispositions
         for observation in batch.observations:
-            outcome = self._one(observation, thread, adapter, now)
-            deliver_calls += outcome[0]
+            outcome = self._one(observation, thread, adapter, now, progress)
             if outcome[1] is not None:
                 dispositions.append(outcome[1])
+            elif progress.pending is not None:
+                dispositions.append(progress.pending)
+            progress.pending = None
             if self.manual_required:
                 break
         report_complete = False
@@ -1101,7 +1146,7 @@ class FixtureSession:
         return PollReport(
             dispositions=tuple(dispositions), complete=report_complete and not self.manual_required,
             continuation_token=token, snapshot_id=batch.snapshot_id, manual_required=self.manual_required,
-            deliver_calls=deliver_calls, source_calls=bound.calls, status=status,
+            deliver_calls=progress.deliver_calls, source_calls=bound.calls, status=status,
         )
 
     def _manual(self, *, source_calls: int, deliver_calls: int, status: str = "MANUAL") -> PollReport:
@@ -1110,7 +1155,8 @@ class FixtureSession:
             manual_required=True, deliver_calls=deliver_calls, source_calls=source_calls, status=status,
         )
 
-    def _one(self, observation: CommentObservation, thread: int, adapter, now) -> tuple[int, Disposition | None]:
+    def _one(self, observation: CommentObservation, thread: int, adapter, now,
+             progress: _PollProgress) -> tuple[int, Disposition | None]:
         prior = self._prior(thread, observation.comment_id)
         digest = body_digest(observation.body)
         if prior is not None and prior["state"] == "PREPARED":
@@ -1156,6 +1202,7 @@ class FixtureSession:
             self.manual_required = True
             return 0, None
         sink = _OutboxSink(self.path, key)
+        progress.deliver_calls += 1
         try:
             result = deliver_frame(extracted.frame, adapter, sink, now)
         except Exception:
@@ -1164,6 +1211,10 @@ class FixtureSession:
         except BaseException:
             self.manual_required = True
             raise
+        progress.pending = Disposition(
+            thread, observation.comment_id, result.admission.value, result.adapter_calls,
+            observation.author, result.ack.value,
+        )
         payload = _dump(_ingress_payload(result))
         wrote = self._write(
             "UPDATE deliveries SET state = 'FINAL', result_json = ? "
@@ -1185,16 +1236,17 @@ class FixtureSession:
     def post_once(self, poster) -> PostReport:
         """Post at most one confirmed local ack. Never calls ``deliver`` and never reposts."""
         _require_disabled()
+        progress = _PostProgress()
         try:
-            return self._post_once_locked(poster)
+            return self._post_once_locked(poster, progress)
         except Exception:
             self.manual_required = True
-            return PostReport(None, True, True, 0, None, None)
+            return PostReport(None, True, True, progress.calls, progress.key, progress.external_id)
         except BaseException:
             self.manual_required = True
             raise
 
-    def _post_once_locked(self, poster) -> PostReport:
+    def _post_once_locked(self, poster, progress: _PostProgress) -> PostReport:
         if self.manual_required or self._post_blocked():
             self.manual_required = True
             return PostReport(None, True, True, 0, None, None)
@@ -1202,6 +1254,7 @@ class FixtureSession:
         if chosen is None:
             return PostReport("NOT_ATTEMPTED", False, False, 0, None, None)
         key, digest, repository, thread = chosen
+        progress.key = key
         wrote = self._write(
             "UPDATE outbox SET post_state = 'ATTEMPTING' "
             "WHERE delivery_key = ? AND post_state = 'NOT_ATTEMPTED'",
@@ -1212,6 +1265,7 @@ class FixtureSession:
             self.manual_required = True
             return PostReport(None, True, True, 0, key, None)
         body = acknowledgment_marker(digest)
+        progress.calls += 1
         try:
             returned = poster.post(repository, thread, body)
         except Exception:
@@ -1221,6 +1275,7 @@ class FixtureSession:
             raise
         else:
             outcome, external_id = _interpret_post(returned)
+        progress.external_id = external_id
         wrote = self._write(
             "UPDATE outbox SET post_state = ?, external_id = ? "
             "WHERE delivery_key = ? AND post_state = 'ATTEMPTING'",
@@ -1241,11 +1296,12 @@ class FixtureSession:
         """One fake read. Presence does not change admission, ack, post state, or a stop."""
         _require_disabled()
         stopped = self.manual_required
+        progress = _ReadProgress()
         try:
-            report = self._read_back_locked(reader, key)
+            report = self._read_back_locked(reader, key, progress)
         except Exception:
             self.manual_required = True
-            return ReadReport("NOT_CHECKED", True, True, 0)
+            return ReadReport("NOT_CHECKED", True, True, progress.calls)
         except BaseException:
             self.manual_required = True
             raise
@@ -1253,7 +1309,7 @@ class FixtureSession:
             self.manual_required = True
         return report
 
-    def _read_back_locked(self, reader, key: str) -> ReadReport:
+    def _read_back_locked(self, reader, key: str, progress: _ReadProgress) -> ReadReport:
         connection = _connect(self.path)
         try:
             _validate_connection(connection)
@@ -1265,6 +1321,7 @@ class FixtureSession:
         digest = self._ack_digest(key)
         if digest is None:
             return ReadReport("NOT_CHECKED", False, False, 0)
+        progress.calls += 1
         try:
             found = reader.read(key)
         except Exception:
@@ -1343,3 +1400,4 @@ class FixtureSession:
         if row is None:
             return None
         return bytes(row["ack_digest"])
+
