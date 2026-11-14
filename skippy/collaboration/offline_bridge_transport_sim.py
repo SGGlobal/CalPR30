@@ -23,6 +23,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -800,7 +801,7 @@ def create_fresh(path, repository: str, threads: tuple[int, ...]) -> "FixtureSes
         raise
     finally:
         connection.close()
-    return FixtureSession(target, repository, tuple(cleaned))
+    return FixtureSession(target, repository, tuple(cleaned), _owner=_SESSION_OWNER)
 
 
 def open_existing(path) -> Inspection:
@@ -847,14 +848,30 @@ def open_existing(path) -> Inspection:
     )
 
 
+_SESSION_OWNER = object()
+
+
+def _serialized(method):
+    """One session handles one poll, post or read at a time. Not a cross-process lock."""
+
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
 class FixtureSession:
     """One owner of one fresh transport file. Reopening is ``open_existing`` only."""
 
-    def __init__(self, path: Path, repository: str, threads: tuple[int, ...]):
+    def __init__(self, path: Path, repository: str, threads: tuple[int, ...], *, _owner=None):
+        if _owner is not _SESSION_OWNER:
+            raise TransportFixtureError("use create_fresh")
         self.path = path
         self.repository = repository
         self.threads = threads
         self.manual_required = False
+        self._lock = threading.Lock()
 
     def _blocked(self) -> bool:
         if self.manual_required:
@@ -891,6 +908,7 @@ class FixtureSession:
         finally:
             connection.close()
 
+    @_serialized
     def poll_once(self, source, adapter, now, *, thread: int) -> PollReport:
         """One bounded intake pass. Does not post and does not retry inside the pass."""
         _require_disabled()
@@ -1044,6 +1062,7 @@ class FixtureSession:
             thread, observation.comment_id, kind, result.adapter_calls, observation.author, result.ack.value,
         )
 
+    @_serialized
     def post_once(self, poster) -> PostReport:
         """Post at most one confirmed local ack. Never calls ``deliver`` and never reposts."""
         _require_disabled()
@@ -1084,6 +1103,7 @@ class FixtureSession:
             return PostReport(None, True, True, 1, key, None)
         return PostReport(outcome, False, False, 1, key, external_id)
 
+    @_serialized
     def read_back_once(self, reader, key: str) -> ReadReport:
         """One fake read. Presence does not change admission, ack, or post eligibility."""
         _require_disabled()

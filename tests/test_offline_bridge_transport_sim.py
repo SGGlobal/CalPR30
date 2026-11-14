@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import json
+import multiprocessing
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -324,7 +325,8 @@ def test_source_module_has_no_network_admission_or_retry_api():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
     assert imported <= {
-        "__future__", "hashlib", "re", "dataclasses", "json", "os", "sqlite3", "pathlib", "skippy",
+        "__future__", "hashlib", "re", "dataclasses", "json", "os", "sqlite3", "pathlib",
+        "threading", "skippy",
     }
     names = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
     assert not any(word in name.lower() for name in names for word in ("retry", "repost", "recover", "resume"))
@@ -955,3 +957,212 @@ def test_unconfirmed_ack_is_not_posted(tmp_path, monkeypatch):
     posted = session.post_once(poster)
     assert posted.poster_calls == 0 and poster.calls == []
     assert report.manual_required is True
+
+
+# --- P7: second owner, commit_refusal, and concurrent intake -------------------
+
+def _p7_child(path):
+    """Fresh interpreter view of one fixture file. Must not gain a poll owner."""
+    from pathlib import Path
+
+    from skippy.collaboration.offline_bridge_transport_sim import (
+        REPOSITORY,
+        FixtureSession,
+        TransportFixtureError,
+        create_fresh,
+        open_existing,
+    )
+
+    target = Path(path)
+    created = True
+    try:
+        create_fresh(target, REPOSITORY, (23, 26))
+    except TransportFixtureError:
+        created = False
+    view = open_existing(target)
+    constructed = True
+    try:
+        FixtureSession(target, REPOSITORY, (23, 26))
+    except TransportFixtureError:
+        constructed = False
+    delivery = view.deliveries[0] if view.deliveries else None
+    posted = view.outbox[0] if view.outbox else None
+    return {
+        "created": created,
+        "constructed": constructed,
+        "blocking": view.blocking,
+        "has_poll": hasattr(view, "poll_once"),
+        "state": None if delivery is None else delivery[5],
+        "digest": None if delivery is None else bytes(delivery[3]),
+        "result": None if delivery is None else delivery[6],
+        "post_state": None if posted is None else posted[3],
+    }
+
+
+def _p7_child_put(path, queue):
+    try:
+        queue.put(_p7_child(path))
+    except Exception as exc:
+        queue.put({"error": repr(exc)})
+
+
+def _spawn(path):
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_p7_child_put, args=(str(path), queue))
+    proc.start()
+    proc.join(60)
+    assert proc.exitcode == 0
+    payload = queue.get(timeout=10)
+    assert "error" not in payload, payload
+    return payload
+
+
+def test_new_process_cannot_poll_prepared_or_attempting(tmp_path, monkeypatch):
+    real_prepared = sim.commit_prepared
+
+    def prepared_after(connection):
+        real_prepared(connection)
+        raise sqlite3.OperationalError("after")
+
+    monkeypatch.setattr(sim, "commit_prepared", prepared_after)
+    stores = AdmissionStores(tmp_path / "prep" / "adm")
+    session = create_fresh(tmp_path / "prep" / "transport.db", REPOSITORY, (23, 26))
+    body = envelope_frame(make_envelope(stores.signers))
+    report = session.poll_once(ScriptSource({None: page((obs(1, body),))}), stores.adapter(), NOW, thread=23)
+    assert report.deliver_calls == 0
+    child = _spawn(session.path)
+    assert child == {
+        "created": False,
+        "constructed": False,
+        "blocking": True,
+        "has_poll": False,
+        "state": "PREPARED",
+        "digest": body_digest(body),
+        "result": None,
+        "post_state": None,
+    }
+
+    monkeypatch.setattr(sim, "commit_prepared", real_prepared)
+    real_attempt = sim.commit_post_attempt
+
+    def attempt_after(connection):
+        real_attempt(connection)
+        raise sqlite3.OperationalError("after")
+
+    monkeypatch.setattr(sim, "commit_post_attempt", attempt_after)
+    (tmp_path / "post").mkdir()
+    posted = create_fresh(tmp_path / "post" / "transport.db", REPOSITORY, (23, 26))
+    post_stores = AdmissionStores(tmp_path / "post" / "adm")
+    signed = envelope_frame(make_envelope(post_stores.signers))
+    assert posted.poll_once(
+        ScriptSource({None: page((obs(1, signed),))}), post_stores.adapter(), NOW, thread=23,
+    ).dispositions[0].kind == "ADMITTED"
+    attempt = posted.post_once(FakePoster())
+    assert attempt.unknown is True and attempt.poster_calls == 0 and attempt.outcome is None
+    child = _spawn(posted.path)
+    assert child["created"] is False and child["constructed"] is False and child["has_poll"] is False
+    assert child["post_state"] == "ATTEMPTING"
+    assert "ADMITTED" in child["result"]
+
+
+def test_concurrent_owner_threads_do_not_double_admit_or_duplicate_ties(tmp_path):
+    import threading
+
+    stores = AdmissionStores(tmp_path / "adm")
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    signed = envelope_frame(make_envelope(stores.signers))
+    source = ScriptSource({None: page((obs(1, signed),))})
+    adapter = CountingAdapter(stores.adapter())
+    reports, errors = [], []
+
+    def run():
+        try:
+            reports.append(session.poll_once(source, adapter, NOW, thread=23))
+        except Exception as exc:
+            errors.append(exc)
+
+    workers = [threading.Thread(target=run) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    assert errors == []
+    assert adapter.calls == 1
+    assert sum(item.deliver_calls for item in reports) == 1
+    assert intent_states(stores) == [("ACCEPTED",)]
+    kinds = [item.kind for report in reports for item in report.dispositions]
+    assert kinds.count("ADMITTED") == 1
+
+    tied = create_fresh(tmp_path / "ties.db", REPOSITORY, (23, 26))
+    pages = {
+        None: page((obs(9, b"later-id", TS), obs(4, b"lower-id", TS)), token="p2"),
+        "p2": page((obs(2, b"next", TS2),), token=None),
+    }
+    shared = ScriptSource(pages)
+    again, failures = [], []
+
+    def run_ties():
+        try:
+            again.append(tied.poll_once(shared, object(), NOW, thread=23))
+        except Exception as exc:
+            failures.append(exc)
+
+    workers = [threading.Thread(target=run_ties) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    assert failures == []
+    rows = open_existing(tied.path).deliveries
+    assert [row[2] for row in rows] == [2, 4, 9]
+    assert sum(item.deliver_calls for item in again) == 0
+    assert len({row[2] for row in rows}) == 3
+
+
+def test_refusal_commit_seams_stop_without_a_deliver(tmp_path, monkeypatch):
+    real = sim.commit_refusal
+    monkeypatch.setattr(
+        sim, "commit_refusal", lambda _connection: (_ for _ in ()).throw(sqlite3.OperationalError("before")),
+    )
+    session = create_fresh(tmp_path / "before.db", REPOSITORY, (23, 26))
+    report = session.poll_once(
+        ScriptSource({None: page((obs(1, b"one"), obs(2, b"two", TS2)))}), object(), NOW, thread=23,
+    )
+    assert report.deliver_calls == 0 and report.manual_required is True
+    assert open_existing(session.path).deliveries == ()
+
+    def after(connection):
+        real(connection)
+        raise sqlite3.OperationalError("after")
+
+    monkeypatch.setattr(sim, "commit_refusal", after)
+    later = create_fresh(tmp_path / "after.db", REPOSITORY, (23, 26))
+    report = later.poll_once(
+        ScriptSource({None: page((obs(1, b"one"), obs(2, b"two", TS2)))}), object(), NOW, thread=23,
+    )
+    assert report.deliver_calls == 0 and report.manual_required is True
+    rows = open_existing(later.path).deliveries
+    assert len(rows) == 1 and rows[0][2] == 1 and rows[0][5] == "FINAL"
+    assert later.poll_once(ScriptSource({None: page(())}), object(), NOW, thread=23).source_calls == 0
+
+
+def test_edit_pin_is_what_a_new_process_can_see(tmp_path, monkeypatch):
+    stores = AdmissionStores(tmp_path / "adm")
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    original = envelope_frame(make_envelope(stores.signers))
+    adapter = CountingAdapter(stores.adapter())
+    assert session.poll_once(
+        ScriptSource({None: page((obs(1, original),))}), adapter, NOW, thread=23,
+    ).dispositions[0].kind == "ADMITTED"
+    monkeypatch.setattr(sim, "deliver_frame", lambda *_a, **_k: (_ for _ in ()).throw(AssertionError("deliver")))
+    report = session.poll_once(
+        ScriptSource({None: page((obs(1, fence(b'{ "a" : 1 }'), TS2),))}), adapter, NOW, thread=23,
+    )
+    assert report.dispositions[0].kind == "EDIT_HELD"
+    assert report.deliver_calls == 0 and adapter.calls == 1
+    child = _spawn(session.path)
+    assert child["created"] is False and child["constructed"] is False and child["has_poll"] is False
+    assert child["digest"] == body_digest(original)
+    assert "ADMITTED" in child["result"]
+    assert child["blocking"] is False
