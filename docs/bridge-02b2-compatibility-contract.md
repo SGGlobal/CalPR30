@@ -1127,6 +1127,12 @@ Execution evidence for the exact committed tree is recorded in the issue #23 evi
 
 Work order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6871635630; base `7621c464496c45e6206f0b78228e47c77b2f7cb1`. Documentation only. Source was read on Homebase with `git grep` and `Get-Content`, with no store, network or test activity. References are at 7621c46: ADP = `offline_authenticated_adapter.py`, GATE = `offline_admission_gate.py`, VER = `offline_signature_verifier.py`, LED = `checkpoint_ledger.py`. "No non-test caller" is a gap, not evidence of a working bridge. GitHub PR comments and the manual Chief relay are a human-mediated path; they are not the cryptographic bridge, and nothing below joins them.
 
+**Correction (work order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6872115811, answering review https://github.com/SGGlobal/QLA/pull/26#issuecomment-6871789657):**
+- J12.2-J12.5 below were corrected in place.
+- They supersede the earlier single-status acknowledgment (`ADMITTED_ACK_UNDELIVERED`), the combined unauthorized acceptance case, the informal decoder rules and the J12.4 transport wording.
+- Source was re-read at `e392e246884f0e12c3a4e516719697e3d6024ef2`. Its code is identical to 7621c46, so the line references stand.
+- This remains documentation only.
+
 ### J12.1 Actual current path
 
 | # | Edge | State | Source / API |
@@ -1142,39 +1148,142 @@ Work order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6871635630; ba
 | 9 | Outbound reply to GitHub | **missing**, deliberately blocked | transport refuses every non-GET method (`github_http_transport.py:86`) |
 | 10 | Legacy unsigned `accept` | implemented, separate | ADP:562; `authenticated_envelope` digest is a checksum, not authentication |
 
-### J12.2 Selected smallest missing edge (PROPOSED)
+### J12.2 Selected smallest missing edge (PROPOSED / NOT IMPLEMENTED; corrected by work order 6872115811)
 
-**Offline signed-frame ingress with acknowledgment.** This covers edges 3 and 8, connecting an inbound byte frame to the existing `accept_signed` and an acknowledgment record. GitHub fetch and posting (edges 1, 2 and 9) stay out of scope.
+**Offline signed-frame ingress, with admission and acknowledgment reported separately.** It covers edges 3 and 8 only, as one call: `deliver(frame: bytes, adapter, sink, now) -> IngressResult`.
+- `adapter` is an instance from the existing `open_signed`, built with test trust root, fixture evidence and HALT on disposable stores.
+- `sink` is an injected recording sink.
+- Ingress adds no authorization, replay, evidence, HALT, retry or recovery rule; those stay with the adapter and gate.
+- Edges 1, 2 and 9 (GitHub fetch and posting) stay out of scope.
 
-- **Input:** one UTF-8 JSON frame of at most 64 KiB carrying exactly the `SignedEnvelope` fields. `payload_digest` and `signature` are lowercase hex. Timestamps are RFC 3339 UTC. Unknown, missing or duplicate keys, non-integer or boolean `sequence`, non-NFC text and trailing data are rejected.
-- **Decoding:** decoding authenticates nothing. Verification remains VER:210 inside the gate and adapter.
-- **Output:** an acknowledgment record `{message_id, idempotency_key, sequence, status, step, reason}`. `status` is one of:
-  - `MALFORMED`: decoder refusal; the adapter is not called.
-  - `ADMITTED`: `"accepted"`.
-  - `REFUSED`, `REJECTED` or `STOP_RETAINED`: the matching classification.
-  - `UNCERTAIN`: `ambiguous` or `confirmed_rolled_back`; manual recovery is required.
+#### J12.2.1 Decoder contract (frame to `SignedEnvelope`)
 
-  The record is handed once to an injected recording sink.
-- **Dependencies:** existing `open_signed` construction with test trust root, fixture evidence and HALT, on disposable P-3 stores. Identity, signature, role, evidence and HALT checks are exactly the existing S3-S9. Nothing is re-implemented and nothing is bypassed.
-- **Replay and sequence:** the existing S6 rules apply. An identical redelivery is refused as `replay: identity already admitted` (ADP:1299-1309); a wrong sequence is refused as `sequence N != M` (ADP:1316). No second admission is possible through ingress.
-- **Acknowledgment semantics:** `ADMITTED` means only "authenticated and durably admitted as a ledger record by this offline prototype". It is **not** source review, implementation completion, CI, Chief approval or permission to execute work.
-- **Uncertainty boundary:** the ack reflects the caller's own J2 observation only. If the sink raises after admission, ingress returns `ADMITTED_ACK_UNDELIVERED` and never calls `accept_signed` again. A later redelivery yields `REJECTED` (replay) with one ledger event. Re-sending the original `ADMITTED` ack would need a read-only receipt lookup that does not exist; this is **unimplemented**, so recovery is manual and there is no automatic retry or re-ack.
+Decoding authenticates nothing; S4 (`verify_signature`, ADP:1221) remains the authentication point. A failure of any rule below gives `MALFORMED`: zero adapter calls, no sink call, no store opened.
+
+1. **Bytes and size:** `type(frame) is bytes` and `len(frame) <= 65536`, checked before decoding.
+2. **Encoding:** strict UTF-8 (`errors="strict"`); a leading BOM is rejected.
+3. **Nesting:** container depth at most 32 (top-level object = 1), checked by a pre-scan outside string literals before parsing. A `RecursionError` is also `MALFORMED`.
+4. **Strict JSON:** exactly one value via `json.loads` with:
+   - an `object_pairs_hook` that rejects duplicate keys at every depth;
+   - a `parse_constant` that rejects `NaN`, `Infinity` and `-Infinity`;
+   - a `parse_float` that rejects every non-integer number.
+
+   Any non-whitespace after the value is rejected. Insignificant JSON whitespace is allowed because frame bytes are not signed. Integer literals Python refuses to parse are `MALFORMED`.
+5. **Surrogates:** no key or string value at any depth may contain a lone surrogate (U+D800-U+DFFF).
+6. **Field set:** the top level is an object with exactly the 17 `SignedEnvelope` fields (VER:54-71): `schema_version, sender, recipient, role, project_id, task_id, checkpoint_id, assignment_id, message_id, idempotency_key, sequence, timestamp, expiry, payload_digest, payload, key_id, signature`. A missing or extra key is rejected.
+7. **Exact built-in types after parsing** (`bool` is never accepted as `int`):
+   - `schema_version`, `sequence`: `int`.
+   - The ten header strings (`_SIGNED_STR_HEADERS`, ADP:1839): `str`.
+   - `payload`: `dict`.
+   - `payload_digest`: `str` matching `^[0-9a-f]{64}$`, decoded with `bytes.fromhex` to 32 bytes.
+   - `signature`: `str` matching `^[0-9a-f]{128}$`, decoded to 64 bytes. Uppercase hex is rejected, not folded.
+   - `timestamp`, `expiry`: `str` matching `^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$`, the 20-byte form that `_encode_timestamp` signs (VER:119-127).
+     - Parsed with `datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)`, because the adapter requires `tzinfo is timezone.utc` (ADP:2096-2099).
+     - An invalid calendar value fails, and `strftime` of the parsed value must reproduce the input exactly.
+8. **No repair:** no trimming, case folding, Unicode or time normalization, digest recomputation or defaults. Values that parse but break signed rules pass unchanged to S4, which refuses them:
+   - non-NFC text;
+   - empty headers;
+   - `schema_version != 1`;
+   - `sequence` outside 0..2^64-1;
+   - payload booleans, nulls, unsafe integers or `reviewed_sha` (`_canonical_json`, VER:79-108);
+   - a digest mismatch (VER:236-239).
+9. **Reference only:** the frozen `canonical_bytes` and `_canonical_json`. No new cryptography or signature format.
+
+#### J12.2.2 Result, sink record and closed outcomes
+
+There are two independent dimensions, and neither ever overwrites the other.
+
+**`IngressResult` (frozen) fields:**
+- `admission`;
+- `adapter_step` (`str | None`);
+- `adapter_classification` (`"accepted"`, one of the five J2 values, or `None`);
+- `poisoned` (`bool | None`);
+- `adapter_calls` (0 or 1);
+- `correlation` (`{message_id, idempotency_key, sequence}` or `None`);
+- `correlation_verified` (`bool`);
+- `ack`;
+- `detail` (non-authoritative text).
+
+**`AckRecord`**, passed once to `sink.record(record)`, has the fields `record_version=1`, `admission`, `adapter_step`, `correlation` and `correlation_verified`. It carries no `sender`, `role` or `key_id`, so no unverified identity appears as attribution.
+
+**`admission`** is a closed set, mapped from `accept_signed` (ADP:1093-1136) and `SignedAdmissionError` (ADP:71-85, 971-1007):
+
+| Adapter outcome | `admission` | Meaning |
+| --- | --- | --- |
+| decoder failure | `MALFORMED` | adapter not called |
+| returns `"accepted"` | `ADMITTED` | authenticated and durably admitted by this offline prototype only |
+| `refused` at S1, S2 or T1 | `REFUSED` | no write, no arm (includes S4 signature refusal, S7, poisoned instance) |
+| `rejected` at E1.b | `REJECTED` | verified pre-arm denial receipt, no arm (S5 HALT, S6; S5 HALT-check failure writes an `uncertain` receipt but is classified `rejected`) |
+| `rejected` at S10 | `REJECTED` | post-arm gate rejection receipt committed; G released |
+| `stop_retained` (S9) | `STOP_RETAINED` | HALT record committed; G kept; poisoned; manual |
+| `refused` at T2, S11, T3 or R | `UNCERTAIN` | armed owner step refused; G retained; poisoned; after T3 or R a ledger event may exist |
+| `confirmed_rolled_back` | `UNCERTAIN` | only the failing transaction rolled back; earlier commits (A, gate reservation) may remain; poisoned |
+| `ambiguous` | `UNCERTAIN` | outcome unknown; poisoned; manual |
+| other exception, unknown classification or step, or a return other than `"accepted"` | `UNCERTAIN` | never treated as a no-effect refusal |
+
+**`correlation`** is `None` for `MALFORMED`. Otherwise it holds the decoded values, which are unverified correlation only. `correlation_verified` is true only for `ADMITTED`, `REJECTED` and `STOP_RETAINED`, each of which is reached only after S4 succeeded.
+
+**`ack`** is a closed set:
+- `NOT_ATTEMPTED`: `MALFORMED`; the sink is not called.
+- `CONFIRMED_BY_SINK`: the sink returned normally. This confirms only what the recording-sink contract guarantees (the record was appended to its local log), not receipt by any remote recipient.
+- `NOT_CONFIRMED`: the sink raised an `Exception`. Delivery may or may not have happened; this is not proof of absence.
+
+**Sink calls:** the sink is called exactly once for every non-`MALFORMED` result, including `REFUSED`, `REJECTED`, `STOP_RETAINED` and `UNCERTAIN`, after the adapter call has returned or raised.
+- A sink exception sets `ack=NOT_CONFIRMED`, is not re-raised and leaves every admission field unchanged.
+- Ingress never calls the sink or the adapter again, and has no resend, lookup or re-ack API.
+- `ADMITTED` plus `CONFIRMED_BY_SINK` is still not source review, implementation completion, CI, Chief approval or permission to execute work.
+
+**Redelivery** is a new `deliver` call under the existing S6 rules, not a lookup or re-ack:
+- an admitted identity gives `REJECTED` ("replay: identity already admitted", ADP:1309) with no ledger effect;
+- a wrong sequence gives `REJECTED` (ADP:1316);
+- a poisoned instance gives `REFUSED` at S2.
+
+Recovering an acknowledgment is manual and unimplemented.
 
 ### J12.3 Proposed files and acceptance set (PROPOSED / NOT IMPLEMENTED; no tests in this order)
 
-- New `skippy/collaboration/offline_bridge_ingress.py`: decoder plus `deliver(frame, adapter, sink, now)`.
-- New `tests/test_offline_bridge_ingress.py`.
+**Files:**
+- New `skippy/collaboration/offline_bridge_ingress.py`: decoder, `deliver`, result and record types.
+- New `tests/test_offline_bridge_ingress.py`: recording and fake sinks, a test-only frame encoder, and the cases below.
 - This document.
 
-The adapter, gate, ledger, verifier, envelope and existing tests are unchanged. Use disposable stores, `test-b2b2-` keys and a recording or fake sink only. There are no live API calls and no credentials.
+The protected adapter, gate, ledger, verifier and envelope, the current runtime and all pre-existing tests stay unchanged. Use disposable stores and `test-b2b2-` keys only, with no network, credentials or GitHub transport.
 
-1. Valid signed frame: `ADMITTED`; one ACCEPTED intent, one ledger event, G released, exactly one ack.
-2. Identical and conflicting replay (same identity with a different payload; reused sequence): no second admission; ledger unchanged.
-3. Unauthorized role, unknown key, invalid signature: existing J2 classification, `REFUSED` or `REJECTED`; never admitted; no arm.
-4. Evidence rejection and active HALT: existing denial or stop classification; never admitted.
-5. Ambiguous durable outcome via existing whole-call W2 or receipts seams: `UNCERTAIN`; instance poisoned; no retry; later delivery refused.
-6. Ack sink fails once after admission: `ADMITTED_ACK_UNDELIVERED`; `accept_signed` called once; redelivery gives `REJECTED` (replay); one ledger event.
-7. Malformed frames: `MALFORMED`; zero adapter calls; stores unchanged.
+1. **Round-trip control:** frames encoded from real test-signed envelopes decode field-for-field equal, with identical `canonical_bytes`, and pass `verify_signature`. Include boundary frames of exactly 65536 bytes and depth 32.
+2. **Valid frame:** `ADMITTED`; one ACCEPTED intent, one ledger event, G released, one adapter call, one sink record.
+3. **Replay:** an identical redelivery, and conflicting reuse (same `message_id` or `idempotency_key` with other content; a reused sequence), each give `REJECTED` at E1.b with the ledger unchanged.
+4. **Stage split,** with no adapter change and no ingress authorization rule:
+   - (a) invalid signature, unknown key, or actor/role mismatch: `REFUSED` at T1 (S4), zero receipts, never armed.
+   - (b) invalid ASSIGNMENT tuple or rejected assignment evidence: `REJECTED` at E1.b (S6), the existing single verified-denial receipt, never armed.
+   - (c) valid signature but an unauthorized IMPLEMENTATION/REVIEW tuple or rejected non-assignment evidence, from a stream state that passes S7: arms at A, `REJECTED` at S10 with a rejection receipt, G released at R. With an injected whole-call gate fault instead: `UNCERTAIN` at S10, G retained, poisoned.
+5. **HALT** (pre-arm and post-arm stay distinct):
+   - S5 HALT gives `REJECTED` at E1.b with no arm.
+   - An S5 HALT-check failure gives `REJECTED` with an `uncertain` receipt.
+   - S9 HALT gives `STOP_RETAINED`, G retained, poisoned.
+   - The gate HALT probe in `reserve` gives `REJECTED` at S10.
+
+   The E1/E2 residuals stay as stated in G, H and J. There is no assertion that the stop fences non-cooperative participants.
+6. **Durable uncertainty** via existing seams (the whole-call W2 wrapper, receipts commit and rollback faults): `UNCERTAIN` with the raw `ambiguous` or `confirmed_rolled_back` kept, poisoned, no retry. The next delivery is `REFUSED` at S2.
+7. **Sink matrix,** run separately for `ADMITTED`, `REFUSED`, `REJECTED` and `UNCERTAIN` inputs:
+   - (i) raises before recording: log empty, `NOT_CONFIRMED`;
+   - (ii) records then raises: one record logged, `NOT_CONFIRMED` (never upgraded);
+   - (iii) returns normally: `CONFIRMED_BY_SINK`.
+
+   Every branch keeps the original admission. It has at most one adapter call and exactly one sink call, exactly one ledger event for the admitted input and none otherwise, and no resend or re-admission. A later redelivery of the admitted frame gives `REJECTED` (replay).
+8. **Malformed:** each case is `MALFORMED` with zero adapter calls, no sink call, `correlation=None` and unchanged stores. Cases:
+   - not bytes; 65537 bytes;
+   - invalid UTF-8; BOM;
+   - duplicate keys at top level and nested in the payload;
+   - trailing tokens;
+   - `NaN` or `Infinity`; a float;
+   - a lone surrogate escape;
+   - depth 33;
+   - a missing or extra field;
+   - `bool` for `int`;
+   - uppercase or wrong-length hex;
+   - a timestamp with an offset, a fraction, a lowercase `z` or an invalid date.
+
+   Control: an adapter double that raises a non-`SignedAdmissionError` gives `UNCERTAIN`, never `REFUSED`.
 
 ### J12.4 Still required for real commissioning (not solved by any offline demonstration or count)
 
@@ -1187,18 +1296,24 @@ The adapter, gate, ledger, verifier, envelope and existing tests are unchanged. 
   - store binding and the freshness anchor;
   - marker-removal limits.
 - **Unchanged limits:** HALT probe-to-commit, schema-to-WAL, no cross-database atomicity, ledger lifecycle and manual recovery. Section G implementation and commissioning are open.
-- **External transport:** separate Chief authorization for any comment read or write endpoint, credentials, posting and deployment. There is no runner design or activation; the sequence remains bridge first, runner later.
+- **External transport:** any future PROJECT runtime endpoint, credential, comment posting or activation needs separate Chief scope. This includes QLA code that reads or writes GitHub.
+  - It does not cover the already-configured ChatGPT GitHub communication tools used for these reads, reviews and orders. Those remain authorized for ongoing use, with no new approval loop.
+  - There is no runner design or activation; the sequence remains bridge first, runner later.
 
 ### J12.5 Smallest proposed implementation scope and passing criteria (PROPOSED; needs Skippy review and Chief authorization)
 
 The scope is the three paths in J12.3. Two are new files, so this **extends** the present three-file lane.
 
 Passing criteria:
-- cases 1-7 pass on fresh disposable stores;
+- an exact diff of those three paths only, with protected, current-runtime and pre-existing test files byte-unchanged;
+- J12.3 cases 1-8 pass on fresh disposable stores;
 - the full repository suite passes unmodified, Colin-executed and independently re-run;
-- an exact diff of three paths, with no protected-file change;
-- no network or credential import (source check);
-- the doc states every uncertainty above.
+- a source check finds:
+  - no network, credential, GitHub-transport or runner import;
+  - no retry, resend, lookup or recovery API;
+  - at most one adapter call and at most one sink call per `deliver`;
+- the `admission` and `ack` closed sets and record fields match J12.2.2 exactly;
+- the document keeps every uncertainty above.
 
 No claim of a working operational bridge follows. execution_enabled=False.
 
@@ -1212,3 +1327,4 @@ No claim of a working operational bridge follows. execution_enabled=False.
   - The contention handshake proves request order and final outcomes, not observed lock-wait entry.
   - Legacy-init COMMIT-then-raise has no committed regression; it was covered only by Skippy's one-off probe.
 - COLIN is a reported identity under the shared SGGlobal login, not authenticated attribution; no claim that comments wake agents. All standing open items remain open.
+- The 1515 results above are prior code evidence at 7621c46. They are not ingress evidence or CI, and no tests were run for the 6872115811 correction.
