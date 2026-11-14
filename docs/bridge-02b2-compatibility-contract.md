@@ -1365,3 +1365,33 @@ The adapter, gate, ledger, verifier, envelope, all other runtime code, every pre
 - **Decoder:** the depth pre-scan counts brackets only outside string literals, honoring escapes. Insignificant JSON whitespace is accepted, so the 65536-byte boundary test pads with whitespace.
 
 **Boundaries kept:** `deliver` has no non-test caller. GitHub edges 1, 2 and 9 are still missing, and trust, evidence and HALT stay synthetic. J12.4 commissioning limits and all standing open items remain open. execution_enabled=False.
+
+### J12.8 Prototype evidence (Colin-executed on Windows (Homebase), not Skippy or CI)
+
+**Exact tree:** committed `551688ae8709e59dd729b9e53c6a4e92317e303e` (parent `b799152`), clean, HEAD = upstream. Its diff against the parent is exactly the three J12.7 paths. This evidence section was added afterwards in a separate documentation-only commit.
+
+**Environment:** Windows, CPython 3.12.10 (`D:\QLA\.venv`), SQLite 3.49.1, PyNaCl 1.6.2, pytest 8.4.2. Each run used `-p no:cacheprovider` and a fresh GUID basetemp under `C:\Users\jonmi\AppData\Local\Temp\`.
+
+**Results:**
+- **Focused run:** `pytest tests/test_offline_bridge_ingress.py tests/test_adapter_signed_admission.py tests/test_offline_bridge02b2_contract.py tests/test_offline_bridge02b2_simulator.py -q -rfE` gave **642 passed in 294.76 s, exit 0**. That is the prior 523 plus 119 new.
+- **Full suite:** `pytest -q -rfE` gave **1634 passed in 413.94 s, exit 0**. That is the prior 1515 baseline plus 119 new, with no failures, skips or errors reported.
+
+The 119 new node IDs are all in `tests/test_offline_bridge_ingress.py`:
+
+| Group | Nodes |
+| --- | --- |
+| case 1 (round trip, byte limit, depth) | 8 |
+| case 2 (valid frames) | 1 |
+| case 3 (replay) | 1 |
+| case 4 (S4, S6, S10 split; gate fault) | 8 |
+| case 5 (HALT) | 4 |
+| case 6 (durable uncertainty) | 5 |
+| case 7 (sink matrix and interrupts) | 16 |
+| case 8 (malformed, no-repair, unexpected) | 74 |
+| closed sets and source check | 2 |
+
+**Limits:**
+- Prior independent Linux 1515 at 7621c46 is baseline only.
+- Counts are not a claim of exhaustive security.
+- No non-test caller exists, and nothing is claimed about GitHub intake, delivery or commissioning.
+- Skippy source/security review and exact-tree/full-suite verification are pending.
