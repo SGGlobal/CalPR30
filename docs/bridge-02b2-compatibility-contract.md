@@ -934,3 +934,13 @@ Independent processes and fresh-process observations are `multiprocessing` spawn
 ### J9.5 Evidence and open items
 
 Colin-executed Windows evidence (commands, interpreter, SQLite, journal_mode and synchronous observations, counts, exit codes and the exact tested SHA) is recorded on issue #23 and in the follow-up record below. It is not Skippy-verified and not CI. Still open and not claimed closed: commissioning; direct gate and ledger fencing; multiple bindings; store identity and freshness; the HALT probe-to-commit race; the schema-to-WAL gap; cross-database atomicity; ledger lifecycle; synthetic trust and evidence; manual recovery procedure (no recovery API); Section G. execution_enabled=False.
+
+### J9.6 Colin-executed Windows evidence (follow-up record; work order 6868633069)
+
+Implementation commit `1dede9f20e43d54cdc5789a475006bc3e7a75b2e` (parent `4d05c321fecd841f6be85c5e4e103b48ccbefb16`; adapter +1380/-2, new test file +1689, this document +56). Both final runs below covered exactly the clean committed tree at `1dede9f2`, with HEAD equal to its upstream and an empty `git status`. This follow-up commit changes only this document. **Colin-executed on Homebase Windows; not Skippy-verified and not CI.**
+
+- Environment: `D:\QLA\.venv\Scripts\python.exe` CPython 3.12.10, SQLite 3.49.1, pytest 8.4.2, PyNaCl 1.6.2, cryptography 45.0.7 (no installs). A plain connection defaults to `journal_mode = delete` and `synchronous = 2` (FULL). P-3 provisioning and P-6 read-back observed `{'journal_mode': 'delete' | 'wal', 'synchronous': 2, 'locking_mode': 'normal', 'busy_timeout_ms': 5000}`, which satisfies J6 prerequisite (d) for this build only.
+- Focused: `D:\QLA\.venv\Scripts\python.exe -m pytest -p no:cacheprovider --basetemp C:\Users\jonmi\AppData\Local\Temp\bd7db4e5-a1f9-43b9-b92a-94cfcdd33efe -rA tests/test_adapter_signed_admission.py tests/test_offline_bridge02b2_contract.py tests/test_offline_bridge02b2_simulator.py`: **401 passed in 163.68 s, exit 0** (107 new tests plus the 294 existing B2.2 tests).
+- Full: `D:\QLA\.venv\Scripts\python.exe -m pytest -q -p no:cacheprovider --basetemp C:\Users\jonmi\AppData\Local\Temp\c49e9251-d383-4ffd-8162-af3f74814f68`: **1393 passed in 298.94 s, exit 0** (the previous baseline of 1286 plus the 107 new tests; every existing test passed unmodified).
+
+The full parametrized node-ID list is in the issue #23 evidence comment. Still open: everything listed in J9.5. execution_enabled=False.
