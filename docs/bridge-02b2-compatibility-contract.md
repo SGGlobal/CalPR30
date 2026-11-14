@@ -1122,3 +1122,93 @@ Baseline controls reproduce the pre-P-9 (6e9d453) transaction pattern test-local
 ### J11.5 Evidence and open items
 
 Execution evidence for the exact committed tree is recorded in the issue #23 evidence comment for this order. It is Colin-executed on Windows, not Skippy and not CI. This document records no test result for its own SHA. All standing items remain open: Section G global stop, the HALT probe-to-commit race, the schema-to-WAL gap, synthetic trust/evidence, cross-database atomicity, binding/freshness, ledger lifecycle, manual recovery, direct gate/ledger fencing, the internal commit seams, multiple bindings, the external freshness anchor and non-cryptographic shared sender identity. None is closed by P-9. execution_enabled=False.
+
+## J12. End-to-end bridge integration contract (work order 6871635630; DESIGN ONLY, PROPOSED / NOT IMPLEMENTED)
+
+Work order https://github.com/SGGlobal/QLA/issues/23#issuecomment-6871635630; base `7621c464496c45e6206f0b78228e47c77b2f7cb1`. Documentation only. Source was read on Homebase with `git grep` and `Get-Content`, with no store, network or test activity. References are at 7621c46: ADP = `offline_authenticated_adapter.py`, GATE = `offline_admission_gate.py`, VER = `offline_signature_verifier.py`, LED = `checkpoint_ledger.py`. "No non-test caller" is a gap, not evidence of a working bridge. GitHub PR comments and the manual Chief relay are a human-mediated path; they are not the cryptographic bridge, and nothing below joins them.
+
+### J12.1 Actual current path
+
+| # | Edge | State | Source / API |
+| --- | --- | --- | --- |
+| 1 | GitHub message (issue/PR comment) to any parser | **missing** | `GitHubLiveProvider` reads only repository, branch, commit, PR, workflow and CI snapshots (`github_live_provider.py:152-379`); `GitHubAdapter.development_report` (`github_adapter.py:277`); no comment endpoint |
+| 2 | Live transport | implemented, read-only, manual only | `ProductionHTTPTransport` GET-only to api.github.com (`github_http_transport.py:85-164`); called only by `run_probe` (`github_live_probe.py:49`) |
+| 3 | Message bytes to `SignedEnvelope` | **missing** | dataclass VER:54-71; built only by tests and the B2.2 simulator (`offline_bridge02b2_simulator.py:216`) |
+| 4 | Signature verification | implemented (pure; no authorization or replay) | `verify_signature` VER:210-270; called at GATE:385 and ADP:1221 |
+| 5 | Trust root, evidence, HALT | synthetic-only, injected | `load_trust_root` VER:162; gate `evidence_verifier`/`halt_probe` GATE:365-375; adapter `halt_check` |
+| 6 | `open_signed` / `accept_signed` | implemented prototype, **unwired** (no non-test caller) | ADP:809, ADP:1093 (returns `"accepted"` or raises `SignedAdmissionError` with J2 classification) |
+| 7 | Receipts, gate, ledger | implemented prototype | T1 ADP:1140; T2 `gate.reserve` under the receipts lock ADP:1488; W2 `record_event` without it ADP:1642, LED:280; T3; R |
+| 8 | Acknowledgment to sender | **missing** for the signed path | no ack record or sink. `CollaborationProtocol.acknowledge` (`protocol.py:720`) and orchestrator `_bridge` (`orchestrator.py:101`) are local synthetic message acks, unrelated |
+| 9 | Outbound reply to GitHub | **missing**, deliberately blocked | transport refuses every non-GET method (`github_http_transport.py:86`) |
+| 10 | Legacy unsigned `accept` | implemented, separate | ADP:562; `authenticated_envelope` digest is a checksum, not authentication |
+
+### J12.2 Selected smallest missing edge (PROPOSED)
+
+**Offline signed-frame ingress with acknowledgment.** This covers edges 3 and 8, connecting an inbound byte frame to the existing `accept_signed` and an acknowledgment record. GitHub fetch and posting (edges 1, 2 and 9) stay out of scope.
+
+- **Input:** one UTF-8 JSON frame of at most 64 KiB carrying exactly the `SignedEnvelope` fields. `payload_digest` and `signature` are lowercase hex. Timestamps are RFC 3339 UTC. Unknown, missing or duplicate keys, non-integer or boolean `sequence`, non-NFC text and trailing data are rejected.
+- **Decoding:** decoding authenticates nothing. Verification remains VER:210 inside the gate and adapter.
+- **Output:** an acknowledgment record `{message_id, idempotency_key, sequence, status, step, reason}`. `status` is one of:
+  - `MALFORMED`: decoder refusal; the adapter is not called.
+  - `ADMITTED`: `"accepted"`.
+  - `REFUSED`, `REJECTED` or `STOP_RETAINED`: the matching classification.
+  - `UNCERTAIN`: `ambiguous` or `confirmed_rolled_back`; manual recovery is required.
+
+  The record is handed once to an injected recording sink.
+- **Dependencies:** existing `open_signed` construction with test trust root, fixture evidence and HALT, on disposable P-3 stores. Identity, signature, role, evidence and HALT checks are exactly the existing S3-S9. Nothing is re-implemented and nothing is bypassed.
+- **Replay and sequence:** the existing S6 rules apply. An identical redelivery is refused as `replay: identity already admitted` (ADP:1299-1309); a wrong sequence is refused as `sequence N != M` (ADP:1316). No second admission is possible through ingress.
+- **Acknowledgment semantics:** `ADMITTED` means only "authenticated and durably admitted as a ledger record by this offline prototype". It is **not** source review, implementation completion, CI, Chief approval or permission to execute work.
+- **Uncertainty boundary:** the ack reflects the caller's own J2 observation only. If the sink raises after admission, ingress returns `ADMITTED_ACK_UNDELIVERED` and never calls `accept_signed` again. A later redelivery yields `REJECTED` (replay) with one ledger event. Re-sending the original `ADMITTED` ack would need a read-only receipt lookup that does not exist; this is **unimplemented**, so recovery is manual and there is no automatic retry or re-ack.
+
+### J12.3 Proposed files and acceptance set (PROPOSED / NOT IMPLEMENTED; no tests in this order)
+
+- New `skippy/collaboration/offline_bridge_ingress.py`: decoder plus `deliver(frame, adapter, sink, now)`.
+- New `tests/test_offline_bridge_ingress.py`.
+- This document.
+
+The adapter, gate, ledger, verifier, envelope and existing tests are unchanged. Use disposable stores, `test-b2b2-` keys and a recording or fake sink only. There are no live API calls and no credentials.
+
+1. Valid signed frame: `ADMITTED`; one ACCEPTED intent, one ledger event, G released, exactly one ack.
+2. Identical and conflicting replay (same identity with a different payload; reused sequence): no second admission; ledger unchanged.
+3. Unauthorized role, unknown key, invalid signature: existing J2 classification, `REFUSED` or `REJECTED`; never admitted; no arm.
+4. Evidence rejection and active HALT: existing denial or stop classification; never admitted.
+5. Ambiguous durable outcome via existing whole-call W2 or receipts seams: `UNCERTAIN`; instance poisoned; no retry; later delivery refused.
+6. Ack sink fails once after admission: `ADMITTED_ACK_UNDELIVERED`; `accept_signed` called once; redelivery gives `REJECTED` (replay); one ledger event.
+7. Malformed frames: `MALFORMED`; zero adapter calls; stores unchanged.
+
+### J12.4 Still required for real commissioning (not solved by any offline demonstration or count)
+
+- **Authority and evidence:**
+  - real authority, key custody, rotation and trust-root distribution;
+  - a real evidence verifier bound to repository and CI facts;
+  - cryptographic sender identity, since the shared SGGlobal login is not cryptographic.
+- **Participants and stores (all BLOCKED or undesigned):**
+  - participant exclusions: direct gate and ledger callers, internal commit seams, multiple bindings;
+  - store binding and the freshness anchor;
+  - marker-removal limits.
+- **Unchanged limits:** HALT probe-to-commit, schema-to-WAL, no cross-database atomicity, ledger lifecycle and manual recovery. Section G implementation and commissioning are open.
+- **External transport:** separate Chief authorization for any comment read or write endpoint, credentials, posting and deployment. There is no runner design or activation; the sequence remains bridge first, runner later.
+
+### J12.5 Smallest proposed implementation scope and passing criteria (PROPOSED; needs Skippy review and Chief authorization)
+
+The scope is the three paths in J12.3. Two are new files, so this **extends** the present three-file lane.
+
+Passing criteria:
+- cases 1-7 pass on fresh disposable stores;
+- the full repository suite passes unmodified, Colin-executed and independently re-run;
+- an exact diff of three paths, with no protected-file change;
+- no network or credential import (source check);
+- the doc states every uncertainty above.
+
+No claim of a working operational bridge follows. execution_enabled=False.
+
+### J12.6 Current evidence (recorded; no test run for J12)
+
+- **Skippy-executed** (issue #23 6871627162): Linux CPython 3.12.14 / SQLite 3.53.1, exact tree `7621c46`, **1515 passed in 114.38 s, exit 0**.
+- **Colin-executed Windows, separate** (6871542608): 1515 passed in 377.55 s, exit 0.
+- Neither is CI, OS-equivalence or exhaustive security.
+- Skippy's nonblocking precision notes (PR #26 6871579626) stand:
+  - In the J11 baseline wording, only the first four CREATE statements autocommitted; later ones ran inside the INSERT's implicit transaction.
+  - The contention handshake proves request order and final outcomes, not observed lock-wait entry.
+  - Legacy-init COMMIT-then-raise has no committed regression; it was covered only by Skippy's one-off probe.
+- COLIN is a reported identity under the shared SGGlobal login, not authenticated attribution; no claim that comments wake agents. All standing open items remain open.
