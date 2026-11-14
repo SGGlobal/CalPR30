@@ -1406,3 +1406,155 @@ def test_storage_read_failure_latches_manual_without_an_adapter_call(tmp_path, m
     assert session.manual_required is True
     posted = session.post_once(FakePoster())
     assert posted.poster_calls == 0 and posted.manual_required is True
+
+
+# Review 6874193589: a late storage failure must preserve observed work.
+@pytest.mark.parametrize("stage", ["second-prior", "final", "continuation"])
+def test_late_poll_connection_failure_preserves_real_admission(tmp_path, monkeypatch, stage):
+    stores = AdmissionStores(tmp_path / "adm")
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    adapter = CountingAdapter(stores.adapter())
+    signed = envelope_frame(make_envelope(stores.signers))
+    observations = [obs(1, signed)]
+    if stage == "second-prior":
+        observations.append(obs(2, b"not reached", TS2))
+    source = ScriptSource({None: page(observations)})
+
+    def unavailable(_path):
+        raise sqlite3.OperationalError("late connection failure")
+
+    with monkeypatch.context() as patch:
+        if stage == "second-prior":
+            original = session._prior
+
+            def prior(thread, comment_id):
+                if comment_id == 2:
+                    patch.setattr(sim, "_connect", unavailable)
+                return original(thread, comment_id)
+
+            patch.setattr(session, "_prior", prior)
+        elif stage == "final":
+            original = sim._OutboxSink.record
+
+            def record(sink, ack):
+                original(sink, ack)
+                patch.setattr(sim, "_connect", unavailable)
+
+            patch.setattr(sim._OutboxSink, "record", record)
+        else:
+            original = sim.commit_final
+
+            def committed(connection):
+                original(connection)
+                patch.setattr(sim, "_connect", unavailable)
+
+            patch.setattr(sim, "commit_final", committed)
+        report = session.poll_once(source, adapter, NOW, thread=23)
+
+    assert report.manual_required and report.status == "MANUAL"
+    assert report.source_calls == len(source.calls) == 1
+    assert report.deliver_calls == adapter.calls == 1
+    assert len(report.dispositions) == 1
+    assert report.dispositions[0].comment_id == 1
+    assert report.dispositions[0].kind == "ADMITTED"
+    assert report.snapshot_id == "snap-1"
+    assert report.complete is False and report.continuation_token is None
+    assert len(ledger_rows(stores)) == 1
+    assert intent_states(stores) == [("ACCEPTED",)]
+    inspection = open_existing(session.path)
+    assert len(inspection.outbox) == len(inspection.deliveries) == 1
+    assert inspection.deliveries[0][5] == ("PREPARED" if stage == "final" else "FINAL")
+    assert session.poll_once(source, adapter, NOW, thread=23).deliver_calls == 0
+    assert len(source.calls) == 1 and adapter.calls == 1
+
+
+def test_post_result_connection_failure_keeps_remote_call_and_delivery_key(tmp_path, monkeypatch):
+    session, stores, key, digest, admission = admit_one(tmp_path)
+    remote = []
+
+    with monkeypatch.context() as patch:
+        class Remote:
+            def post(self, repository, thread, body):
+                remote.append((repository, thread, body))
+
+                def unavailable(_path):
+                    raise sqlite3.OperationalError("after remote storage")
+
+                patch.setattr(sim, "_connect", unavailable)
+                return PostOutcome("POSTED", 919)
+
+        report = session.post_once(Remote())
+    assert report.poster_calls == 1 and len(remote) == 1
+    assert report.delivery_key == key and report.external_id == 919
+    assert report.unknown and report.manual_required and report.outcome is None
+    assert acknowledgment_marker(digest) in remote[0][2]
+    inspected = open_existing(session.path)
+    assert inspected.outbox[0][3] == "ATTEMPTING"
+    assert inspected.deliveries[0][6] == admission
+    assert len(ledger_rows(stores)) == 1
+    assert session.post_once(Remote()).poster_calls == 0 and len(remote) == 1
+
+
+def test_readback_result_connection_failure_keeps_reader_count(tmp_path, monkeypatch):
+    session, stores, key, digest, admission = admit_one(tmp_path)
+    calls = []
+    with monkeypatch.context() as patch:
+        class Reader:
+            def read(self, delivery):
+                calls.append(delivery)
+
+                def unavailable(_path):
+                    raise sqlite3.OperationalError("after fake read")
+
+                patch.setattr(sim, "_connect", unavailable)
+                return acknowledgment_marker(digest)
+
+        report = session.read_back_once(Reader(), key)
+    assert calls == [key] and report.reader_calls == 1
+    assert report.confirmation == "NOT_CHECKED" and report.unknown and report.manual_required
+    inspected = open_existing(session.path)
+    assert inspected.outbox[0][5] == "NOT_CHECKED"
+    assert inspected.deliveries[0][6] == admission
+    assert len(ledger_rows(stores)) == 1
+
+
+@pytest.mark.parametrize("corruption", ["partial", "type", "nullable", "default", "generated"])
+def test_inspection_rejects_schema_properties_without_repair(tmp_path, corruption):
+    session = create_fresh(tmp_path / "transport.db", REPOSITORY, (23, 26))
+    key_column = "delivery_key TEXT NOT NULL"
+    ack_column = "ack_json TEXT NOT NULL"
+    if corruption == "nullable":
+        key_column = "delivery_key TEXT"
+    if corruption == "type":
+        ack_column = "ack_json BLOB NOT NULL"
+    if corruption == "default":
+        ack_column += " DEFAULT 'unexpected'"
+    extra = ", hidden_copy TEXT GENERATED ALWAYS AS (ack_json) VIRTUAL" if corruption == "generated" else ""
+    connection = sqlite3.connect(session.path)
+    try:
+        connection.execute("DROP TABLE outbox")
+        connection.execute(
+            f"CREATE TABLE outbox ({key_column}, {ack_column}, ack_digest BLOB NOT NULL, "
+            f"post_state TEXT NOT NULL, external_id INTEGER, confirmation TEXT NOT NULL{extra})"
+        )
+        predicate = " WHERE post_state = 'POSTED'" if corruption == "partial" else ""
+        connection.execute("CREATE UNIQUE INDEX fixture_outbox_key ON outbox(delivery_key)" + predicate)
+        connection.commit()
+        before = connection.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall()
+    finally:
+        connection.close()
+    with pytest.raises(sim.InspectionError):
+        open_existing(session.path)
+    adapter = CountingAdapter(object())
+    source = ScriptSource({None: page((obs(1, fence(b"{}")),))})
+    report = session.poll_once(source, adapter, NOW, thread=23)
+    assert report.manual_required and report.deliver_calls == adapter.calls == 0
+    assert report.source_calls == 0 and source.calls == []
+    connection = sqlite3.connect(session.path)
+    try:
+        after = connection.execute("SELECT type, name, sql FROM sqlite_master ORDER BY name").fetchall()
+        assert after == before
+        assert connection.execute("SELECT COUNT(*) FROM deliveries").fetchone()[0] == 0
+    finally:
+        connection.close()
+
