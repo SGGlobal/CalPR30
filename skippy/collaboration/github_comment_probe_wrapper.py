@@ -12,20 +12,29 @@ import json
 import re
 from dataclasses import dataclass
 
-from skippy.collaboration.github_issue_comment_reader import read_comment_page
+from skippy.collaboration.github_issue_comment_reader import ReaderRefusal, read_comment_page
 from skippy.collaboration.github_live_provider import HTTPResponse
 
 execution_enabled = False
 PROBE_URL = 'https://api.github.com/repos/SGGlobal/QLA/issues/23/comments?per_page=25&page=1'
+VALIDATION_CODES = frozenset({
+    "TRANSPORT", "RESPONSE", "BODY_BOUNDS", "CONTENT_TYPE",
+    "JSON", "PAGE_STRUCTURE", "PAGINATION",
+})
 
 
 class ProbeRefusal(Exception):
     """Static reason and actual delegated invocation count; no foreign text."""
 
-    def __init__(self, reason: str, calls: int, status: int | None = None):
+    def __init__(self, reason: str, calls: int, status: int | None = None,
+                 *, validation_code: str = "UNCLASSIFIED"):
         super().__init__(reason)
         self.calls = calls
         self.status = status
+        self.validation_code = (
+            validation_code if type(validation_code) is str and validation_code in VALIDATION_CODES
+            else "UNCLASSIFIED"
+        )
 
 
 @dataclass(frozen=True)
@@ -90,8 +99,12 @@ def observe_issue23_once(transport, token: str) -> ProbeSummary:
             minimum_id=min(ids) if ids else None, maximum_id=max(ids) if ids else None,
             pagination=page.pagination, next_token=page.next_token,
         )
+    except ReaderRefusal as error:
+        code = error.validation_code if type(error) is ReaderRefusal else "UNCLASSIFIED"
+        raise ProbeRefusal('probe refused', calls, status, validation_code=code) from None
     except Exception:
         raise ProbeRefusal('probe refused', calls, status) from None
     except (KeyboardInterrupt, SystemExit):
         # Preserve cancellation semantics, suppress foreign exception text.
         raise ProbeRefusal('probe interrupted', calls, status) from None
+

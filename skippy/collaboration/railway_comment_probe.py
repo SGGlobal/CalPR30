@@ -60,7 +60,8 @@ def main() -> int:
         summary = observe_issue23_once(production_transport(), token)
     except ProbeRefusal as error:
         print(json.dumps({"outcome": "UNCERTAIN", "transport_calls": error.calls,
-                          "status": error.status, "reservation_retained": True}), flush=True)
+                          "status": error.status, "validation_code": error.validation_code,
+                          "reservation_retained": True}), flush=True)
         return 1
     except (Exception, KeyboardInterrupt, SystemExit):
         print('{"outcome":"UNCERTAIN","reservation_retained":true}', flush=True)
@@ -72,3 +73,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

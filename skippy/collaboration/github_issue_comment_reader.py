@@ -24,9 +24,10 @@ TIMEOUT = 10
 class ReaderRefusal(Exception):
     """Static classification with actual transport invocation count; no remote text."""
 
-    def __init__(self, reason: str, calls: int):
+    def __init__(self, reason: str, calls: int, *, validation_code: str = "UNCLASSIFIED"):
         super().__init__(reason)
         self.calls = calls
+        self.validation_code = validation_code
 
 
 @dataclass(frozen=True)
@@ -154,17 +155,20 @@ def read_comment_page(transport, repository: str, number: int,
     try:
         response = transport("GET", url, {"Accept": "application/vnd.github+json"}, TIMEOUT)
     except Exception:
-        raise ReaderRefusal("transport failed", 1) from None
+        raise ReaderRefusal("transport failed", 1, validation_code="TRANSPORT") from None
     # Interrupts propagate; there is no retry, persisted work or resume path.
     if type(response) is not HTTPResponse or type(response.status) is not int or response.status != 200:
-        raise ReaderRefusal("response refused", 1)
+        raise ReaderRefusal("response refused", 1, validation_code="RESPONSE")
     if type(response.body) is not bytes or len(response.body) > MAX_BYTES:
-        raise ReaderRefusal("body refused", 1)
+        raise ReaderRefusal("body refused", 1, validation_code="BODY_BOUNDS")
+    validation_code = "CONTENT_TYPE"
     try:
         if strict_response:
             _strict_content_type(response.headers)
+        validation_code = "JSON"
         payload = json.loads(response.body.decode("utf-8"), object_pairs_hook=_pairs,
                              parse_constant=_constant)
+        validation_code = "PAGE_STRUCTURE"
         if type(payload) is not list or len(payload) > PER_PAGE:
             raise ValueError("page")
         ids = set()
@@ -176,8 +180,10 @@ def read_comment_page(transport, repository: str, number: int,
             if item["id"] in ids:
                 raise ValueError("duplicate comment")
             ids.add(item["id"])
+        validation_code = "PAGINATION"
         next_token = _links(response.headers, number, page)
     except (ValueError, TypeError, UnicodeError, RecursionError):
-        raise ReaderRefusal("page refused", 1) from None
+        raise ReaderRefusal("page refused", 1, validation_code=validation_code) from None
     return CommentPageBytes(repository, number, response.body, next_token,
                             "NEXT_OBSERVED" if next_token else "UNKNOWN")
+
