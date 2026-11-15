@@ -14,6 +14,8 @@ from skippy.collaboration.github_live_provider import HTTPResponse
 
 execution_enabled = False
 REPOSITORY = "SGGlobal/QLA"
+# Verified via the connected GitHub repository metadata API. No runtime lookup.
+REPOSITORY_ID = 1448604243
 THREADS = (23, 26)
 MAX_BYTES = 1_000_000
 MAX_LINK_BYTES = 8192
@@ -53,6 +55,20 @@ def _page(url: str, number: int) -> int:
     return int(match.group(1))
 
 
+def _link_page(url: str, number: int) -> int:
+    # Response metadata accepts only the two pinned repository path forms and
+    # the two exact query orders. Caller-supplied request tokens stay canonical.
+    bases = (_base(number),
+             f"https://api.github.com/repositories/{REPOSITORY_ID}/issues/{number}/comments")
+    for base in bases:
+        for query in (r"\?per_page=25&page=([1-9][0-9]{0,3})",
+                      r"\?page=([1-9][0-9]{0,3})&per_page=25"):
+            match = re.fullmatch(re.escape(base) + query, url)
+            if match is not None:
+                return int(match.group(1))
+    raise ValueError("url")
+
+
 def _links(headers: dict, number: int, page: int) -> str | None:
     if type(headers) is not dict:
         raise ValueError("headers")
@@ -72,7 +88,7 @@ def _links(headers: dict, number: int, page: int) -> str | None:
         if match is None:
             raise ValueError("link")
         url, relation = match.groups()
-        target = _page(url, number)
+        target = _link_page(url, number)
         if relation in seen:
             raise ValueError("link")
         if relation == "next" and target != page + 1:
@@ -83,7 +99,8 @@ def _links(headers: dict, number: int, page: int) -> str | None:
             raise ValueError("first")
         if relation == "last" and target < page:
             raise ValueError("last")
-        seen[relation] = url
+        # Never expose a numeric-path or reordered link as a request token.
+        seen[relation] = _base(number) + f"?per_page=25&page={target}"
     if "next" in seen and "last" in seen:
         if _page(seen["last"], number) < _page(seen["next"], number):
             raise ValueError("contradictory pagination")
