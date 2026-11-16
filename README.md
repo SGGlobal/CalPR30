@@ -71,7 +71,7 @@ The terminal dashboard shows:
 
 ## Safety notes
 
-- `DRY_RUN` defaults to `True` if missing or invalid.
-- Live order signing is intentionally not implemented in this clean framework.
+- `get_settings()` reads `DRY_RUN`. Missing and unrecognized values stay `True`.
+- Placement, cancel, and non-dry-run status lookups all refuse. Live order signing is intentionally not implemented.
 - If order status is unknown or an API call fails after an order attempt, QLA refuses duplicate placement.
 - Events are logged to `logs/qla_events.log` with secret-like fields redacted.

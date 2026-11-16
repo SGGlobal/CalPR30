@@ -61,7 +61,7 @@ def get_settings() -> Settings:
         poly_api_key=os.getenv("POLY_API_KEY", ""),
         poly_api_secret=os.getenv("POLY_API_SECRET", ""),
         poly_passphrase=os.getenv("POLY_PASSPHRASE", ""),
-        dry_run=True,
+        dry_run=_get_bool("DRY_RUN", True),
         bet_size_usd=float(os.getenv("BET_SIZE_USD", "5") or 5),
         environment_loaded=environment_loaded,
     )
