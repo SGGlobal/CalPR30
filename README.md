@@ -1,6 +1,10 @@
-# QLA — Skippy AI Collaboration Project
+# Cal PR~30
 
-Welcome to QLA, the home of **Skippy** and our work on a structured AI collaboration bridge.
+**Live AI handoffs through GitHub**
+
+Cal PR~30 is the project behind **Skippy** and a structured collaboration bridge for AI assistants. The project was previously called QLA.
+
+[Project home](https://calpr30.com/)
 
 We are developing a way for AI assistants to coordinate development through GitHub: read an assignment, acknowledge it, work within its scope, submit evidence, and hand the result back for review. The goal is to reduce manual copying between chats while keeping the human owner in control.
 
@@ -17,7 +21,7 @@ We are developing a way for AI assistants to coordinate development through GitH
 | Human direction | Keep assignments bounded and preserve the owner's authority over consequential actions. |
 | Scheduled watch | Check for updates and advance already-authorized work when a supported schedule or service actually exists. |
 
-QLA also contains trading research and an earlier Polymarket dry-run framework. Collaboration messages do not authorize trading. This README does not claim the bridge is commissioned, continuously running, or ready for live execution.
+This repository also contains trading research and an earlier Polymarket dry-run framework. Collaboration messages do not authorize trading. This README does not claim the bridge is commissioned, continuously running, or ready for live execution.
 
 ## Our team language
 
@@ -73,12 +77,12 @@ Use new comments for meaningful handoffs and corrections. Preserve history, avoi
 
 ## For friends and their AI assistants
 
-You can adopt this style in your own repository. Use your own owner, AI names and handoff issue. Access to this README does not grant a QLA role or permission to change the project.
+You can adopt this style in your own repository. Use your own owner, AI names and handoff issue. Access to this README does not grant a Cal PR~30 role or permission to change the project.
 
 Give your assistant this prompt:
 
 ```text
-Use the QLA communication style for our project.
+Use the Cal PR~30 communication style for our project.
 Owner: [human owner]
 AI name and role: [name / coordinator / implementer / reviewer]
 Repository: [exact URL]
@@ -97,101 +101,3 @@ Report your verified access, latest applicable assignment and actual status.
 For expanded templates, status definitions and protocol boundaries, read the
 [full communication guide](https://github.com/SGGlobal/QLA/blob/docs/qla-communication-style-20261116/docs/communication/README.md)
 on our documentation branch.
-
-## Project records
-
-- [Architecture](docs/ARCHITECTURE.md)
-- [Roadmap](docs/ROADMAP.md)
-- [BRIDGE-01 checkpoint handoff](docs/bridge-01-checkpoint-handoff.md)
-- [GitHub adapter contract](docs/github-adapter.md)
-- [Pull request #26 — ongoing coordination and review history](https://github.com/SGGlobal/QLA/pull/26)
-- [Issue #23 — detailed work and evidence](https://github.com/SGGlobal/QLA/issues/23)
-
-Development lives across branches. Historical documents and reports describe their named checkpoint; read the latest applicable evidence before assuming current operational status.
-
-## Earlier Polymarket framework reference
-
-The original framework README is retained below for its existing setup information. Its setup describes that component, not installation or activation of the collaboration bridge.
-
-<details>
-<summary>Original Polymarket dry-run framework setup</summary>
-
-## QLA Polymarket Bot Framework
-
-QLA is an original, clean Polymarket bot framework for BTC 5-minute UP/DOWN markets. It is built to default to dry-run mode and avoid duplicate order placement when order state is uncertain.
-
-## Warning
-
-Real trading can lose money. This project defaults to `DRY_RUN=True`; do not set `DRY_RUN=False` unless you understand the risks and have added and audited real order signing.
-
-## Setup
-
-```bash
-python -m venv .venv
-source .venv/Scripts/activate
-pip install --upgrade pip
-```
-
-This implementation uses Python standard-library HTTP helpers, so no extra package is required for the core dry-run bot.
-
-## Environment
-
-Create a `.env` file from the example:
-
-```bash
-cp .env.example .env
-```
-
-Fill in only the environment variables you intend to use:
-
-```env
-PRIVATE_KEY=
-PUBLIC_KEY=
-POLY_API_KEY=
-POLY_API_SECRET=
-POLY_PASSPHRASE=
-DRY_RUN=True
-BET_SIZE_USD=5
-```
-
-Optional strategy tuning variables:
-
-```env
-FAVORITE_THRESHOLD=0.70
-MAX_ASK_CAP=0.97
-```
-
-## Run in dry-run mode
-
-Keep this in `.env`:
-
-```env
-DRY_RUN=True
-```
-
-Then run:
-
-```bash
-python main_qla.py
-```
-
-The terminal dashboard shows:
-
-- Bot name QLA
-- Current market question
-- Time left
-- UP bid/ask
-- DOWN bid/ask
-- Favored side
-- Last action
-- Attempts, entries, and skips
-- Dry-run status
-
-## Safety notes
-
-- `DRY_RUN` defaults to `True` if missing or invalid.
-- Live order signing is intentionally not implemented in this clean framework.
-- If order status is unknown or an API call fails after an order attempt, QLA refuses duplicate placement.
-- Events are logged to `logs/qla_events.log` with secret-like fields redacted.
-
-</details>
