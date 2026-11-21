@@ -160,3 +160,34 @@ def deliver_status(
             raise ValueError("CODEX/CAL POST requires independent read-back")
     record(db, inbox, "verified", reply)
     return True
+
+
+def maybe_deliver_status(db, token, row, *, github, find_reply, record, owner_id):
+    """Call immediately after the existing worker verifies the wake-up body."""
+    approval = load_local_approval()
+    if approval is None or row[0] != approval["handoff"]:
+        return False
+
+    def read_work_order(github_token, comment_id):
+        comment = github(f"repos/{REPO}/issues/comments/{comment_id}", github_token)
+        if (
+            type(comment) is not dict
+            or comment.get("id") != comment_id
+            or comment.get("issue_url") != f"https://api.github.com/repos/{REPO}/issues/26"
+            or type(comment.get("user")) is not dict
+            or comment["user"].get("id") != owner_id
+        ):
+            raise ValueError("CODEX/CAL work-order author or route mismatch")
+        return comment.get("body")
+
+    def post_reply(github_token, number, body):
+        posted = github(f"repos/{REPO}/issues/{number}/comments", github_token, body)
+        if type(posted) is not dict or type(posted.get("id")) is not int:
+            raise ValueError("CODEX/CAL POST did not return a comment ID")
+        return posted["id"]
+
+    return deliver_status(
+        db, token, row, approval=approval, read_work_order=read_work_order,
+        halt_active=lambda: local_halt_active(approval), find_reply=find_reply,
+        post_reply=post_reply, record=record,
+    )
