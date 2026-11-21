@@ -152,6 +152,7 @@ def test_preflight_reads_only_account_and_reports_no_private_fields():
         "live_account_authenticated": True,
         "account_active_and_unblocked": True,
         "crypto_active": False,
+        "crypto_status": "INACTIVE",
     }
     assert broker.calls == [("GET", LIVE_API + "/account", None)]
 
@@ -163,4 +164,17 @@ def test_preflight_rejects_response_without_an_account_identity():
     del broker.account["id"]
     with pytest.raises(OrderRefused, match="identity unavailable"):
         check_live_account(broker)
+    assert broker.calls == [("GET", LIVE_API + "/account", None)]
+
+
+
+@pytest.mark.parametrize("value,label", [(None, "MISSING"), ("APPROVAL_PENDING", "APPROVAL_PENDING"),
+                                        ("private diagnostic", "UNRECOGNIZED"), ([], "UNRECOGNIZED")])
+def test_preflight_distinguishes_crypto_status_without_echoing_raw_values(value, label):
+    from skippy.adapters.alpaca_live_preflight import check_live_account
+
+    broker = Broker()
+    broker.account["crypto_status"] = value
+    result = check_live_account(broker)
+    assert result["crypto_status"] == label and result["crypto_active"] is False
     assert broker.calls == [("GET", LIVE_API + "/account", None)]
