@@ -1,4 +1,4 @@
-"""Explicit Alpaca paper order submission and read-back.
+"""Alpaca paper order adapter and shared submission journal.
 
 The caller supplies an authenticated transport, a durable journal path, and an
 order admission callback. Startup and TradingView do not call this adapter.
@@ -54,17 +54,20 @@ class PaperMarketOrder:
         }
 
 
-class AlpacaPaperOrders:
+class _AlpacaOrders:
+    api: str
+    journal_table: str
+
     def __init__(self, journal_path, *, account_id, transport, allow_submit=None):
         if str(journal_path) in ("", ":memory:") or not isinstance(account_id, str) or not account_id:
-            raise OrderRefused("A durable journal and a paper account ID are required")
+            raise OrderRefused("A durable journal and an Alpaca account ID are required")
         self.path = journal_path
         self.account_id = account_id
         self.transport = transport
         self.allow_submit = allow_submit
         with closing(self._connect()) as db, db:
             db.execute(
-                "CREATE TABLE IF NOT EXISTS paper_orders ("
+                f"CREATE TABLE IF NOT EXISTS {self.journal_table} ("
                 "account TEXT NOT NULL, client_id TEXT NOT NULL, payload TEXT NOT NULL, "
                 "broker_id TEXT, PRIMARY KEY (account, client_id))"
             )
@@ -80,22 +83,19 @@ class AlpacaPaperOrders:
 
     def _admit(self, order):
         if self.allow_submit is None or self.allow_submit(order) is not True:
-            raise OrderRefused("Paper order submission is disabled for this order")
+            raise OrderRefused("Order submission is disabled for this order")
 
     def _account(self, *, opening=False):
-        account = self.transport("GET", f"{PAPER_API}/account", None)
+        account = self.transport("GET", f"{self.api}/account", None)
         if not isinstance(account, dict) or account.get("id") != self.account_id:
-            raise OrderRefused("Paper account identity mismatch")
-        if opening and (
-            account.get("status") != "ACTIVE"
-            or account.get("trading_blocked") is not False
-            or account.get("account_blocked") is not False
-        ):
-            raise OrderRefused("Paper account is inactive or restricted")
+            raise OrderRefused("Alpaca account identity mismatch")
+        if opening and not _account_is_active(account):
+            raise OrderRefused("Alpaca account is inactive or restricted")
+        return account
 
     def _stored(self, db, payload):
         return db.execute(
-            "SELECT payload, broker_id FROM paper_orders WHERE account=? AND client_id=?",
+            f"SELECT payload, broker_id FROM {self.journal_table} WHERE account=? AND client_id=?",
             (self.account_id, payload["client_order_id"]),
         ).fetchone()
 
@@ -103,23 +103,23 @@ class AlpacaPaperOrders:
         broker_id = _matching_broker_id(payload, broker_order)
         with closing(self._connect()) as db, db:
             updated = db.execute(
-                "UPDATE paper_orders SET broker_id=? WHERE account=? AND client_id=? "
+                f"UPDATE {self.journal_table} SET broker_id=? WHERE account=? AND client_id=? "
                 "AND (broker_id IS NULL OR broker_id=?)",
                 (broker_id, self.account_id, payload["client_order_id"], broker_id),
             ).rowcount
             if updated != 1:
-                raise OrderUncertain("Paper order conflicts with the journal")
+                raise OrderUncertain("Alpaca order conflicts with the journal")
         return broker_id
 
-    def submit(self, order: PaperMarketOrder) -> str:
+    def submit(self, order) -> str:
         """Return the accepted broker order ID, which does not imply a fill."""
-        payload = order.payload()
         self._admit(order)
+        payload = order.payload()
         self._account(opening=True)
         encoded = json.dumps(payload, sort_keys=True)
         with closing(self._connect()) as db, db:
             reserved = db.execute(
-                "INSERT OR IGNORE INTO paper_orders (account, client_id, payload) "
+                f"INSERT OR IGNORE INTO {self.journal_table} (account, client_id, payload) "
                 "VALUES (?, ?, ?)",
                 (self.account_id, payload["client_order_id"], encoded),
             ).rowcount
@@ -128,15 +128,15 @@ class AlpacaPaperOrders:
                 if prior != encoded:
                     raise OrderRefused("Client order ID is already bound to a different order")
                 if broker_id is None:
-                    raise OrderUncertain("Paper order already reserved; reconcile before proceeding")
+                    raise OrderUncertain("Alpaca order already reserved; reconcile before proceeding")
                 return broker_id
 
         try:
             self._admit(order)
-            order_response = self.transport("POST", f"{PAPER_API}/orders", payload.copy())
+            order_response = self.transport("POST", f"{self.api}/orders", payload.copy())
             return self._record(payload, order_response)
         except Exception:
-            raise OrderUncertain("Paper order outcome unverified; reconcile by client ID") from None
+            raise OrderUncertain("Alpaca order outcome unverified; reconcile by client ID") from None
 
     def reconcile(self, client_order_id: str) -> str:
         """Read back a previously reserved order without sending another order."""
@@ -149,16 +149,29 @@ class AlpacaPaperOrders:
         query = urlencode({"client_order_id": client_order_id})
         try:
             order_response = self.transport(
-                "GET", f"{PAPER_API}/orders:by_client_order_id?{query}", None
+                "GET", f"{self.api}/orders:by_client_order_id?{query}", None
             )
             return self._record(payload, order_response)
         except Exception:
-            raise OrderUncertain("Paper order could not be reconciled; reservation retained") from None
+            raise OrderUncertain("Alpaca order could not be reconciled; reservation retained") from None
+
+
+class AlpacaPaperOrders(_AlpacaOrders):
+    api = PAPER_API
+    journal_table = "paper_orders"
+
+
+def _account_is_active(account):
+    return (
+        account.get("status") == "ACTIVE"
+        and account.get("trading_blocked") is False
+        and account.get("account_blocked") is False
+    )
 
 
 def _matching_broker_id(payload, reply):
     if not isinstance(reply, dict):
-        raise OrderUncertain("Paper broker did not return an order")
+        raise OrderUncertain("Alpaca broker did not return an order")
     broker_id = reply.get("id")
     symbol = reply.get("symbol")
     quantity = reply.get("qty")
@@ -170,6 +183,11 @@ def _matching_broker_id(payload, reply):
         or any(reply.get(field) != payload[field] for field in ("side", "type", "time_in_force"))
         or not isinstance(quantity, str)
         or Decimal(quantity) != Decimal(payload["qty"])
+        or (
+            "limit_price" in payload
+            and (not isinstance(reply.get("limit_price"), str)
+                 or Decimal(reply["limit_price"]) != Decimal(payload["limit_price"]))
+        )
     ):
-        raise OrderUncertain("Paper broker order does not match the request")
+        raise OrderUncertain("Alpaca broker order does not match the request")
     return broker_id
