@@ -141,3 +141,26 @@ def test_https_transport_pins_host_and_refuses_redirects():
         assert client.request.call_args.args == ("GET", "/v2/account")
         assert client.request.call_args.kwargs["headers"]["APCA-API-SECRET-KEY"] == "mock-secret"
         client.close.assert_called_once()
+
+
+def test_preflight_reads_only_account_and_reports_no_private_fields():
+    from skippy.adapters.alpaca_live_preflight import check_live_account
+
+    broker = Broker()
+    broker.account.update(account_number="private", buying_power="123.45", crypto_status="INACTIVE")
+    assert check_live_account(broker) == {
+        "live_account_authenticated": True,
+        "account_active_and_unblocked": True,
+        "crypto_active": False,
+    }
+    assert broker.calls == [("GET", LIVE_API + "/account", None)]
+
+
+def test_preflight_rejects_response_without_an_account_identity():
+    from skippy.adapters.alpaca_live_preflight import check_live_account
+
+    broker = Broker()
+    del broker.account["id"]
+    with pytest.raises(OrderRefused, match="identity unavailable"):
+        check_live_account(broker)
+    assert broker.calls == [("GET", LIVE_API + "/account", None)]

@@ -89,11 +89,7 @@ class _AlpacaOrders:
         account = self.transport("GET", f"{self.api}/account", None)
         if not isinstance(account, dict) or account.get("id") != self.account_id:
             raise OrderRefused("Alpaca account identity mismatch")
-        if opening and (
-            account.get("status") != "ACTIVE"
-            or account.get("trading_blocked") is not False
-            or account.get("account_blocked") is not False
-        ):
+        if opening and not _account_is_active(account):
             raise OrderRefused("Alpaca account is inactive or restricted")
         return account
 
@@ -163,6 +159,14 @@ class _AlpacaOrders:
 class AlpacaPaperOrders(_AlpacaOrders):
     api = PAPER_API
     journal_table = "paper_orders"
+
+
+def _account_is_active(account):
+    return (
+        account.get("status") == "ACTIVE"
+        and account.get("trading_blocked") is False
+        and account.get("account_blocked") is False
+    )
 
 
 def _matching_broker_id(payload, reply):

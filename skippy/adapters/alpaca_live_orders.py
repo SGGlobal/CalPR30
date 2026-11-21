@@ -77,9 +77,13 @@ class AlpacaLiveOrders(_AlpacaOrders):
 
     def _account(self, *, opening=False):
         account = super()._account(opening=opening)
-        if opening and account.get("crypto_status") != "ACTIVE":
+        if opening and not _crypto_is_active(account):
             raise OrderRefused("Alpaca live crypto status is inactive or unknown")
         return account
+
+
+def _crypto_is_active(account):
+    return account.get("crypto_status") == "ACTIVE"
 
 
 class AlpacaLiveHTTPS:
