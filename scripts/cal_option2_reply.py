@@ -4,6 +4,10 @@ The worker supplies a verified inbound receipt, its GitHub helpers, and CAL's
 trusted approval and HALT checks. Importing this module starts no work.
 """
 
+import json
+import os
+import re
+import stat
 from datetime import datetime, timezone
 from hashlib import sha256
 from hmac import compare_digest
@@ -12,6 +16,59 @@ from check_cal_bridge_status import UNIT, check_status
 
 REPO = "SGGlobal/CalPR30"
 ACTION = "CAL_BRIDGE_STATUS"
+CONTROL_DIR = "/etc/cal-option2"
+APPROVAL_FIELDS = {"action", "handoff", "comment_id", "body_sha256", "expires_at"}
+
+
+def _root_control(info):
+    return info.st_uid == 0 and not info.st_mode & 0o022
+
+
+def load_local_approval():
+    """Return the current one-shot server-owner approval, or None when halted."""
+    try:
+        directory = os.open(CONTROL_DIR, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if not _root_control(os.fstat(directory)):
+                return None
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            descriptor = os.open("approval.json", flags, dir_fd=directory)
+            try:
+                info = os.fstat(descriptor)
+                if not stat.S_ISREG(info.st_mode) or not _root_control(info):
+                    return None
+                with open(descriptor, "rb", closefd=False) as stream:
+                    raw = stream.read(2049)
+                if len(raw) > 2048:
+                    return None
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(directory)
+
+        approval = json.loads(raw)
+        if (
+            type(approval) is not dict
+            or approval.keys() != APPROVAL_FIELDS
+            or approval["action"] != ACTION
+            or not re.fullmatch(r"QLA-ARP29-PR30-[A-Z0-9][A-Z0-9-]{0,48}", approval["handoff"])
+            or type(approval["comment_id"]) is not int
+            or not 0 < approval["comment_id"] < 2**63
+            or not re.fullmatch(r"[0-9a-f]{64}", approval["body_sha256"])
+        ):
+            return None
+        expires = datetime.fromisoformat(approval["expires_at"])
+        if expires.tzinfo is None or expires <= datetime.now(timezone.utc):
+            return None
+        approval["expires_at"] = expires
+        return approval
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def local_halt_active(approval):
+    """Treat missing, expired, or changed approval as a stop."""
+    return approval is None or load_local_approval() != approval
 
 
 def deliver_status(
